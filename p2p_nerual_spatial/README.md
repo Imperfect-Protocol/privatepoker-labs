@@ -27,7 +27,9 @@ This is a research prototype. The output measures simulated behavior; it does no
 - SciPy
 - Optional: PyTorch, for batched embedding translation plus Haar/Gaussian/inverse-Haar processing on CUDA or Apple MPS (Metal)
 
-The event queue, graph simulation, sparse Hebbian state, zlib compression, and serialization remain CPU-based. Installing PyTorch does **not** move the entire simulation onto a GPU. When `--device cuda` or `--device mps` is selected and available, embedding batches of at least 8 use the selected accelerator. The message/node wavelet pipeline also runs Haar decomposition, Gaussian filtering, coefficient thresholding, and inverse Haar on that accelerator. Wavelet coefficients cross back to CPU only at the compression/serialization boundary, or after inverse reconstruction when sparse node state must be updated. `--device auto` prefers CUDA, then Apple MPS, then CPU.
+The event queue, graph simulation, sparse Hebbian state, zlib compression, and serialization remain CPU-based. Installing PyTorch does **not** move the entire simulation onto a GPU. With `--device cuda` or `--device mps`, eligible embedding batches and the Haar/Gaussian wavelet pipeline use the selected accelerator. The new `tensor_engine.py` module provides integer handles and a dedicated backend-owning thread: the simulator queues uploads with `store()`, queues backend-native computation with `queue_op()`, and calls `load()` only at a CPU-result boundary. Intermediate Haar axes, Gaussian filtering, thresholding, and inverse Haar execute without converting intermediate tensors to NumPy or synchronizing between those operations. In the serial, non-event-log path, outbound message transforms are queued at send time and loaded at delivery, allowing queued GPU work to overlap intervening event-loop work. Event-log and multi-worker IPC paths use eager payload materialization where bytes must be exported.
+
+There are still explicit CPU/GPU boundaries. Signal embeddings and the dense message tensor are assembled by the CPU event loop. The current message codec needs coefficient data back on the CPU for zlib/sparse serialization, and node-tensor denoising returns the reconstructed dense tensor for projection into the sparse Python Hebbian table. Thus the engine removes hidden/intermediate round-trips within a processing pipeline, but it does not yet keep all protocol or learning state resident on the GPU. In process-parallel mode each node-owning worker currently initializes its own engine; MPS performance with multiple workers needs separate benchmarking because several processes may contend for the same GPU. `--device auto` prefers CUDA, then Apple MPS, then CPU.
 
 ## Installation
 
@@ -46,7 +48,29 @@ On Windows PowerShell, activate the environment with:
 .venv\Scripts\Activate.ps1
 ```
 
-PyTorch is optional. If you want accelerator support, install a PyTorch build appropriate for your operating system and accelerator using the official selector: <https://pytorch.org/get-started/locally/>. On Apple Silicon, use a build with MPS support. The event queue, sparse Hebbian tables, and zlib/JSON serialization remain on the CPU; eligible embedding batches and the Haar/Gaussian/inverse-Haar tensor pipeline use CUDA or MPS.
+PyTorch is optional. If you want accelerator support, install a PyTorch build appropriate for your operating system and accelerator using the official selector: <https://pytorch.org/get-started/locally/>. On Apple Silicon, use a build with MPS support. Keep `tensor_engine.py` beside `simulator.py`; the simulator imports it when an accelerator is selected. The event queue, sparse Hebbian tables, and zlib/JSON serialization remain on the CPU; eligible embedding batches and the Haar/Gaussian/inverse-Haar tensor pipeline use CUDA or MPS through the handle-based engine.
+
+## Handle-based asynchronous tensor engine
+
+`tensor_engine.py` is part of the simulator package. It owns backend tensors behind integer handles and executes commands on one dedicated thread per process. It can be used directly:
+
+```python
+from tensor_engine import TensorEngine, add, multiply
+
+with TensorEngine(device="mps") as engine:
+    left = engine.create_tensor()
+    right = engine.create_tensor()
+    engine.store(left, (2, 2), [[1, 2], [3, 4]])
+    engine.store(right, (2, 2), [[10, 20], [30, 40]])
+    product = engine.queue_op(multiply, left, right)
+    total = engine.queue_op(add, product, left)
+    # load() is the explicit synchronization/fence boundary.
+    result = engine.load(total, (2, 2))
+```
+
+`create_tensor()`, `store()`, and `queue_op()` do not wait for accelerator completion. `store()` snapshots its host input before returning so callers can safely reuse their input buffer. Operations are ordered in the engine's command queue and operate on backend tensors; custom callables must not call `.cpu()`, `.numpy()`, or `.item()`. `load()` waits for prior commands, synchronizes the selected accelerator, and returns a NumPy array. The simulator reuses input/scratch handles for immediate wavelet and embedding operations; deferred outbound message transforms receive per-message output handles, which are released after `load()` fences the result.
+
+The remaining CPU boundaries are intentional: protocol state still consumes embedding arrays, the sender's zlib encoder needs coefficients, and sparse Hebbian denoising projects the reconstructed dense tensor back into a Python dictionary. Message tensor computation can now remain queued between send and delivery on the serial, non-event-log path, but coefficient packing still occurs at the delivery fence. This is not a claim that protocol state, sparse learning, or serialization has migrated to the GPU.
 
 ## Run it
 
@@ -69,6 +93,57 @@ Run a reproducible 100-node simulation explicitly:
 ```bash
 python simulator.py --nodes 100 --seed 42
 ```
+
+### Process-partitioned simulation (experimental)
+
+Use `--workers N` to run node-owned partitions in separate Python processes:
+
+```bash
+python simulator.py --nodes 100 --seed 42 --workers 4
+```
+
+`--workers 1` (the default) keeps the original single-process event engine and is
+still the reference mode. With more than one worker, node IDs are assigned
+deterministically by `node_id % worker_count`. Each worker constructs and owns
+its partition's node objects, node tensors, stun/dedup state, timers and local
+event heap. Events whose source and destination belong to the same worker stay
+local. Cross-partition messages are serialized into batches, one batch per
+destination worker at each synchronization point.
+
+Workers use conservative logical-time synchronization. The coordinator manages
+join/fallback lifecycle events and the global time frontier; workers process
+their own queues. At a batch hand-off, the receiver rebases a message using the
+remaining time delta:
+
+```text
+destination_dispatch = destination_clock + (message_dispatch - source_clock)
+```
+
+The runner checks that a received event is never inserted behind the receiving
+worker's clock. It uses bounded look-ahead based on the network link delay and
+stops at coordinator lifecycle events and topology-sensitive time watermarks.
+The watermark covers both timers that already contain pending announce discoveries
+and a queued announce aimed at a node with an active stun timer. That second case
+matters because an announce can join an existing stun cluster: the timer is anchored
+to the cluster's first message and may fire less than 50 ms after the new announce
+arrives. The safe barrier is the existing timer timestamp, not just the new message's
+arrival time. A regression test for this case is included in `--self-test`.
+
+This is an **experimental parallel backend**, not a promise of linear speedup.
+In current measurements, a 20-node full-feature run completed in about 14 seconds,
+and a 100-node run through 13.5 simulated seconds completed in about 23 seconds;
+these are correctness smoke tests, not evidence of a speedup over the serial engine.
+Process startup, tensor serialization and synchronization barriers can make
+simulations slower than `--workers 1`. Events on different workers that
+share exactly the same simulated timestamp are handled as a concurrent
+superstep; their tie ordering can differ from the serial priority queue, so
+learning/noise-enabled runs may not be bit-for-bit identical to the reference
+engine. Use the same seed and configuration for comparisons, and verify graph
+and traffic metrics on your workload before drawing conclusions. Near the
+`--max-events` limit, the runner switches to timestamp steps with per-worker
+event quotas so concurrent queues do not overrun the cap just by draining
+together. For initial parallel tests, CPU is recommended (`--device cpu`); GPU
+contexts and small per-worker tensor batches may add more overhead.
 
 Try a larger graph:
 
@@ -178,6 +253,7 @@ Compare with the same command without `--no-learning`, keeping all other argumen
 | `--ttl` | `8` | Initial TTL per signal, decremented at each relay |
 | `--seed` | `42` | Random seed for repeatable graph and simulation setup |
 | `--max-events` | `750000` | Maximum number of dispatched events |
+| `--workers` | `1` | Number of node-owning worker processes; 1 uses the reference single-process event engine, values above 1 enable the experimental partitioned backend |
 | `--progress-every` | `0` | Print progress every N events; zero disables progress output |
 | `--device` | `auto` | Embedding transform device: `auto`, `cpu`, `cuda`, or `mps`. Auto prefers CUDA, then Apple MPS, then CPU |
 | `--no-learning` | off | Disable Hebbian updates and node-tensor denoising, use uniform unit weights, keep message processing enabled |
@@ -265,6 +341,7 @@ A high packet-reduction percentage mostly reflects **bundling**. To measure the 
 The built-in self-tests cover the current implementation, including:
 
 - Haar transform/inverse round-trip across all axes
+- Persistent tensor-engine handle semantics: queued store/ops and explicit load fences, including simulator wavelet processing on the engine's NumPy backend
 - Eight-layer embedding rotations, accumulated hop twists, oldest-layer eviction, and preservation of zero-filled unused layers
 - Noise, Gaussian coefficient blur, thresholding, and sparse node denoising
 - Compressed message tensor encoding/decoding
@@ -288,7 +365,7 @@ python simulator.py --self-test
 - Address-derived coordinates are synthetic. They are useful for deterministic directional hints but do not represent real graph distance.
 - Learned routing is heuristic and may fall back to ripple forwarding when it is uncertain.
 - The mesh server is modeled as a simulated fallback link.
-- The event queue, sparse Hebbian tables, dense-to-sparse projection, zlib compression, and serialization remain CPU work. CUDA or Apple MPS accelerates eligible embedding batches and the Haar/Gaussian/inverse-Haar tensor pipeline, but not the entire event loop.
+- The event queue, sparse Hebbian tables, dense-to-sparse projection, zlib compression, and serialization remain CPU work. CUDA or Apple MPS accelerates eligible embedding batches and the Haar/Gaussian/inverse-Haar tensor pipeline through `tensor_engine.py`, but not the entire event loop. In the serial, non-event-log path, outbound message transforms are queued at send time and fenced at delivery; the coefficient tensor then returns to CPU for packing, while node denoising returns a dense reconstruction for sparse-table projection. Small tensors can still be launch-overhead bound, and no GPU speedup is assumed without measuring wall-clock time. Multi-worker accelerator runs currently initialize an engine per worker, so MPS workers may contend for one GPU; start with `--workers 1` when evaluating the new GPU path.
 - Compression savings reported for tensor coefficients exclude signal metadata and the embedding sidecar unless the output explicitly reports otherwise.
 
 ## Suggested next experiments
