@@ -1,5 +1,11 @@
 # Neural Hebbian P2P Simulator
 
+**Author:** [Sonia Code](https://github.com/sadhbh-c0d3)
+
+*Copyright (c) 2026 Sonia Kolasinska / Imperfect Protocol. All Rights Reserved.*
+
+----
+
 An experimental, event-driven Python simulator for a peer-to-peer network that forms dynamically, propagates beacon and announce signals, coalesces traffic during short stun windows, and learns which next hops have been useful.
 
 The aim is not perfect neural routing. It is to improve ordinary ripple gossip under contention by combining:
