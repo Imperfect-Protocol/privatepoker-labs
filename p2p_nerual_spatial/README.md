@@ -25,9 +25,9 @@ This is a research prototype. The output measures simulated behavior; it does no
 - Python 3.10 or later recommended
 - NumPy
 - SciPy
-- Optional: PyTorch, for batched embedding translation on a CUDA-capable GPU
+- Optional: PyTorch, for batched embedding translation plus Haar/Gaussian/inverse-Haar processing on CUDA or Apple MPS (Metal)
 
-The event queue, graph simulation, sparse Hebbian state, and Haar coefficient encoding are CPU-based. Installing PyTorch does **not** move the entire simulation onto a GPU. The embedding translation backend selects CUDA when `--device auto` detects a compatible PyTorch CUDA installation and the operation is large enough to benefit.
+The event queue, graph simulation, sparse Hebbian state, zlib compression, and serialization remain CPU-based. Installing PyTorch does **not** move the entire simulation onto a GPU. When `--device cuda` or `--device mps` is selected and available, embedding batches of at least 8 use the selected accelerator. The message/node wavelet pipeline also runs Haar decomposition, Gaussian filtering, coefficient thresholding, and inverse Haar on that accelerator. Wavelet coefficients cross back to CPU only at the compression/serialization boundary, or after inverse reconstruction when sparse node state must be updated. `--device auto` prefers CUDA, then Apple MPS, then CPU.
 
 ## Installation
 
@@ -46,7 +46,7 @@ On Windows PowerShell, activate the environment with:
 .venv\Scripts\Activate.ps1
 ```
 
-PyTorch is optional. If you want GPU-assisted embedding translation, install a PyTorch build appropriate for your operating system and CUDA setup by following the official PyTorch installation selector: <https://pytorch.org/get-started/locally/>.
+PyTorch is optional. If you want accelerator support, install a PyTorch build appropriate for your operating system and accelerator using the official selector: <https://pytorch.org/get-started/locally/>. On Apple Silicon, use a build with MPS support. The event queue, sparse Hebbian tables, and zlib/JSON serialization remain on the CPU; eligible embedding batches and the Haar/Gaussian/inverse-Haar tensor pipeline use CUDA or MPS.
 
 ## Run it
 
@@ -90,17 +90,78 @@ Force CPU embedding transforms:
 python simulator.py --device cpu
 ```
 
-Require CUDA for embedding transforms (the program exits with an argument error if CUDA is unavailable):
+Require CUDA for embedding transforms and wavelet tensor operations (the program exits with an argument error if CUDA is unavailable):
 
 ```bash
 python simulator.py --device cuda
 ```
+
+Use Apple's Metal Performance Shaders backend for embedding transforms and wavelet tensor operations on a supported Mac with an MPS-enabled PyTorch build:
+
+```bash
+python simulator.py --device mps
+```
+
+By default, `--device auto` prefers CUDA, then Apple MPS, then CPU. Verify MPS support in the active Python environment with:
+
+```bash
+python -c "import torch; print('MPS built:', torch.backends.mps.is_built()); print('MPS available:', torch.backends.mps.is_available())"
+```
+
+If `MPS available` is `False`, `--device mps` exits with an explanatory error rather than silently pretending to use the GPU. On a CPU-only machine, use `--device cpu` or `--device auto`.
 
 Show periodic event-loop progress:
 
 ```bash
 python simulator.py --nodes 100 --progress-every 10000
 ```
+
+Capture every scheduled message as one JSON Lines row, with exact addresses and
+signal metadata plus the encoded tensor payload represented as a long hexadecimal
+string (the on-wire tensor bytes, rendered in a blockchain-style hex field):
+
+```bash
+python simulator.py --nodes 100 --seed 42 --event-log messages.jsonl
+```
+
+Each row includes `sent_at`, `dispatch_time`, sender and recipient node IDs and
+20-byte addresses, signal IDs/types/addresses/TTL/hop counts, tensor shape and
+encoding, byte length, and `tensor_hex`. The log includes ordinary bundled
+messages, local self-messages and internal join-intent messages. Join-intent rows
+have an empty tensor because they are simulation-control events, not tensor
+transmissions. The file may get large because `tensor_hex` deliberately stores
+all encoded bytes as text.
+
+Disable processing stages individually for controlled experiments:
+
+```bash
+# Neutral/unit weights, no noise, no Gaussian smoothing, with Haar + compression.
+python simulator.py --nodes 100 --seed 42 --no-learning --no-noise --no-gaussian
+
+# Keep noise but bypass Haar, Gaussian filtering, coefficient thresholding and compression.
+python simulator.py --nodes 100 --no-haar
+
+# Keep Haar thresholding and receiver-side inverse Haar, but send dense float32 coefficients.
+python simulator.py --nodes 100 --no-compression
+
+# Disable TTL enforcement, or disable embedding rotations while still shifting the 8-layer stack.
+python simulator.py --nodes 100 --no-ttl
+python simulator.py --nodes 100 --no-twist
+
+# Tune background noise, coefficient blur, threshold and reward strength.
+python simulator.py --noise-strength 0.00001 --gaussian-width 0.30 --threshold 0.006 --hebbian-reward 0.35
+```
+
+
+### No-learning baseline
+
+Use `--no-learning` to disable Hebbian updates and node-tensor denoising while keeping message tensor processing, Haar/Gaussian filtering, compression, TTL, deduplication, beacon traffic, announcements, and fallback behavior enabled. Every logical routing weight is an implicit unit value (`1.0`), so all nodes make neutral, uniform weight-based decisions without allocating a dense tensor. Success-feedback packets remain enabled for a fair protocol comparison, but they do not change weights.
+
+```bash
+python simulator.py --nodes 100 --seed 42 --no-learning
+```
+
+Compare with the same command without `--no-learning`, keeping all other arguments identical. The difference in traffic and delivery is the incremental effect of learned weights, subject to run-to-run timing and stochastic wavelet noise.
 
 ## Command-line options
 
@@ -118,7 +179,20 @@ python simulator.py --nodes 100 --progress-every 10000
 | `--seed` | `42` | Random seed for repeatable graph and simulation setup |
 | `--max-events` | `750000` | Maximum number of dispatched events |
 | `--progress-every` | `0` | Print progress every N events; zero disables progress output |
-| `--device` | `auto` | Embedding transform device: `auto`, `cpu`, or `cuda` |
+| `--device` | `auto` | Embedding transform device: `auto`, `cpu`, `cuda`, or `mps`. Auto prefers CUDA, then Apple MPS, then CPU |
+| `--no-learning` | off | Disable Hebbian updates and node-tensor denoising, use uniform unit weights, keep message processing enabled |
+| `--no-noise` | off | Disable random noise injection before tensor processing |
+| `--no-haar` | off | Bypass Haar decomposition; also disables coefficient Gaussian filtering and compression, but does not disable noise |
+| `--no-gaussian` | off | Disable Gaussian smoothing in Haar-coefficient space and embedding-rotation smoothing |
+| `--no-compression` | off | Send dense float32 Haar coefficients instead of sparse zlib/DEFLATE. Receiver still performs inverse Haar |
+| `--no-ttl` | off | Do not enforce or decrement TTL; useful for controlled propagation experiments |
+| `--no-twist` | off | Do not rotate inherited embedding layers; still shift the fixed stack and add a fresh up-arrow layer |
+| `--noise-strength` | `0.00001` | Standard deviation of Gaussian background noise relative to unit-valued tensor entries |
+| `--gaussian-width` | `0.30` | Gaussian sigma applied in wavelet coefficient space |
+| `--threshold` | `0.006` | Soft-threshold for message Haar coefficients |
+| `--node-threshold` | `0.00005` | Soft-threshold for internal node-learning tensor coefficients |
+| `--hebbian-reward` | `0.35` | Base successful-route reward. Default preserves the current 0.12 beacon reward and 0.35 success-feedback reward; both scale proportionally |
+| `--event-log` | none | Write one JSONL row per scheduled message, with signal metadata and encoded tensor bytes in hex |
 | `--self-test` | off | Run assertions and protocol tests, then exit |
 
 ## How the simulation works
@@ -161,15 +235,17 @@ The tensor is a fuzzy routing hint, not a guarantee of shortest-path routing. Ad
 
 ### 5. Haar filtering and message compression
 
-The current filtering pipeline is:
+The default filtering pipeline is:
 
-1. Add very small random background noise to the tensor.
+1. Add low-strength random background noise before decomposition.
 2. Apply a separable, one-level orthonormal Haar transform along every tensor axis.
 3. Apply Gaussian smoothing in coefficient space.
 4. Soft-threshold small coefficients.
-5. For node learning state, inverse-transform the coefficients and project the result back onto already observed sparse entries.
+5. For node learning state, apply inverse Haar and project the result back onto already observed sparse entries.
 
-Node tensor filtering is periodically triggered after a configured number of timer firings. Message tensors are encoded as sparse, thresholded Haar coefficients and compressed with Python's `zlib`/DEFLATE. The receiver decompresses the coefficients and applies the inverse Haar transform, then re-applies each signal's exact occupied-layer mask and normalizes its occupied direction profiles. The message tensor is a padded stack of per-signal embeddings, with metadata rows kept in the same order so signal addresses, IDs, TTLs, targets, and embedding depth remain exact.
+Node tensor filtering is periodically triggered after a configured number of timer firings. Message tensors are encoded as sparse, thresholded Haar coefficients and compressed with Python's `zlib`/DEFLATE. The receiver decompresses the coefficients and applies inverse Haar, then re-applies each signal's exact occupied-layer mask and normalizes its occupied direction profiles. The message tensor is a padded stack of per-signal embeddings, with metadata rows kept in the same order so signal addresses, IDs, TTLs, targets, and embedding depth remain exact.
+
+Pipeline switches are intended for ablation experiments. `--no-noise` bypasses noise injection. `--no-haar` sends the noisy raw float32 tensor and automatically disables Gaussian coefficient filtering, coefficient thresholding, and compression. `--no-gaussian` removes both wavelet-space Gaussian blur and the small Gaussian smoothing used during embedding rotation. `--no-compression` sends dense float32 Haar coefficients, while the receiver still applies inverse Haar. `--no-ttl` leaves TTL metadata in place but neither decrements nor enforces it. `--no-twist` shifts the eight-layer history but does not rotate or smooth inherited angle profiles. `--threshold` controls message coefficients and `--node-threshold` separately controls the learning tensor so the two very different value scales retain sensible defaults.
 
 The current logical dense tensor has shape `8 × 8 × 8 × 8 × 8 × 8` (262,144 float32 values, about 1 MiB before overhead). Node storage is sparse, but a node wavelet-filter pass temporarily materializes a dense array. This can become a performance bottleneck as the simulation grows.
 
@@ -193,6 +269,7 @@ The built-in self-tests cover the current implementation, including:
 - Noise, Gaussian coefficient blur, thresholding, and sparse node denoising
 - Compressed message tensor encoding/decoding
 - Exact 20-byte address metadata
+- Independent pipeline switches, no-twist behavior, and JSONL event logs with hex tensor payloads
 - Priority queue ordering and simulation time
 - Stun anchoring, timer replacement, and stale timer cancellation
 - TTL expiry and duplicate suppression
@@ -211,7 +288,7 @@ python simulator.py --self-test
 - Address-derived coordinates are synthetic. They are useful for deterministic directional hints but do not represent real graph distance.
 - Learned routing is heuristic and may fall back to ripple forwarding when it is uncertain.
 - The mesh server is modeled as a simulated fallback link.
-- Haar filtering and dense tensor materialization are CPU work. CUDA acceleration, when available, applies to eligible batched embedding transformations rather than the entire event loop.
+- The event queue, sparse Hebbian tables, dense-to-sparse projection, zlib compression, and serialization remain CPU work. CUDA or Apple MPS accelerates eligible embedding batches and the Haar/Gaussian/inverse-Haar tensor pipeline, but not the entire event loop.
 - Compression savings reported for tensor coefficients exclude signal metadata and the embedding sidecar unless the output explicitly reports otherwise.
 
 ## Suggested next experiments

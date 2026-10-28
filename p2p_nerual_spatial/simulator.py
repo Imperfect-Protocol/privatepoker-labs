@@ -8,19 +8,24 @@ received signal state, and arm the node's single timer. The timer handler choose
 routes and emits at most one bundled Message per destination neighbour.
 
 Examples:
-    python sim_maybe2.py --self-test
-    python sim_maybe2.py --nodes 100
-    python sim_maybe2.py --nodes 1000 --max-events 1500000
-    python sim_maybe2.py --nodes 100 --ttl 8
+    python simulator.py --self-test
+    python simulator.py --nodes 100
+    python simulator.py --nodes 1000 --max-events 1500000
+    python simulator.py --nodes 100 --ttl 8
+    python simulator.py --no-learning --no-gaussian --threshold 0.01
+    python simulator.py --device mps --nodes 100
+    python simulator.py --event-log messages.jsonl
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import heapq
+import json
 import math
 import random
 import struct
+import tempfile
 import time
 import zlib
 from dataclasses import dataclass, field, replace
@@ -36,30 +41,90 @@ except ImportError:  # NumPy/SciPy remain a fully supported CPU fallback.
     torch = None
 
 
-# Use a CUDA device for sufficiently large translation batches when one exists.
-# The event queue and sparse Hebbian tables remain on the CPU because they are
-# irregular Python data structures; dense embedding transforms are the GPU work.
-_EMBEDDING_DEVICE = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
-_GPU_BATCH_THRESHOLD = 8
+# Dense embedding transforms and the Haar/Gaussian/inverse-Haar tensor pipeline
+# can use NVIDIA CUDA or Apple Metal Performance Shaders (MPS). The event queue,
+# sparse Hebbian tables, and zlib serialization remain CPU-based. Small embedding
+# batches stay on CPU to avoid accelerator launch and host/device transfer overhead.
+_EMBEDDING_DEVICE = "cpu"
+_ACCELERATOR_BATCH_THRESHOLD = 8
+
+
+def _cuda_available() -> bool:
+    """Return whether this PyTorch installation can use a CUDA device."""
+    try:
+        return bool(torch is not None and torch.cuda.is_available())
+    except (AttributeError, RuntimeError):
+        return False
+
+
+def _mps_available() -> bool:
+    """Return whether this PyTorch installation can use Apple's MPS backend."""
+    try:
+        return bool(
+            torch is not None
+            and hasattr(torch, "backends")
+            and hasattr(torch.backends, "mps")
+            and torch.backends.mps.is_available()
+        )
+    except (AttributeError, RuntimeError):
+        return False
+
+
+def available_embedding_devices() -> Tuple[str, ...]:
+    """List supported embedding-transform devices in selection preference order."""
+    devices = ["cpu"]
+    if _mps_available():
+        devices.insert(0, "mps")
+    if _cuda_available():
+        devices.insert(0, "cuda")
+    return tuple(devices)
 
 
 def configure_embedding_device(preference: str = "auto") -> str:
-    """Configure embedding transforms: auto, cpu, or cuda (if CUDA is available)."""
+    """Select auto, CPU, NVIDIA CUDA, or Apple MPS for batched embedding transforms.
+
+    ``auto`` prefers CUDA when available, then MPS, then CPU. Explicit accelerator
+    requests fail with a clear error instead of silently running on the CPU.
+    """
     global _EMBEDDING_DEVICE
-    preference = preference.lower()
-    if preference not in {"auto", "cpu", "cuda"}:
-        raise ValueError("embedding device must be one of: auto, cpu, cuda")
-    cuda_available = torch is not None and torch.cuda.is_available()
+    preference = str(preference).lower()
+    if preference not in {"auto", "cpu", "cuda", "mps"}:
+        raise ValueError("embedding device must be one of: auto, cpu, cuda, mps")
+
+    cuda_available = _cuda_available()
+    mps_available = _mps_available()
     if preference == "cuda" and not cuda_available:
+        if torch is None:
+            raise RuntimeError("CUDA was requested, but PyTorch is not installed")
         raise RuntimeError("CUDA was requested, but PyTorch reports no CUDA-capable GPU")
-    _EMBEDDING_DEVICE = "cuda" if preference == "cuda" or (preference == "auto" and cuda_available) else "cpu"
+    if preference == "mps" and not mps_available:
+        if torch is None:
+            raise RuntimeError("MPS was requested, but PyTorch is not installed")
+        raise RuntimeError(
+            "MPS was requested, but torch.backends.mps.is_available() is false. "
+            "Use an MPS-enabled PyTorch build on a supported Apple Mac, or choose --device cpu."
+        )
+
+    if preference == "auto":
+        _EMBEDDING_DEVICE = "cuda" if cuda_available else ("mps" if mps_available else "cpu")
+    else:
+        _EMBEDDING_DEVICE = preference
     return _EMBEDDING_DEVICE
 
 
 def embedding_backend_name() -> str:
+    """Describe the selected backend and make the small-batch CPU path explicit."""
     if _EMBEDDING_DEVICE == "cuda":
-        return f"PyTorch CUDA ({torch.cuda.get_device_name(0)})"
-    return "NumPy cubic CPU (PyTorch CUDA unavailable or disabled)"
+        try:
+            device_name = torch.cuda.get_device_name(0)
+        except (AttributeError, RuntimeError):
+            device_name = "CUDA device"
+        return (f"PyTorch CUDA / {device_name} (embedding batches >= {_ACCELERATOR_BATCH_THRESHOLD}; "
+                "Haar + Gaussian + inverse Haar on GPU; zlib serialization on CPU)")
+    if _EMBEDDING_DEVICE == "mps":
+        return (f"PyTorch MPS / Apple Metal GPU (embedding batches >= {_ACCELERATOR_BATCH_THRESHOLD}; "
+                "Haar + Gaussian + inverse Haar on GPU; zlib serialization on CPU)")
+    return "NumPy cubic CPU (CPU selected or no supported PyTorch accelerator available)"
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +146,7 @@ WAVELET_NOISE_STD = 0.00001
 WAVELET_GAUSSIAN_SIGMA = 0.30
 WAVELET_THRESHOLD = 0.00005
 MESSAGE_WAVELET_THRESHOLD = 0.006
+DEFAULT_HEBBIAN_REWARD = 0.35
 NODE_WAVELET_EVERY_N_TIMERS = 32
 NODE_TENSOR_PRUNE_THRESHOLD = 0.002
 
@@ -125,8 +191,126 @@ def haar_inverse_axis(array: np.ndarray, axis: int) -> np.ndarray:
     return np.moveaxis(out, -1, axis)
 
 
+def _accelerator_tensor_device():
+    """Return the selected CUDA/MPS torch device, or None for the NumPy CPU path."""
+    if torch is None or _EMBEDDING_DEVICE not in {"cuda", "mps"}:
+        return None
+    return torch.device(_EMBEDDING_DEVICE)
+
+
+def _haar_forward_axis_torch(tensor, axis: int):
+    """One-level orthonormal Haar transform on a torch tensor without leaving device."""
+    axis = int(axis) % tensor.ndim
+    length = int(tensor.shape[axis])
+    if length < 1 or (length & (length - 1)) != 0:
+        raise ValueError("Haar axis lengths must be powers of two")
+    if length == 1:
+        return tensor.clone()
+    moved = tensor.movedim(axis, -1)
+    even = moved[..., 0::2]
+    odd = moved[..., 1::2]
+    scale = 1.0 / math.sqrt(2.0)
+    transformed = torch.cat(((even + odd) * scale, (even - odd) * scale), dim=-1)
+    return transformed.movedim(-1, axis).contiguous()
+
+
+def _haar_inverse_axis_torch(tensor, axis: int):
+    """Inverse one-level Haar transform on a torch tensor without leaving device."""
+    axis = int(axis) % tensor.ndim
+    length = int(tensor.shape[axis])
+    if length < 1 or (length & (length - 1)) != 0:
+        raise ValueError("Haar axis lengths must be powers of two")
+    if length == 1:
+        return tensor.clone()
+    moved = tensor.movedim(axis, -1)
+    half = length // 2
+    low, high = moved[..., :half], moved[..., half:]
+    scale = 1.0 / math.sqrt(2.0)
+    composed = torch.stack(((low + high) * scale, (low - high) * scale), dim=-1)
+    composed = composed.flatten(start_dim=-2)
+    return composed.movedim(-1, axis).contiguous()
+
+
+def _haar_forward_nd_torch(tensor):
+    result = tensor.to(dtype=torch.float32)
+    for axis in range(result.ndim):
+        result = _haar_forward_axis_torch(result, axis)
+    return result
+
+
+def _haar_inverse_nd_torch(tensor):
+    result = tensor.to(dtype=torch.float32)
+    for axis in reversed(range(result.ndim)):
+        result = _haar_inverse_axis_torch(result, axis)
+    return result
+
+
+def _torch_gaussian_filter_nd(tensor, sigma: float):
+    """Separable Gaussian filter with replicate/nearest boundary handling on-device.
+
+    This is a PyTorch implementation of the separable filtering used by SciPy's
+    gaussian_filter. Coefficients stay on the selected accelerator for every axis.
+    """
+    sigma = float(sigma)
+    if sigma <= 0.0 or tensor.ndim == 0:
+        return tensor
+    # SciPy's default truncate is 4.0 and radius is rounded from truncate*sigma.
+    radius = int(4.0 * sigma + 0.5)
+    if radius < 1:
+        return tensor
+    device, dtype = tensor.device, tensor.dtype
+    positions = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+    kernel = torch.exp(-0.5 * (positions / sigma).square())
+    kernel = kernel / kernel.sum()
+    result = tensor
+    import torch.nn.functional as torch_f
+    for axis in range(result.ndim):
+        moved = result.movedim(axis, -1).contiguous()
+        original_shape = moved.shape
+        length = int(original_shape[-1])
+        rows = moved.reshape(-1, 1, length)
+        rows = torch_f.pad(rows, (radius, radius), mode="replicate")
+        rows = torch_f.conv1d(rows, kernel.reshape(1, 1, -1))
+        moved = rows.reshape(*original_shape)
+        result = moved.movedim(-1, axis).contiguous()
+    return result
+
+
+def _prepare_wavelet_coefficients_torch(tensor: np.ndarray, rng: np.random.Generator, *,
+                                        noise_std: float, noise_enabled: bool,
+                                        haar_enabled: bool, gaussian_enabled: bool,
+                                        gaussian_sigma: float, threshold: float,
+                                        device):
+    """Noise on input, then Haar/Gaussian/threshold entirely on selected device."""
+    source = np.asarray(tensor, dtype=np.float32)
+    if noise_enabled and float(noise_std) > 0.0:
+        # Noise generation remains CPU-side, then one transfer begins the GPU pipeline.
+        source = source + rng.normal(0.0, float(noise_std), size=source.shape).astype(np.float32)
+    with torch.no_grad():
+        processed = torch.as_tensor(np.ascontiguousarray(source), dtype=torch.float32, device=device)
+        if not haar_enabled:
+            return processed
+        coefficients = _haar_forward_nd_torch(processed)
+        if gaussian_enabled and float(gaussian_sigma) > 0.0:
+            coefficients = _torch_gaussian_filter_nd(coefficients, float(gaussian_sigma))
+        cutoff = float(threshold)
+        if cutoff > 0.0:
+            coefficients = torch.sign(coefficients) * torch.clamp(torch.abs(coefficients) - cutoff, min=0.0)
+        coefficients = coefficients.masked_fill(torch.abs(coefficients) < 1e-8, 0.0)
+        return coefficients
+
+
 def haar_forward_nd(array: np.ndarray) -> np.ndarray:
-    """Apply a separable one-level Haar decomposition along every tensor axis."""
+    """Apply separable Haar decomposition across every axis.
+
+    On a selected CUDA/MPS device, all axes are transformed on that device and a
+    NumPy array is returned only at the serialization/testing boundary.
+    """
+    device = _accelerator_tensor_device()
+    if device is not None:
+        with torch.no_grad():
+            source = torch.as_tensor(np.ascontiguousarray(array), dtype=torch.float32, device=device)
+            return _haar_forward_nd_torch(source).detach().cpu().numpy().astype(np.float32, copy=False)
     result = np.asarray(array, dtype=np.float32)
     if result.ndim == 0:
         return result.copy()
@@ -136,7 +320,12 @@ def haar_forward_nd(array: np.ndarray) -> np.ndarray:
 
 
 def haar_inverse_nd(coefficients: np.ndarray) -> np.ndarray:
-    """Compose an N-D tensor from coefficients decomposed along every axis."""
+    """Compose an N-D tensor, using CUDA/MPS for all inverse axes when selected."""
+    device = _accelerator_tensor_device()
+    if device is not None:
+        with torch.no_grad():
+            source = torch.as_tensor(np.ascontiguousarray(coefficients), dtype=torch.float32, device=device)
+            return _haar_inverse_nd_torch(source).detach().cpu().numpy().astype(np.float32, copy=False)
     result = np.asarray(coefficients, dtype=np.float32)
     if result.ndim == 0:
         return result.copy()
@@ -147,30 +336,80 @@ def haar_inverse_nd(coefficients: np.ndarray) -> np.ndarray:
 
 def prepare_wavelet_coefficients(tensor: np.ndarray, rng: np.random.Generator, *,
                                  noise_std: float = WAVELET_NOISE_STD,
+                                 noise_enabled: bool = True,
+                                 haar_enabled: bool = True,
+                                 gaussian_enabled: bool = True,
                                  gaussian_sigma: float = WAVELET_GAUSSIAN_SIGMA,
                                  threshold: float = WAVELET_THRESHOLD) -> np.ndarray:
-    """Noise -> N-D Haar -> Gaussian blur coefficients -> soft-threshold.
+    """Apply noise -> all-axis Haar -> Gaussian -> soft-threshold processing.
 
-    Blurring is performed in wavelet-coefficient space. The small noise is
-    deliberately added before decomposition, as requested, and is normally
-    removed by the coefficient threshold unless it aligns with useful structure.
+    For CUDA/MPS, Haar, Gaussian filtering, and coefficient thresholding all run
+    on-device in one pass. The only device-to-host transfer is the final coefficient
+    array, needed by the existing CPU zlib/sparse serializer. With Haar disabled,
+    the noisy tensor is returned directly and Gaussian/thresholding are skipped.
     """
     source = np.asarray(tensor, dtype=np.float32)
     if any((dim & (dim - 1)) != 0 for dim in source.shape):
         raise ValueError("all tensor dimensions must be powers of two for Haar")
-    noisy = source + rng.normal(0.0, float(noise_std), size=source.shape).astype(np.float32)
-    coefficients = haar_forward_nd(noisy)
-    if gaussian_sigma > 0.0:
+    device = _accelerator_tensor_device()
+    if device is not None:
+        coefficients = _prepare_wavelet_coefficients_torch(
+            source, rng, noise_std=noise_std, noise_enabled=noise_enabled,
+            haar_enabled=haar_enabled, gaussian_enabled=gaussian_enabled,
+            gaussian_sigma=gaussian_sigma, threshold=threshold, device=device,
+        )
+        return coefficients.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    if noise_enabled and float(noise_std) > 0.0:
+        processed = source + rng.normal(0.0, float(noise_std), size=source.shape).astype(np.float32)
+    else:
+        processed = source.copy()
+    if not haar_enabled:
+        return processed.astype(np.float32, copy=False)
+    coefficients = haar_forward_nd(processed)
+    if gaussian_enabled and gaussian_sigma > 0.0:
         coefficients = gaussian_filter(
             coefficients, sigma=(float(gaussian_sigma),) * coefficients.ndim,
             mode="nearest",
         ).astype(np.float32, copy=False)
     cutoff = float(threshold)
     if cutoff > 0.0:
-        coefficients = (np.sign(coefficients) * np.maximum(np.abs(coefficients) - cutoff, 0.0))
+        coefficients = np.sign(coefficients) * np.maximum(np.abs(coefficients) - cutoff, 0.0)
     coefficients[np.abs(coefficients) < 1e-8] = 0.0
     return coefficients.astype(np.float32, copy=False)
 
+
+def prepare_and_compose_wavelet_tensor(tensor: np.ndarray, rng: np.random.Generator, *,
+                                       noise_std: float = WAVELET_NOISE_STD,
+                                       noise_enabled: bool = True,
+                                       haar_enabled: bool = True,
+                                       gaussian_enabled: bool = True,
+                                       gaussian_sigma: float = WAVELET_GAUSSIAN_SIGMA,
+                                       threshold: float = WAVELET_THRESHOLD) -> Tuple[np.ndarray, int]:
+    """Filter and inverse-compose a node tensor with no intermediate host round-trip on GPU."""
+    source = np.asarray(tensor, dtype=np.float32)
+    device = _accelerator_tensor_device()
+    if device is not None:
+        coefficients = _prepare_wavelet_coefficients_torch(
+            source, rng, noise_std=noise_std, noise_enabled=noise_enabled,
+            haar_enabled=haar_enabled, gaussian_enabled=gaussian_enabled,
+            gaussian_sigma=gaussian_sigma, threshold=threshold, device=device,
+        )
+        count = int(torch.count_nonzero(coefficients).item())
+        if haar_enabled:
+            with torch.no_grad():
+                composed = _haar_inverse_nd_torch(coefficients)
+        else:
+            composed = coefficients
+        return composed.detach().cpu().numpy().astype(np.float32, copy=False), count
+    coefficients = prepare_wavelet_coefficients(
+        source, rng, noise_std=noise_std, noise_enabled=noise_enabled,
+        haar_enabled=haar_enabled, gaussian_enabled=gaussian_enabled,
+        gaussian_sigma=gaussian_sigma, threshold=threshold,
+    )
+    count = int(np.count_nonzero(coefficients))
+    composed = haar_inverse_nd(coefficients) if haar_enabled else coefficients
+    return composed, count
 
 def pack_sparse_wavelet_coefficients(coefficients: np.ndarray) -> Tuple[bytes, int]:
     """Losslessly DEFLATE sparse, thresholded Haar coefficients.
@@ -452,7 +691,8 @@ def _smooth_profiles_numpy(profiles: np.ndarray, sigma: float = 0.42) -> np.ndar
     return np.maximum(smoothed * scale.astype(np.float32), 0.0).astype(np.float32, copy=False)
 
 
-def _translate_embedding_batch_numpy(sources: np.ndarray, offset: np.ndarray) -> np.ndarray:
+def _translate_embedding_batch_numpy(sources: np.ndarray, offset: np.ndarray, twist: bool = True,
+                                    gaussian_enabled: bool = True) -> np.ndarray:
     """Rotate every occupied history layer, shift it back one slot, then push up-arrow.
 
     Input and output are [batch, angle, hop]. The oldest column is dropped, every
@@ -464,15 +704,19 @@ def _translate_embedding_batch_numpy(sources: np.ndarray, offset: np.ndarray) ->
     if (angle_count, hop_count) != EMBEDDING_SHAPE:
         raise ValueError(f"expected embeddings with shape {EMBEDDING_SHAPE}")
     out = np.zeros_like(sources)
-    phi = _hop_rotation_radians(offset)
+    phi = _hop_rotation_radians(offset) if twist else 0.0
     for old_hop in range(hop_count - 1):
         profile = sources[:, :, old_hop]
         mass = profile.sum(axis=1)
         active = mass > 1e-10
         if not np.any(active):
             continue
-        rotated = _rotate_profiles_numpy(profile, phi)
-        rotated = _smooth_profiles_numpy(rotated)
+        if twist:
+            rotated = _rotate_profiles_numpy(profile, phi)
+            if gaussian_enabled:
+                rotated = _smooth_profiles_numpy(rotated)
+        else:
+            rotated = profile.copy()
         rotated[~active] = 0.0
         out[:, :, old_hop + 1] = rotated
     # Fresh local frame: the receiver is always represented by a unit-up arrow.
@@ -484,7 +728,9 @@ def _translate_embedding_batch_numpy(sources: np.ndarray, offset: np.ndarray) ->
 
 
 def _translate_embedding_batch_torch(sources: np.ndarray, offset: np.ndarray,
-                                     device_name: Optional[str] = None) -> np.ndarray:
+                                     device_name: Optional[str] = None,
+                                     twist: bool = True,
+                                     gaussian_enabled: bool = True) -> np.ndarray:
     """PyTorch equivalent of the fixed eight-layer rotation/shift operation."""
     device = torch.device(device_name or _EMBEDDING_DEVICE)
     src_np = np.maximum(np.asarray(sources, dtype=np.float32), 0.0)
@@ -493,7 +739,7 @@ def _translate_embedding_batch_torch(sources: np.ndarray, offset: np.ndarray,
         raise ValueError(f"expected embeddings with shape {EMBEDDING_SHAPE}")
     src = torch.as_tensor(src_np, dtype=torch.float32, device=device)
     out = torch.zeros_like(src)
-    phi = _hop_rotation_radians(offset)
+    phi = _hop_rotation_radians(offset) if twist else 0.0
     shift = (phi % (2.0 * math.pi)) * angle_count / (2.0 * math.pi)
     whole = int(math.floor(shift))
     fraction = float(shift - whole)
@@ -502,21 +748,27 @@ def _translate_embedding_batch_torch(sources: np.ndarray, offset: np.ndarray,
         mass = profile.sum(dim=1, keepdim=True)
         if not bool(torch.any(mass > 1e-10).item()):
             continue
-        rotated = torch.roll(profile, shifts=whole, dims=1) * (1.0 - fraction)
-        if fraction > 1e-12:
-            rotated = rotated + torch.roll(profile, shifts=whole + 1, dims=1) * fraction
-        rotated_mass = rotated.sum(dim=1, keepdim=True)
-        rotated = torch.where(rotated_mass > 1e-12,
-                              rotated * mass / rotated_mass.clamp_min(1e-12), 0.0)
-        taps = torch.arange(-2, 3, dtype=src.dtype, device=device)
-        kernel = torch.exp(-0.5 * (taps / 0.42) ** 2)
-        kernel = kernel / kernel.sum()
-        smoothed = torch.zeros_like(rotated)
-        for tap, weight in zip(range(-2, 3), kernel):
-            smoothed = smoothed + torch.roll(rotated, shifts=tap, dims=1) * weight
-        smooth_mass = smoothed.sum(dim=1, keepdim=True)
-        smoothed = torch.where(smooth_mass > 1e-12,
-                               smoothed * mass / smooth_mass.clamp_min(1e-12), 0.0)
+        if twist:
+            rotated = torch.roll(profile, shifts=whole, dims=1) * (1.0 - fraction)
+            if fraction > 1e-12:
+                rotated = rotated + torch.roll(profile, shifts=whole + 1, dims=1) * fraction
+            rotated_mass = rotated.sum(dim=1, keepdim=True)
+            rotated = torch.where(rotated_mass > 1e-12,
+                                  rotated * mass / rotated_mass.clamp_min(1e-12), 0.0)
+            if gaussian_enabled:
+                taps = torch.arange(-2, 3, dtype=src.dtype, device=device)
+                kernel = torch.exp(-0.5 * (taps / 0.42) ** 2)
+                kernel = kernel / kernel.sum()
+                smoothed = torch.zeros_like(rotated)
+                for tap, weight in zip(range(-2, 3), kernel):
+                    smoothed = smoothed + torch.roll(rotated, shifts=tap, dims=1) * weight
+                smooth_mass = smoothed.sum(dim=1, keepdim=True)
+                smoothed = torch.where(smooth_mass > 1e-12,
+                                       smoothed * mass / smooth_mass.clamp_min(1e-12), 0.0)
+            else:
+                smoothed = rotated
+        else:
+            smoothed = profile
         out[:, :, old_hop + 1] = smoothed
     out[:, :, 0] = 0.0
     out[:, 0, 0] = 1.0
@@ -525,7 +777,9 @@ def _translate_embedding_batch_torch(sources: np.ndarray, offset: np.ndarray,
 
 
 def translate_embedding_batch(embeddings: Iterable[np.ndarray], source_to_target: np.ndarray,
-                              max_radius: float = DEFAULT_MAX_RADIUS) -> np.ndarray:
+                              max_radius: float = DEFAULT_MAX_RADIUS,
+                              twist: bool = True,
+                              gaussian_enabled: bool = True) -> np.ndarray:
     """Rotate all occupied layers by K->L, shift them down, and push a fresh up arrow.
 
     Embeddings are angle x hop (8 x 8). Angle bin zero points up and bins increase
@@ -543,16 +797,19 @@ def translate_embedding_batch(embeddings: Iterable[np.ndarray], source_to_target
     if tuple(batch.shape[1:]) != EMBEDDING_SHAPE:
         batch = np.stack([resize_embedding_cubic(item, EMBEDDING_SHAPE) for item in batch])
     offset = np.asarray(source_to_target, dtype=np.float64)
-    # Tiny packets are faster on CPU due to CUDA launch and transfer overhead.
-    if _EMBEDDING_DEVICE == "cuda" and len(batch) >= _GPU_BATCH_THRESHOLD:
-        return _translate_embedding_batch_torch(batch, offset)
-    return _translate_embedding_batch_numpy(batch, offset)
+    # Tiny packets are faster on CPU due to device launch and transfer overhead.
+    if _EMBEDDING_DEVICE in {"cuda", "mps"} and len(batch) >= _ACCELERATOR_BATCH_THRESHOLD:
+        return _translate_embedding_batch_torch(batch, offset, twist=twist, gaussian_enabled=gaussian_enabled)
+    return _translate_embedding_batch_numpy(batch, offset, twist=twist, gaussian_enabled=gaussian_enabled)
 
 
 def translate_embedding(embedding: np.ndarray, source_to_target: np.ndarray,
-                        max_radius: float = DEFAULT_MAX_RADIUS) -> np.ndarray:
+                        max_radius: float = DEFAULT_MAX_RADIUS,
+                        twist: bool = True,
+                        gaussian_enabled: bool = True) -> np.ndarray:
     """Single-embedding convenience wrapper around the batched translator."""
-    return translate_embedding_batch([embedding], source_to_target, max_radius)[0]
+    return translate_embedding_batch([embedding], source_to_target, max_radius,
+                                     twist=twist, gaussian_enabled=gaussian_enabled)[0]
 
 
 class SparseHebbianTensor:
@@ -562,11 +819,15 @@ class SparseHebbianTensor:
     Only observed combinations allocate an 8-slot time-history vector.
     """
     def __init__(self, time_depth: int = TIME_DEPTH, baseline: float = 0.1,
-                 max_weight: float = 5.0) -> None:
+                 max_weight: float = 5.0, learning_enabled: bool = True) -> None:
         self.embedding_shape = EMBEDDING_SHAPE
         self.neighbour_shape = (ANGLE_BINS, 1)
         self.time_depth = int(time_depth)
-        self.baseline = float(baseline)
+        self.learning_enabled = bool(learning_enabled)
+        # With learning disabled, represent a logical dense unit tensor implicitly.
+        # score() returns 1.0 for every source/target/neighbour/time combination,
+        # without allocating the prohibitively large dense tensor.
+        self.baseline = float(baseline) if self.learning_enabled else 1.0
         self.max_weight = float(max_weight)
         self.values: Dict[Tuple[int, ...], np.ndarray] = {}
         self.epochs: Dict[Tuple[int, ...], np.ndarray] = {}
@@ -594,7 +855,7 @@ class SparseHebbianTensor:
 
     def reward(self, source: Tuple[int, int], target: Tuple[int, int],
                neighbour: int, time_epoch: int, amount: float) -> None:
-        if amount <= 0.0:
+        if not self.learning_enabled or amount <= 0.0:
             return
         key = self._key(source, target, neighbour)
         if key not in self.values:
@@ -612,6 +873,9 @@ class SparseHebbianTensor:
 
     def wavelet_denoise(self, rng: np.random.Generator, *,
                         noise_std: float = WAVELET_NOISE_STD,
+                        noise_enabled: bool = True,
+                        haar_enabled: bool = True,
+                        gaussian_enabled: bool = True,
                         gaussian_sigma: float = WAVELET_GAUSSIAN_SIGMA,
                         threshold: float = WAVELET_THRESHOLD,
                         prune_threshold: float = NODE_TENSOR_PRUNE_THRESHOLD) -> Tuple[int, int]:
@@ -622,7 +886,7 @@ class SparseHebbianTensor:
         observed sparse keys and existing time epochs so noise cannot manufacture
         unobserved protocol facts or turn the sparse table into a dense allocation.
         """
-        if not self.values or self.updates_since_filter <= 0:
+        if not self.learning_enabled or not self.values or self.updates_since_filter <= 0:
             return 0, 0
         dense = np.zeros(LOGICAL_TENSOR_SHAPE, dtype=np.float32)
         valid_by_key: Dict[Tuple[int, ...], np.ndarray] = {}
@@ -638,12 +902,14 @@ class SparseHebbianTensor:
             self.updates_since_filter = 0
             return 0, 0
 
-        coefficients = prepare_wavelet_coefficients(
-            dense, rng, noise_std=noise_std, gaussian_sigma=gaussian_sigma,
-            threshold=threshold,
+        # On CUDA/MPS, keep the tensor on-device through forward Haar, Gaussian
+        # filtering, thresholding, and inverse Haar. Only the composed result is
+        # copied back to CPU for projection into the sparse Python weight table.
+        composed, coefficient_count = prepare_and_compose_wavelet_tensor(
+            dense, rng, noise_std=noise_std, noise_enabled=noise_enabled,
+            haar_enabled=haar_enabled, gaussian_enabled=gaussian_enabled,
+            gaussian_sigma=gaussian_sigma, threshold=threshold,
         )
-        coefficient_count = int(np.count_nonzero(coefficients))
-        composed = haar_inverse_nd(coefficients)
 
         removed_keys = []
         for key, valid in valid_by_key.items():
@@ -669,6 +935,8 @@ class SparseHebbianTensor:
 
     def score(self, source: Tuple[int, int], target: Tuple[int, int],
               neighbour: int, time_epoch: int, decay: float = 0.97) -> float:
+        if not self.learning_enabled:
+            return 1.0
         key = self._key(source, target, neighbour)
         if key not in self.values:
             return self.baseline
@@ -813,6 +1081,7 @@ class Message:
     target_eth_address: bytes = b""
     tensor_payload: bytes = b""
     tensor_shape: Tuple[int, ...] = (1, *EMBEDDING_SHAPE)
+    tensor_codec: str = "sparse-haar+zlib"
     tensor_coefficient_count: int = 0
     tensor_uncompressed_bytes: int = 0
     decoded_items: Optional[List[Signal]] = field(default=None, repr=False)
@@ -841,8 +1110,22 @@ class Message:
         if self.decoded_items is not None:
             return self.decoded_items, self.decoded_tensor
         if self.tensor_payload:
-            coefficients = unpack_sparse_wavelet_coefficients(self.tensor_payload, self.tensor_shape)
-            reconstructed = haar_inverse_nd(coefficients)
+            if self.tensor_codec == "sparse-haar+zlib":
+                coefficients = unpack_sparse_wavelet_coefficients(self.tensor_payload, self.tensor_shape)
+                reconstructed = haar_inverse_nd(coefficients)
+            elif self.tensor_codec == "haar-f32":
+                expected = int(np.prod(self.tensor_shape)) * 4
+                if len(self.tensor_payload) != expected:
+                    raise ValueError("uncompressed Haar coefficient payload has incorrect length")
+                coefficients = np.frombuffer(self.tensor_payload, dtype="<f4").copy().reshape(self.tensor_shape)
+                reconstructed = haar_inverse_nd(coefficients)
+            elif self.tensor_codec == "raw-f32":
+                expected = int(np.prod(self.tensor_shape)) * 4
+                if len(self.tensor_payload) != expected:
+                    raise ValueError("raw tensor payload has incorrect length")
+                reconstructed = np.frombuffer(self.tensor_payload, dtype="<f4").copy().reshape(self.tensor_shape)
+            else:
+                raise ValueError(f"unknown tensor codec: {self.tensor_codec}")
             reconstructed = np.maximum(reconstructed, 0.0).astype(np.float32, copy=False)
             restored = reconstructed[:len(self.items)].copy()
             for index, item in enumerate(self.items):
@@ -868,7 +1151,7 @@ class Message:
             "to_address": self.target_eth_address,
             "signals": [item.metadata for item in self.items],
             "tensor_shape": self.tensor_shape,
-            "tensor_codec": "sparse-haar+zlib",
+            "tensor_codec": self.tensor_codec,
             "tensor_payload_bytes": len(self.tensor_payload),
             "tensor_coefficient_count": self.tensor_coefficient_count,
         }
@@ -896,7 +1179,16 @@ Event = Union[Timer, Message, Fallback]
 class Simulation:
     def __init__(self, *, link_delay: float = 0.015, forwarding_threshold: float = 0.20,
                  coefficient_decay: float = 0.97, fallback_timeout: float = 5.0,
-                 initial_ttl: int = DEFAULT_TTL, wavelet_seed: int = 42) -> None:
+                 initial_ttl: int = DEFAULT_TTL, wavelet_seed: int = 42,
+                 learning_enabled: bool = True, noise_enabled: bool = True,
+                 haar_enabled: bool = True, gaussian_enabled: bool = True,
+                 compression_enabled: bool = True, ttl_enabled: bool = True,
+                 twist_enabled: bool = True, noise_strength: float = WAVELET_NOISE_STD,
+                 gaussian_width: float = WAVELET_GAUSSIAN_SIGMA,
+                 threshold: float = MESSAGE_WAVELET_THRESHOLD,
+                 node_threshold: float = WAVELET_THRESHOLD,
+                 hebbian_reward: float = DEFAULT_HEBBIAN_REWARD,
+                 event_log_path: Optional[str] = None) -> None:
         if link_delay < 0:
             raise ValueError("link_delay must be non-negative")
         if fallback_timeout <= 0:
@@ -906,10 +1198,29 @@ class Simulation:
         self.fallback_timeout = float(fallback_timeout)
         self.forwarding_threshold = float(forwarding_threshold)
         self.coefficient_decay = float(coefficient_decay)
+        self.learning_enabled = bool(learning_enabled)
+        self.noise_enabled = bool(noise_enabled)
+        self.haar_enabled = bool(haar_enabled)
+        self.gaussian_enabled = bool(gaussian_enabled) and self.haar_enabled
+        self.compression_enabled = bool(compression_enabled) and self.haar_enabled
+        self.ttl_enabled = bool(ttl_enabled)
+        self.twist_enabled = bool(twist_enabled)
+        self.noise_strength = float(noise_strength)
+        self.gaussian_width = float(gaussian_width)
+        self.wavelet_threshold = float(threshold)
+        self.node_threshold = float(node_threshold)
+        self.hebbian_reward = float(hebbian_reward)
         self.initial_ttl = int(initial_ttl)
         self.wavelet_rng = np.random.default_rng(int(wavelet_seed))
-        if self.initial_ttl < 1:
-            raise ValueError("initial_ttl must be >= 1")
+        if self.initial_ttl < 1 and self.ttl_enabled:
+            raise ValueError("initial_ttl must be >= 1 when TTL is enabled")
+        if self.noise_strength < 0 or self.gaussian_width < 0 or self.wavelet_threshold < 0 or self.node_threshold < 0:
+            raise ValueError("noise strength, Gaussian width and thresholds must be >= 0")
+        if self.hebbian_reward < 0:
+            raise ValueError("Hebbian reward must be >= 0")
+        self.event_log_path = event_log_path
+        self._event_log = open(event_log_path, "w", encoding="utf-8") if event_log_path else None
+        self._logged_messages = 0
         self._queue: List[Tuple[float, int, Event]] = []
         self._order = 0
         self.nodes: Dict[int, P2PNode] = {}
@@ -976,6 +1287,66 @@ class Simulation:
         heapq.heappush(self._queue, (dispatch, self._order, event))
         self._order += 1
         self.peak_queue_size = max(self.peak_queue_size, len(self._queue))
+        if isinstance(event, Message) and self._event_log is not None:
+            self._write_event_log(event)
+
+    def _write_event_log(self, message: Message) -> None:
+        """Write one JSONL row per scheduled message, including the tensor as hex."""
+        if self._event_log is None:
+            return
+        if message.tensor_payload:
+            tensor_bytes = message.tensor_payload
+            tensor_encoding = message.tensor_codec
+        elif message.items:
+            local_tensor = np.stack([
+                resize_embedding_cubic(item.embedding, EMBEDDING_SHAPE)
+                for item in message.items
+            ]).astype("<f4", copy=False)
+            tensor_bytes = local_tensor.tobytes()
+            tensor_encoding = "local-raw-f32"
+        else:
+            tensor_bytes = b""
+            tensor_encoding = "none"
+        signals = []
+        for item in message.items:
+            signals.append({
+                "signal_id": item.signal_id.hex(),
+                "type": item.kind,
+                "origin_address": item.origin_address.hex(),
+                "target_address": item.target_address.hex() if item.target_address is not None else None,
+                "sequence_id": item.sequence_id,
+                "ttl": item.ttl,
+                "hop_count": item.hop_count,
+                "embedding_depth": item.embedding_depth,
+                "route_attempt": item.route_attempt,
+                "visited_addresses": [address_for_node(n).hex() for n in item.visited],
+                "route_path_addresses": [address_for_node(n).hex() for n in item.route_path],
+                "return_path_addresses": [address_for_node(n).hex() for n in item.return_path],
+            })
+        row = {
+            "row": self._logged_messages,
+            "event_type": message.kind,
+            "sent_at": message.sent_at,
+            "dispatch_time": message.dispatch_time,
+            "from_node": message.source_address,
+            "to_node": message.target_address,
+            "from_address": message.source_eth_address.hex(),
+            "to_address": message.target_eth_address.hex(),
+            "signal_count": len(message.items),
+            "signals": signals,
+            "tensor_shape": list(message.tensor_shape),
+            "tensor_encoding": tensor_encoding,
+            "tensor_payload_bytes": len(tensor_bytes),
+            "tensor_hex": tensor_bytes.hex(),
+        }
+        self._event_log.write(json.dumps(row, separators=(",", ":")) + "\n")
+        self._logged_messages += 1
+
+    def close_event_log(self) -> None:
+        if self._event_log is not None:
+            self._event_log.flush()
+            self._event_log.close()
+            self._event_log = None
 
     @property
     def pending_events(self) -> int:
@@ -1154,7 +1525,8 @@ class P2PNode:
         # Logical Source(8x8) x Target(8x8) x Neighbour(8x1) x Time(8),
         # stored sparsely so unobserved combinations cost no memory.
         self.tensor = SparseHebbianTensor(time_depth=time_depth, baseline=0.1,
-                                          max_weight=5.0)
+                                          max_weight=5.0,
+                                          learning_enabled=sim.learning_enabled)
 
         # Exactly one live timer slot; all nodes begin idle and unstunned.
         self.current_timer: Optional[Timer] = None
@@ -1249,7 +1621,8 @@ class P2PNode:
                 raise RuntimeError("received message tensor was not reconstructed correctly")
             if not np.all(np.isfinite(decoded_message_tensor)):
                 raise RuntimeError("received message tensor contains non-finite values")
-            self.sim.message_wavelet_decoded += 1
+            if message.tensor_codec in {"sparse-haar+zlib", "haar-f32"}:
+                self.sim.message_wavelet_decoded += 1
             self.sim.message_tensor_reconstructed_mass += float(
                 np.sum(decoded_message_tensor, dtype=np.float64)
             )
@@ -1295,12 +1668,14 @@ class P2PNode:
             prepared.append([received, is_first, better_path, is_self_loopback, local_embedding])
 
         # All protocol items inside a packet have the same immediate sender, so they
-        # share a coordinate-frame offset. Transform them as one batch (CUDA for large
-        # bundles when available; vectorized NumPy cubic interpolation otherwise).
+        # share a coordinate-frame offset. Transform them as one batch (CUDA or Apple MPS for large bundles when available;
+        # vectorized NumPy cubic interpolation otherwise).
         translate_indices = [i for i, entry in enumerate(prepared) if not entry[3]]
         if translate_indices:
             translated = translate_embedding_batch(
-                [prepared[i][0].embedding for i in translate_indices], offset, self.max_radius
+                [prepared[i][0].embedding for i in translate_indices], offset, self.max_radius,
+                twist=self.sim.twist_enabled,
+                gaussian_enabled=self.sim.gaussian_enabled,
             )
             for item_index, local_embedding in zip(translate_indices, translated):
                 prepared[item_index][4] = local_embedding
@@ -1414,11 +1789,15 @@ class P2PNode:
         from is a known direction toward the beacon's exact origin. Announces only
         receive the stronger reward when explicit success feedback returns.
         """
+        if not self.sim.learning_enabled:
+            return
         learning_signal = signal if forward_hop is None else replace(signal, hop_count=int(forward_hop))
         source_bins = self._source_signature_weights(learning_signal)
         target_bins = self._target_signature_weights(learning_signal)
         neighbour_bins = self._neighbour_signature_weights(forward_neighbour_id)
-        base_reward = 0.12 if signal.kind == "beacon" else 0.35
+        # Default 0.35 preserves the established 0.35 feedback and 0.12 beacon rewards.
+        reward_scale = self.sim.hebbian_reward / DEFAULT_HEBBIAN_REWARD
+        base_reward = (0.12 if signal.kind == "beacon" else DEFAULT_HEBBIAN_REWARD) * reward_scale
         reward = base_reward * signal.coefficient / (1.0 + 0.25 * max(0, learning_signal.hop_count))
         for source, sw in source_bins:
             for target, tw in target_bins:
@@ -1465,7 +1844,7 @@ class P2PNode:
         return expected
 
     def _choose_destinations(self, signal: Signal) -> Tuple[List[int], bool]:
-        if signal.ttl <= 0:
+        if self.sim.ttl_enabled and signal.ttl <= 0:
             self.sim.signal_items_dropped_ttl += 1
             return [], False
         if signal.kind == "feedback":
@@ -1543,18 +1922,35 @@ class P2PNode:
                 item.kind, item.origin_address, item.target_address or b"",
                 item.sequence_id, item.hop_count, item.route_attempt,
             ))
-            # Sender path: noise -> Haar along every message-tensor axis -> Gaussian
-            # blur -> soft threshold -> sparse DEFLATE. Do not compose at the sender.
+            # Configurable sender path. Default: noise -> Haar all axes -> Gaussian
+            # coefficient blur -> threshold -> sparse DEFLATE. The receiver performs
+            # the inverse Haar. --no-haar keeps noise but sends the noisy tensor raw.
             message_tensor = self._build_message_tensor(items)
-            coefficients = prepare_wavelet_coefficients(
+            processed_tensor = prepare_wavelet_coefficients(
                 message_tensor, self.sim.wavelet_rng,
-                threshold=MESSAGE_WAVELET_THRESHOLD,
+                noise_std=self.sim.noise_strength, noise_enabled=self.sim.noise_enabled,
+                haar_enabled=self.sim.haar_enabled,
+                gaussian_enabled=self.sim.gaussian_enabled,
+                gaussian_sigma=self.sim.gaussian_width,
+                threshold=self.sim.wavelet_threshold,
             )
-            tensor_payload, coefficient_count = pack_sparse_wavelet_coefficients(coefficients)
             tensor_shape = tuple(message_tensor.shape)
+            if self.sim.haar_enabled:
+                coefficient_count = int(np.count_nonzero(processed_tensor))
+                if self.sim.compression_enabled:
+                    tensor_payload, coefficient_count = pack_sparse_wavelet_coefficients(processed_tensor)
+                    tensor_codec = "sparse-haar+zlib"
+                else:
+                    tensor_payload = processed_tensor.astype("<f4", copy=False).tobytes()
+                    tensor_codec = "haar-f32"
+            else:
+                coefficient_count = int(np.count_nonzero(processed_tensor))
+                tensor_payload = processed_tensor.astype("<f4", copy=False).tobytes()
+                tensor_codec = "raw-f32"
             wire_items = [replace(item, embedding=np.zeros(EMBEDDING_SHAPE, dtype=np.float32))
                           for item in items]
-            self.sim.message_wavelet_encoded += 1
+            if self.sim.haar_enabled:
+                self.sim.message_wavelet_encoded += 1
             self.sim.message_tensor_raw_bytes += int(message_tensor.nbytes)
             self.sim.message_tensor_compressed_bytes += len(tensor_payload)
             self.sim.message_wavelet_coefficients += coefficient_count
@@ -1579,6 +1975,7 @@ class P2PNode:
             target_eth_address=self.nodes[destination_id].address,
             tensor_payload=tensor_payload,
             tensor_shape=tensor_shape,
+            tensor_codec=(tensor_codec if is_network_send else "local"),
             tensor_coefficient_count=coefficient_count,
             tensor_uncompressed_bytes=(int(message_tensor.nbytes) if message_tensor is not None else 0),
         )
@@ -1646,9 +2043,14 @@ class P2PNode:
         # Denoise the full six-axis learned tensor periodically, amortizing the
         # dense Haar operation across stun clusters. The reconstructed tensor is
         # projected back into sparse storage before its weights are queried.
-        if (self.tensor.updates_since_filter > 0
+        if (self.sim.learning_enabled and self.tensor.updates_since_filter > 0
                 and self.timer_fires % NODE_WAVELET_EVERY_N_TIMERS == 0):
-            coefficient_count, pruned = self.tensor.wavelet_denoise(self.sim.wavelet_rng)
+            coefficient_count, pruned = self.tensor.wavelet_denoise(
+                self.sim.wavelet_rng, noise_std=self.sim.noise_strength,
+                noise_enabled=self.sim.noise_enabled, haar_enabled=self.sim.haar_enabled,
+                gaussian_enabled=self.sim.gaussian_enabled,
+                gaussian_sigma=self.sim.gaussian_width, threshold=self.sim.node_threshold,
+            )
             if coefficient_count or pruned:
                 self.sim.node_wavelet_filter_passes += 1
                 self.sim.node_wavelet_coefficients += coefficient_count
@@ -1699,7 +2101,7 @@ class P2PNode:
                 continue
             destinations, smart = self._choose_destinations(signal)
             for destination_id in destinations:
-                if signal.ttl <= 0:
+                if self.sim.ttl_enabled and signal.ttl <= 0:
                     self.sim.signal_items_dropped_ttl += 1
                     continue
                 forwarded = replace(
@@ -1710,7 +2112,7 @@ class P2PNode:
                              else signal.visited + (self.id,)),
                     return_path=(signal.return_path[1:] if signal.kind == "feedback"
                                  else signal.return_path),
-                    ttl=signal.ttl - 1,
+                    ttl=(signal.ttl - 1 if self.sim.ttl_enabled else signal.ttl),
                     coefficient=signal.coefficient * self.sim.coefficient_decay,
                 )
                 dest_items = by_destination.setdefault(destination_id, {})
@@ -1778,7 +2180,8 @@ def _schedule_join_intent(sim: Simulation, nodes: Dict[int, P2PNode], when: floa
 def build_demo(node_count: int = 100, seed: int = 42, beacon_interval: float = 1.0,
                join_interval: float = 0.05, extra_connect_requests: int = 20,
                announce_spacing: float = 0.25, forwarding_threshold: float = 0.20,
-               fallback_timeout: float = 5.0, initial_ttl: int = DEFAULT_TTL
+               fallback_timeout: float = 5.0, initial_ttl: int = DEFAULT_TTL,
+               learning_enabled: bool = True, **sim_options
                ) -> Tuple[Simulation, Dict[int, P2PNode], dict]:
     """Start with no links and queue real join requests that construct the graph.
 
@@ -1794,7 +2197,8 @@ def build_demo(node_count: int = 100, seed: int = 42, beacon_interval: float = 1
         raise ValueError("extra_connect_requests must be non-negative")
     rng = random.Random(seed)
     sim = Simulation(forwarding_threshold=forwarding_threshold, fallback_timeout=fallback_timeout,
-                     initial_ttl=initial_ttl, wavelet_seed=seed)
+                     initial_ttl=initial_ttl, wavelet_seed=seed,
+                     learning_enabled=learning_enabled, **sim_options)
     nodes: Dict[int, P2PNode] = {}
     sim.nodes = nodes
     for node_id in range(node_count):
@@ -1875,13 +2279,71 @@ def _is_connected(nodes: Dict[int, P2PNode], active_ids: List[int]) -> bool:
 
 
 def run_self_tests() -> None:
-    # 0. Multidimensional Haar transforms cover every axis and invert cleanly.
+    # 0. Device selection is backend-generic. Mock hardware discovery so the
+    # preference logic can be tested on a CPU-only host as well as on Macs.
+    original_cuda_available = _cuda_available
+    original_mps_available = _mps_available
+    original_device = _EMBEDDING_DEVICE
+    try:
+        globals()["_cuda_available"] = lambda: False
+        globals()["_mps_available"] = lambda: False
+        assert configure_embedding_device("auto") == "cpu"
+        assert available_embedding_devices() == ("cpu",)
+
+        globals()["_cuda_available"] = lambda: False
+        globals()["_mps_available"] = lambda: True
+        assert configure_embedding_device("auto") == "mps"
+        assert configure_embedding_device("mps") == "mps"
+        assert available_embedding_devices() == ("mps", "cpu")
+
+        globals()["_cuda_available"] = lambda: True
+        globals()["_mps_available"] = lambda: True
+        assert configure_embedding_device("auto") == "cuda"
+        assert available_embedding_devices() == ("cuda", "mps", "cpu")
+        assert configure_embedding_device("cpu") == "cpu"
+
+        globals()["_cuda_available"] = lambda: False
+        globals()["_mps_available"] = lambda: False
+        for unavailable in ("cuda", "mps"):
+            try:
+                configure_embedding_device(unavailable)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(f"explicit unavailable device {unavailable!r} must fail clearly")
+    finally:
+        globals()["_cuda_available"] = original_cuda_available
+        globals()["_mps_available"] = original_mps_available
+        globals()["_EMBEDDING_DEVICE"] = original_device
+
+    # 1. Multidimensional Haar transforms cover every axis and invert cleanly.
     wavelet_rng = np.random.default_rng(123)
     wavelet_probe = wavelet_rng.normal(size=LOGICAL_TENSOR_SHAPE).astype(np.float32)
     wavelet_coefficients = haar_forward_nd(wavelet_probe)
     wavelet_rebuilt = haar_inverse_nd(wavelet_coefficients)
     assert wavelet_coefficients.shape == LOGICAL_TENSOR_SHAPE
     assert np.max(np.abs(wavelet_probe - wavelet_rebuilt)) < 1e-5
+
+    # Explicitly test the PyTorch implementation on the selected accelerator,
+    # or on CPU when no accelerator exists. This validates the exact same
+    # operation sequence used by the MPS/CUDA wavelet pipeline.
+    if torch is not None:
+        torch_test_device = _accelerator_tensor_device() or torch.device("cpu")
+        torch_probe_np = np.random.default_rng(321).normal(size=(2, 8, 8)).astype(np.float32)
+        with torch.no_grad():
+            torch_probe = torch.as_tensor(torch_probe_np, device=torch_test_device)
+            torch_coeff = _haar_forward_nd_torch(torch_probe)
+            torch_rebuilt = _haar_inverse_nd_torch(torch_coeff)
+            assert tuple(torch_coeff.shape) == torch_probe_np.shape
+            assert float(torch.max(torch.abs(torch.as_tensor(torch_probe_np, device=torch_test_device) - torch_rebuilt)).item()) < 1e-5
+            torch_blurred = _torch_gaussian_filter_nd(torch_coeff, 0.30)
+            assert tuple(torch_blurred.shape) == torch_probe_np.shape
+            assert bool(torch.isfinite(torch_blurred).all().item())
+            scipy_blurred = gaussian_filter(
+                torch_coeff.detach().cpu().numpy(), sigma=(0.30,) * torch_coeff.ndim,
+                mode="nearest",
+            )
+            assert float(np.max(np.abs(torch_blurred.detach().cpu().numpy() - scipy_blurred))) < 2e-5
     noisy_coefficients = prepare_wavelet_coefficients(
         np.zeros(LOGICAL_TENSOR_SHAPE, dtype=np.float32), wavelet_rng
     )
@@ -1890,6 +2352,24 @@ def run_self_tests() -> None:
     unpacked_coefficients = unpack_sparse_wavelet_coefficients(packed_coefficients)
     assert packed_count == int(np.count_nonzero(wavelet_coefficients))
     assert np.array_equal(unpacked_coefficients, wavelet_coefficients)
+
+    # --no-learning control: every logical entry has unit weight, with no updates.
+    neutral_tensor = SparseHebbianTensor(learning_enabled=False)
+    assert neutral_tensor.score((0, 0), (7, 7), 3, time_epoch=0) == 1.0
+    neutral_tensor.reward((0, 0), (7, 7), 3, time_epoch=0, amount=2.0)
+    assert neutral_tensor.stored_combinations == 0
+    assert neutral_tensor.reward_total == 0.0
+    assert neutral_tensor.wavelet_denoise(wavelet_rng) == (0, 0)
+    assert neutral_tensor.score((0, 0), (7, 7), 3, time_epoch=99) == 1.0
+    neutral_sim = Simulation(learning_enabled=False)
+    neutral_nodes: Dict[int, P2PNode] = {}
+    neutral_node = P2PNode(991, neutral_sim, neutral_nodes)
+    neutral_nodes[991] = neutral_node
+    neutral_signal = Signal("beacon", make_self_embedding(EMBEDDING_SHAPE), 991, 1)
+    neutral_node._apply_embedding_reward(neutral_signal, 991)
+    assert neutral_node.messages_applied == 0
+    assert neutral_sim.beacon_path_rewards == 0
+    assert neutral_node.tensor.reward_total == 0.0
 
     # Node tensor: sparse weights survive the six-axis denoise and remain sparse.
     denoise_tensor = SparseHebbianTensor()
@@ -2038,6 +2518,7 @@ def run_self_tests() -> None:
     assert abs(float(decoded_items[0].embedding.sum()) - 1.0) < 1e-5
     assert len(decoded_items[0].origin_address) == 20
 
+    print("PASS: CUDA/MPS/CPU device selection and availability checks.", flush=True)
     print("PASS: fixed 8-layer twists, accumulated rotations, empty layers, all-axis Haar,", flush=True)
     print("      noise/blur/threshold, compressed message reconstruction and sparse node denoise.", flush=True)
 
@@ -2164,9 +2645,45 @@ def run_self_tests() -> None:
     assert fb_nodes[1].tensor.reward_total > 0.0
     assert fb_sim.signal_items_dropped_ttl == 0, fb_sim.signal_items_dropped_ttl
 
+    # 12. Processing switches and long-hex JSONL event log.
+    no_haar_probe = prepare_wavelet_coefficients(
+        np.ones((2, 8, 8), dtype=np.float32), np.random.default_rng(1),
+        noise_enabled=False, haar_enabled=False, gaussian_enabled=True,
+        gaussian_sigma=4.0, threshold=0.9,
+    )
+    assert np.array_equal(no_haar_probe, np.ones((2, 8, 8), dtype=np.float32))
+    untwisted = translate_embedding(origin, thirty_degrees, twist=False)
+    assert np.argmax(untwisted[:, 1]) == 0, "--no-twist must retain inherited direction without rotation"
+    with tempfile.NamedTemporaryFile(mode="r+", suffix=".jsonl", delete=False, encoding="utf-8") as log_file:
+        log_path = log_file.name
+    try:
+        log_sim = Simulation(event_log_path=log_path)
+        log_nodes: Dict[int, P2PNode] = {}
+        log_nodes[0] = P2PNode(0, log_sim, log_nodes)
+        log_nodes[1] = P2PNode(1, log_sim, log_nodes)
+        log_sim.nodes = log_nodes
+        log_signal = Signal("beacon", make_self_embedding(), 0, 3)
+        logged = Message(0.1, 0, 1, log_nodes[1], [log_signal], tensor_payload=b"\x01\x02",
+                         tensor_codec="test-codec")
+        log_sim.schedule(logged)
+        log_sim.close_event_log()
+        rows = [json.loads(line) for line in open(log_path, encoding="utf-8") if line.strip()]
+        assert len(rows) == 1, len(rows)
+        assert rows[0]["tensor_hex"] == "0102"
+        assert len(rows[0]["from_address"]) == 40 and len(rows[0]["to_address"]) == 40
+        assert rows[0]["signals"][0]["origin_address"] == address_for_node(0).hex()
+    finally:
+        try:
+            import os
+            os.unlink(log_path)
+        except FileNotFoundError:
+            pass
+
     print("PASS: all-axis Haar round-trip, noise/blur/threshold, sparse node denoise,")
     print("      compressed message tensor decode, exact 20-byte metadata, timer coalescing,")
+    print("      neutral unit-weight tensor with --no-learning mode.")
     print("      TTL expiry, success feedback, dynamic joins, announces and mesh fallback.")
+    print("      pipeline switches, no-twist behavior, and JSONL event-log hex payloads.")
 
 
 def main() -> None:
@@ -2188,8 +2705,28 @@ def main() -> None:
     parser.add_argument("--max-events", type=int, default=750_000)
     parser.add_argument("--progress-every", type=int, default=0,
                         help="print a progress line every N dispatched events (0 disables it)")
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto",
-                        help="embedding transform device; auto uses CUDA when PyTorch sees a GPU")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto",
+                        help="tensor compute device for embeddings and Haar/Gaussian/inverse-Haar; auto prefers CUDA, then Apple MPS, then CPU")
+    parser.add_argument("--no-learning", action="store_true",
+                        help="disable Hebbian updates and node-tensor denoising; use uniform unit routing weights")
+    parser.add_argument("--no-noise", action="store_true", help="disable random background noise before tensor processing")
+    parser.add_argument("--no-haar", action="store_true", help="disable Haar decomposition, Gaussian filtering and compression; noise remains enabled unless --no-noise is also supplied")
+    parser.add_argument("--no-gaussian", action="store_true", help="disable Gaussian smoothing in Haar coefficient space")
+    parser.add_argument("--no-compression", action="store_true", help="send dense float32 Haar coefficients without zlib compression")
+    parser.add_argument("--no-ttl", action="store_true", help="ignore TTL checks and do not decrement TTL at relays")
+    parser.add_argument("--no-twist", action="store_true", help="shift the fixed embedding stack without rotating inherited directions")
+    parser.add_argument("--noise-strength", type=float, default=WAVELET_NOISE_STD,
+                        help=f"Gaussian background-noise standard deviation (default: {WAVELET_NOISE_STD})")
+    parser.add_argument("--gaussian-width", type=float, default=WAVELET_GAUSSIAN_SIGMA,
+                        help=f"Gaussian sigma in wavelet coefficient space (default: {WAVELET_GAUSSIAN_SIGMA})")
+    parser.add_argument("--threshold", type=float, default=MESSAGE_WAVELET_THRESHOLD,
+                        help=f"soft-threshold for message Haar coefficients (default: {MESSAGE_WAVELET_THRESHOLD})")
+    parser.add_argument("--node-threshold", type=float, default=WAVELET_THRESHOLD,
+                        help=f"soft-threshold for internal node tensor coefficients (default: {WAVELET_THRESHOLD})")
+    parser.add_argument("--hebbian-reward", type=float, default=DEFAULT_HEBBIAN_REWARD,
+                        help=f"base success-feedback reward; default preserves beacon=0.12 and feedback=0.35")
+    parser.add_argument("--event-log", type=str, default=None,
+                        help="write each scheduled message as one JSONL row, with tensor bytes hex-encoded")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     try:
@@ -2203,12 +2740,27 @@ def main() -> None:
     sim, nodes, meta = build_demo(
         args.nodes, args.seed, args.beacon_interval, args.join_interval,
         args.extra_connect_requests, args.announce_spacing, args.forwarding_threshold,
-        args.fallback_timeout, args.ttl,
+        args.fallback_timeout, args.ttl, learning_enabled=not args.no_learning,
+        noise_enabled=not args.no_noise,
+        haar_enabled=not args.no_haar,
+        gaussian_enabled=not args.no_gaussian and not args.no_haar,
+        compression_enabled=not args.no_compression and not args.no_haar,
+        ttl_enabled=not args.no_ttl,
+        twist_enabled=not args.no_twist,
+        noise_strength=args.noise_strength,
+        gaussian_width=args.gaussian_width,
+        threshold=args.threshold,
+        node_threshold=args.node_threshold,
+        hebbian_reward=args.hebbian_reward,
+        event_log_path=args.event_log,
     )
     duration = args.duration if args.duration is not None else max(10.0, meta["last_intent_time"] + 8.0)
     start = time.perf_counter()
-    processed = sim.run(until=duration, max_events=args.max_events,
-                        progress_every=args.progress_every)
+    try:
+        processed = sim.run(until=duration, max_events=args.max_events,
+                            progress_every=args.progress_every)
+    finally:
+        sim.close_event_log()
     wall = time.perf_counter() - start
 
     active = [node for node in nodes.values() if node.active]
@@ -2228,7 +2780,11 @@ def main() -> None:
 
     print("=" * 78)
     print("EVENT-DRIVEN P2P SIMULATION — DYNAMIC JOINS + BUNDLED SIGNALS")
-    print(f"Embedding transform backend:                      {embedding_backend_name()}")
+    print(f"Tensor compute backend:                           {embedding_backend_name()}")
+    print(f"Hebbian learning:                                 {'ENABLED' if sim.learning_enabled else 'DISABLED (uniform unit weights)'}")
+    print(f"Tensor pipeline: noise={'on' if sim.noise_enabled else 'off'} ({sim.noise_strength:g}), Haar={'on' if sim.haar_enabled else 'off'}, Gaussian={'on' if sim.gaussian_enabled else 'off'} (sigma={sim.gaussian_width:g}), compression={'on' if sim.compression_enabled else 'off'}, TTL={'on' if sim.ttl_enabled else 'off'}, twist={'on' if sim.twist_enabled else 'off'}")
+    if sim.event_log_path:
+        print(f"Event log:                                        {sim.event_log_path} ({sim._logged_messages:,} rows)")
     print("=" * 78)
     print(f"Candidates / joined nodes:                       {len(nodes):,} / {len(active):,}")
     print(f"Edges / graph connected:                         {edge_count:,} / {_is_connected(nodes, active_ids)}")
@@ -2260,11 +2816,12 @@ def main() -> None:
     tensor_payload_ratio = (100.0 * (1.0 - sim.message_tensor_compressed_bytes / sim.message_tensor_raw_bytes)
                             if sim.message_tensor_raw_bytes else 0.0)
     print(f"Wavelet tensor encoded / decoded:                  {sim.message_wavelet_encoded:,} / {sim.message_wavelet_decoded:,}")
-    print(f"Message tensor raw / compressed coefficients:       {sim.message_tensor_raw_bytes:,} / {sim.message_tensor_compressed_bytes:,} bytes ({tensor_payload_ratio:.1f}% payload reduction; metadata excluded)")
+    print(f"Message tensor raw / encoded payload:               {sim.message_tensor_raw_bytes:,} / {sim.message_tensor_compressed_bytes:,} bytes ({tensor_payload_ratio:.1f}% payload reduction; metadata excluded)")
     print(f"Nonzero Haar coefficients transmitted:              {sim.message_wavelet_coefficients:,}")
-    print(f"Signal copies on learned routes / fallback ripple: {sim.smart_signal_copies:,} / {sim.fallback_ripple_signal_copies:,}")
+    print(f"Signal copies threshold-selected / fallback ripple: {sim.smart_signal_copies:,} / {sim.fallback_ripple_signal_copies:,}")
     print(f"Reverse-path success-feedback copies:               {sim.feedback_signal_copies:,}")
-    print(f"Share of data-signal copies using learned threshold: {smart_percent:.1f}%")
+    route_label = "threshold-selected" if not sim.learning_enabled else "using learned threshold"
+    print(f"Share of data-signal copies {route_label:23s}: {smart_percent:.1f}%")
     print(f"Duplicate/loop copies rejected:                    {sim.signal_items_dropped_as_duplicates:,}")
     print(f"Signals dropped by TTL / hop limit:                 {sim.signal_items_dropped_ttl:,} / {sim.signal_items_dropped_hop_limit:,}")
     print(f"No eligible next hop:                              {sim.no_route_signal_drops:,}")
@@ -2280,7 +2837,8 @@ def main() -> None:
     print(f"Total Hebbian weight increase over baseline:        {rewards:.2f}")
     print(f"Node tensor Haar denoise passes / coefficients:      {sim.node_wavelet_filter_passes:,} / {sim.node_wavelet_coefficients:,}")
     print(f"Node tensor sparse keys pruned by filtering:         {sim.node_wavelet_keys_pruned:,}")
-    print(f"Initial per-signal TTL:                              {sim.initial_ttl}")
+    print(f"Hebbian base reward / message threshold:             {sim.hebbian_reward:g} / {sim.wavelet_threshold:g}")
+    print(f"Initial per-signal TTL / enforcement:                {sim.initial_ttl} / {'ON' if sim.ttl_enabled else 'OFF'}")
     print(f"Embedding dimensions (angle x 8-hop history):        {EMBEDDING_SHAPE}")
     print(f"Logical tensor: Source(8x8) x Target(8x8) x Neighbour(8x1) x Time({active[0].time_depth if active else TIME_DEPTH})")
     print(f"Sparse learned combinations / time slots:           {sum(n.tensor.stored_combinations for n in active):,} / {sum(n.tensor.stored_time_slots for n in active):,}")
