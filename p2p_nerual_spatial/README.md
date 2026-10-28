@@ -1,11 +1,5 @@
 # Neural Hebbian P2P Simulator
 
-**Author:** [Sonia Code](https://github.com/sadhbh-c0d3)
-
-*Copyright (c) 2026 Sonia Kolasinska / Imperfect Protocol. All Rights Reserved.*
-
----
-
 An experimental, event-driven Python simulator for a peer-to-peer network that forms dynamically, propagates beacon and announce signals, coalesces traffic during short stun windows, and learns which next hops have been useful.
 
 The aim is not perfect neural routing. It is to improve ordinary ripple gossip under contention by combining:
@@ -147,7 +141,7 @@ The simulator uses deterministic 20-byte address-like values derived from node I
 
 ### 4. Embeddings and learning tensor
 
-A compact embedding is an `8 × 8` array representing **angle × hop**. The angle dimension is circular, and each graph edge advances the path by one hop. Embedding translation uses Cartesian displacement internally, periodic cubic angular interpolation, and light Gaussian smoothing.
+A compact embedding is a fixed `8 × 8` array representing **angle × the eight most recent hop-history layers**. Layer 0 is always the current node's canonical unit-up arrow. The remaining layers contain inherited path directions, transformed into the current node's frame. Angles are circular, bin 0 points up (+Y), and positive rotation is clockwise. For each K→L relay, the simulator calculates the signed direction angle of the K→L displacement, rotates every occupied layer by that angle, shifts the layers down one slot, discards the oldest layer, and pushes a fresh unit-up arrow at layer 0. The occupied-layer depth is retained as exact metadata so noise and wavelet reconstruction cannot invent path history in the seven initially empty layers. Each occupied angular profile is kept as a normalized fuzzy direction distribution.
 
 The node's logical learning tensor is:
 
@@ -169,7 +163,7 @@ The current filtering pipeline is:
 4. Soft-threshold small coefficients.
 5. For node learning state, inverse-transform the coefficients and project the result back onto already observed sparse entries.
 
-Node tensor filtering is periodically triggered after a configured number of timer firings. Message tensors are encoded as sparse, thresholded Haar coefficients and compressed with Python's `zlib`/DEFLATE. The receiver decompresses the coefficients and applies the inverse Haar transform. A compressed embedding sidecar retains per-signal embeddings, aligned with metadata, because an aggregate tensor by itself cannot reconstruct each distinct signal's embedding.
+Node tensor filtering is periodically triggered after a configured number of timer firings. Message tensors are encoded as sparse, thresholded Haar coefficients and compressed with Python's `zlib`/DEFLATE. The receiver decompresses the coefficients and applies the inverse Haar transform, then re-applies each signal's exact occupied-layer mask and normalizes its occupied direction profiles. The message tensor is a padded stack of per-signal embeddings, with metadata rows kept in the same order so signal addresses, IDs, TTLs, targets, and embedding depth remain exact.
 
 The current logical dense tensor has shape `8 × 8 × 8 × 8 × 8 × 8` (262,144 float32 values, about 1 MiB before overhead). Node storage is sparse, but a node wavelet-filter pass temporarily materializes a dense array. This can become a performance bottleneck as the simulation grows.
 
@@ -189,6 +183,7 @@ A high packet-reduction percentage mostly reflects **bundling**. To measure the 
 The built-in self-tests cover the current implementation, including:
 
 - Haar transform/inverse round-trip across all axes
+- Eight-layer embedding rotations, accumulated hop twists, oldest-layer eviction, and preservation of zero-filled unused layers
 - Noise, Gaussian coefficient blur, thresholding, and sparse node denoising
 - Compressed message tensor encoding/decoding
 - Exact 20-byte address metadata

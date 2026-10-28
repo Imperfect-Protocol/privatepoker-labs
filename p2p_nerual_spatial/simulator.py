@@ -63,7 +63,7 @@ def embedding_backend_name() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Compact fuzzy embeddings: Angle x Hop (8 x 8)
+# Fixed history embeddings: Angle x Hop (8 x 8), newest hop at column 0.
 # ---------------------------------------------------------------------------
 
 ANGLE_BINS = 8
@@ -272,7 +272,8 @@ def angle_bin(delta: np.ndarray, bins: int = ANGLE_BINS) -> int:
     delta = np.asarray(delta, dtype=np.float64)
     if float(np.linalg.norm(delta)) < 1e-12:
         return 0
-    angle = math.atan2(float(delta[1]), float(delta[0])) % (2.0 * math.pi)
+    # Embedding convention: theta=0 points up (+Y), positive angles rotate clockwise.
+    angle = math.atan2(float(delta[0]), float(delta[1])) % (2.0 * math.pi)
     return int((angle / (2.0 * math.pi)) * bins) % bins
 
 
@@ -281,7 +282,8 @@ def fuzzy_angle_weights(delta: np.ndarray, bins: int = ANGLE_BINS) -> List[Tuple
     delta = np.asarray(delta, dtype=np.float64)
     if float(np.linalg.norm(delta)) < 1e-12:
         return [(0, 1.0)]
-    angle = math.atan2(float(delta[1]), float(delta[0])) % (2.0 * math.pi)
+    # Same coordinate convention as path embeddings: zero is up, positive clockwise.
+    angle = math.atan2(float(delta[0]), float(delta[1])) % (2.0 * math.pi)
     coordinate = angle * bins / (2.0 * math.pi)
     lower_float = math.floor(coordinate)
     lower = int(lower_float) % bins
@@ -293,7 +295,7 @@ def fuzzy_angle_weights(delta: np.ndarray, bins: int = ANGLE_BINS) -> List[Tuple
 
 
 def make_self_embedding(shape: Tuple[int, int] = EMBEDDING_SHAPE) -> np.ndarray:
-    """A beacon begins as a dot at angle-bin 0, hop 0; all other cells are zero."""
+    """A beacon begins with an up arrow at layer 0; the other seven layers are zero."""
     if len(shape) != 2 or any(int(n) < 1 for n in shape):
         raise ValueError("embedding shape must be angle x hop")
     result = np.zeros(shape, dtype=np.float32)
@@ -376,111 +378,160 @@ def _cubic_periodic_sample_torch(profiles, coordinates):
     return torch.sum(samples * weights[None, :, :], dim=-1)
 
 
-def _translate_embedding_batch_numpy(sources: np.ndarray, offset: np.ndarray) -> np.ndarray:
-    """Fast CPU implementation. All embeddings in a packet share one link offset."""
-    batch, angle_count, hop_count = sources.shape
-    out = np.zeros((batch, angle_count, hop_count), dtype=np.float32)
-    norm = float(np.linalg.norm(offset))
-    if norm > 1e-12:
-        direction = np.asarray(offset, dtype=np.float64) / norm
-    else:
-        direction = np.array([1.0, 0.0], dtype=np.float64)
-    offset_angle = math.atan2(float(direction[1]), float(direction[0])) % (2.0 * math.pi)
-    old_angle = np.arange(angle_count, dtype=np.float64) * (2.0 * math.pi / angle_count)
-    output_angle = old_angle
-    for old_hop in range(hop_count - 1):
-        profile = np.maximum(sources[:, :, old_hop], 0.0)
-        mass = np.sum(profile, axis=1, dtype=np.float64).astype(np.float32)
-        new_hop = old_hop + 1
-        if old_hop == 0:
-            coordinate = offset_angle * angle_count / (2.0 * math.pi)
-            lower_float = math.floor(coordinate)
-            lower = int(lower_float) % angle_count
-            fraction = float(coordinate - lower_float)
-            out[:, lower, new_hop] += mass * (1.0 - fraction)
-            out[:, (lower + 1) % angle_count, new_hop] += mass * fraction
-            continue
+def normalize_embedding_layers(embedding: np.ndarray, depth: int,
+                               *, fallback_direction: int = 0) -> np.ndarray:
+    """Keep only occupied history layers and normalize each as a unit direction.
 
-        radius = float(new_hop)  # unit edge lengths; hop depth is our fuzzy radius proxy
-        out_x = radius * np.cos(output_angle) - direction[0]
-        out_y = radius * np.sin(output_angle) - direction[1]
-        old_theta = np.arctan2(out_y, out_x) % (2.0 * math.pi)
-        sample_coords = old_theta * angle_count / (2.0 * math.pi)
-        warped = _cubic_periodic_sample_numpy(profile, sample_coords)
-        warped = np.maximum(warped, 0.0)
-        warped_mass = np.sum(warped, axis=1, keepdims=True, dtype=np.float64)
-        scale = np.divide(mass[:, None], warped_mass, out=np.zeros_like(warped_mass), where=warped_mass > 1e-12)
-        out[:, :, new_hop] = (warped * scale).astype(np.float32, copy=False)
+    Layer 0 is always the current node's canonical up arrow (angle bin 0).
+    Layers at and beyond ``depth`` are exactly zero, so noise introduced for the
+    wavelet codec can never invent path history in an empty layer.
+    """
+    result = np.maximum(np.asarray(embedding, dtype=np.float32), 0.0).copy()
+    if result.shape != EMBEDDING_SHAPE:
+        result = resize_embedding_cubic(result, EMBEDDING_SHAPE)
+    depth = max(1, min(int(depth), HOP_BINS))
+    result[:, depth:] = 0.0
+    result[:, 0] = 0.0
+    result[0, 0] = 1.0
+    for layer in range(1, depth):
+        profile = result[:, layer]
+        mass = float(profile.sum())
+        if mass > 1e-10:
+            result[:, layer] = profile / mass
+        else:
+            # A layer declared occupied by exact metadata must still represent a
+            # unit direction if thresholding removed all of its coefficients.
+            result[:, layer] = 0.0
+            result[int(fallback_direction) % ANGLE_BINS, layer] = 1.0
+    return result.astype(np.float32, copy=False)
 
-    # Small, periodic angular Gaussian blur: make the compact embedding fuzzy/smooth.
-    sigma = 0.42
+
+def _hop_rotation_radians(offset: np.ndarray) -> float:
+    """Signed rotation from the canonical up direction to K->L, in radians.
+
+    The embedding's angle 0 points up (+Y). Positive rotations move clockwise
+    toward +X, hence atan2(dx, dy) rather than conventional atan2(dy, dx).
+    """
+    delta = np.asarray(offset, dtype=np.float64)
+    if float(np.linalg.norm(delta)) <= 1e-12:
+        return 0.0
+    return float(math.atan2(float(delta[0]), float(delta[1])) % (2.0 * math.pi))
+
+
+def _rotate_profiles_numpy(profiles: np.ndarray, angle_radians: float) -> np.ndarray:
+    """Rotate [batch, angle] unit-direction distributions with periodic interpolation."""
+    profiles = np.maximum(np.asarray(profiles, dtype=np.float32), 0.0)
+    batch, angle_count = profiles.shape
+    shift = (float(angle_radians) % (2.0 * math.pi)) * angle_count / (2.0 * math.pi)
+    whole = int(math.floor(shift))
+    fraction = float(shift - whole)
+    # Angular bins start at up and increase clockwise. Bilinear circular binning
+    # retains a continuous rotation while keeping the compact fuzzy representation.
+    rotated = np.roll(profiles, whole, axis=1) * np.float32(1.0 - fraction)
+    if fraction > 1e-12:
+        rotated += np.roll(profiles, whole + 1, axis=1) * np.float32(fraction)
+    old_mass = profiles.sum(axis=1, keepdims=True, dtype=np.float64)
+    new_mass = rotated.sum(axis=1, keepdims=True, dtype=np.float64)
+    scale = np.divide(old_mass, new_mass, out=np.zeros_like(old_mass), where=new_mass > 1e-12)
+    return np.maximum(rotated * scale.astype(np.float32), 0.0).astype(np.float32, copy=False)
+
+
+def _smooth_profiles_numpy(profiles: np.ndarray, sigma: float = 0.42) -> np.ndarray:
+    """Apply the existing light circular Gaussian blur to inherited arrow layers."""
+    if sigma <= 0.0:
+        return np.maximum(profiles, 0.0).astype(np.float32, copy=False)
     taps = np.arange(-2, 3, dtype=np.float64)
-    kernel = np.exp(-0.5 * (taps / sigma) ** 2)
+    kernel = np.exp(-0.5 * (taps / float(sigma)) ** 2)
     kernel /= kernel.sum()
-    blurred = np.zeros_like(out)
+    smoothed = np.zeros_like(profiles, dtype=np.float32)
     for tap, weight in zip(taps.astype(int), kernel):
-        blurred += np.roll(out, int(tap), axis=1) * np.float32(weight)
-    blurred = np.maximum(blurred, 0.0)
-    blurred[:, 0, 0] = 1.0  # the receiving node is always at its own origin
-    return blurred
+        smoothed += np.roll(profiles, int(tap), axis=1) * np.float32(weight)
+    old_mass = profiles.sum(axis=1, keepdims=True, dtype=np.float64)
+    new_mass = smoothed.sum(axis=1, keepdims=True, dtype=np.float64)
+    scale = np.divide(old_mass, new_mass, out=np.zeros_like(old_mass), where=new_mass > 1e-12)
+    return np.maximum(smoothed * scale.astype(np.float32), 0.0).astype(np.float32, copy=False)
+
+
+def _translate_embedding_batch_numpy(sources: np.ndarray, offset: np.ndarray) -> np.ndarray:
+    """Rotate every occupied history layer, shift it back one slot, then push up-arrow.
+
+    Input and output are [batch, angle, hop]. The oldest column is dropped, every
+    existing column rotates by the same K->L angle, and a new canonical unit-up arrow
+    is inserted at hop 0. Empty layers remain bitwise zero.
+    """
+    sources = np.maximum(np.asarray(sources, dtype=np.float32), 0.0)
+    batch, angle_count, hop_count = sources.shape
+    if (angle_count, hop_count) != EMBEDDING_SHAPE:
+        raise ValueError(f"expected embeddings with shape {EMBEDDING_SHAPE}")
+    out = np.zeros_like(sources)
+    phi = _hop_rotation_radians(offset)
+    for old_hop in range(hop_count - 1):
+        profile = sources[:, :, old_hop]
+        mass = profile.sum(axis=1)
+        active = mass > 1e-10
+        if not np.any(active):
+            continue
+        rotated = _rotate_profiles_numpy(profile, phi)
+        rotated = _smooth_profiles_numpy(rotated)
+        rotated[~active] = 0.0
+        out[:, :, old_hop + 1] = rotated
+    # Fresh local frame: the receiver is always represented by a unit-up arrow.
+    out[:, :, 0] = 0.0
+    out[:, 0, 0] = 1.0
+    # Empty incoming layers remain exactly zero after all transforms.
+    out[np.abs(out) < 1e-8] = 0.0
+    return out
 
 
 def _translate_embedding_batch_torch(sources: np.ndarray, offset: np.ndarray,
                                      device_name: Optional[str] = None) -> np.ndarray:
-    """Batched PyTorch transform; CUDA is intended for large bundles, CPU for backend tests."""
+    """PyTorch equivalent of the fixed eight-layer rotation/shift operation."""
     device = torch.device(device_name or _EMBEDDING_DEVICE)
-    src = torch.as_tensor(sources, dtype=torch.float32, device=device).clamp_min(0.0)
-    batch, angle_count, hop_count = src.shape
+    src_np = np.maximum(np.asarray(sources, dtype=np.float32), 0.0)
+    batch, angle_count, hop_count = src_np.shape
+    if (angle_count, hop_count) != EMBEDDING_SHAPE:
+        raise ValueError(f"expected embeddings with shape {EMBEDDING_SHAPE}")
+    src = torch.as_tensor(src_np, dtype=torch.float32, device=device)
     out = torch.zeros_like(src)
-    norm = float(np.linalg.norm(offset))
-    direction = (np.asarray(offset, dtype=np.float64) / norm if norm > 1e-12
-                 else np.array([1.0, 0.0], dtype=np.float64))
-    offset_angle = math.atan2(float(direction[1]), float(direction[0])) % (2.0 * math.pi)
-    old_angle_np = np.arange(angle_count, dtype=np.float64) * (2.0 * math.pi / angle_count)
-    old_angle = torch.as_tensor(old_angle_np, dtype=src.dtype, device=device)
+    phi = _hop_rotation_radians(offset)
+    shift = (phi % (2.0 * math.pi)) * angle_count / (2.0 * math.pi)
+    whole = int(math.floor(shift))
+    fraction = float(shift - whole)
     for old_hop in range(hop_count - 1):
         profile = src[:, :, old_hop]
-        mass = profile.sum(dim=1)
-        new_hop = old_hop + 1
-        if old_hop == 0:
-            coordinate = offset_angle * angle_count / (2.0 * math.pi)
-            lower_float = math.floor(coordinate)
-            lower = int(lower_float) % angle_count
-            fraction = float(coordinate - lower_float)
-            out[:, lower, new_hop] += mass * (1.0 - fraction)
-            out[:, (lower + 1) % angle_count, new_hop] += mass * fraction
+        mass = profile.sum(dim=1, keepdim=True)
+        if not bool(torch.any(mass > 1e-10).item()):
             continue
-        radius = float(new_hop)
-        out_x = radius * torch.cos(old_angle) - float(direction[0])
-        out_y = radius * torch.sin(old_angle) - float(direction[1])
-        old_theta = torch.remainder(torch.atan2(out_y, out_x), 2.0 * math.pi)
-        sample_coords = old_theta * angle_count / (2.0 * math.pi)
-        warped = _cubic_periodic_sample_torch(profile, sample_coords).clamp_min(0.0)
-        warped_mass = warped.sum(dim=1, keepdim=True)
-        scale = torch.where(warped_mass > 1e-12, mass[:, None] / warped_mass.clamp_min(1e-12), 0.0)
-        out[:, :, new_hop] = warped * scale
-
-    sigma = 0.42
-    taps = torch.arange(-2, 3, dtype=src.dtype, device=device)
-    kernel = torch.exp(-0.5 * (taps / sigma) ** 2)
-    kernel = kernel / kernel.sum()
-    blurred = torch.zeros_like(out)
-    for tap, weight in zip(range(-2, 3), kernel):
-        blurred = blurred + torch.roll(out, shifts=tap, dims=1) * weight
-    blurred = blurred.clamp_min(0.0)
-    blurred[:, 0, 0] = 1.0
-    return blurred.detach().cpu().numpy().astype(np.float32, copy=False)
+        rotated = torch.roll(profile, shifts=whole, dims=1) * (1.0 - fraction)
+        if fraction > 1e-12:
+            rotated = rotated + torch.roll(profile, shifts=whole + 1, dims=1) * fraction
+        rotated_mass = rotated.sum(dim=1, keepdim=True)
+        rotated = torch.where(rotated_mass > 1e-12,
+                              rotated * mass / rotated_mass.clamp_min(1e-12), 0.0)
+        taps = torch.arange(-2, 3, dtype=src.dtype, device=device)
+        kernel = torch.exp(-0.5 * (taps / 0.42) ** 2)
+        kernel = kernel / kernel.sum()
+        smoothed = torch.zeros_like(rotated)
+        for tap, weight in zip(range(-2, 3), kernel):
+            smoothed = smoothed + torch.roll(rotated, shifts=tap, dims=1) * weight
+        smooth_mass = smoothed.sum(dim=1, keepdim=True)
+        smoothed = torch.where(smooth_mass > 1e-12,
+                               smoothed * mass / smooth_mass.clamp_min(1e-12), 0.0)
+        out[:, :, old_hop + 1] = smoothed
+    out[:, :, 0] = 0.0
+    out[:, 0, 0] = 1.0
+    out = torch.where(out.abs() < 1e-8, 0.0, out)
+    return out.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
 def translate_embedding_batch(embeddings: Iterable[np.ndarray], source_to_target: np.ndarray,
                               max_radius: float = DEFAULT_MAX_RADIUS) -> np.ndarray:
-    """Translate a bundle's embeddings at once, using CUDA for large batches if available.
+    """Rotate all occupied layers by K->L, shift them down, and push a fresh up arrow.
 
-    Each incoming embedding is angle x hop (8 x 8). Every existing hop layer is
-    re-expressed in the receiver's frame; hop depth advances by one, and the
-    receiver's own origin is inserted at [angle=0, hop=0]. Distance is intentionally
-    compacted away: each graph edge counts as one unit hop. Cubic periodic angular
-    interpolation and Gaussian blur keep the embedding fuzzy rather than exact.
+    Embeddings are angle x hop (8 x 8). Angle bin zero points up and bins increase
+    clockwise. Each graph hop rotates every inherited layer by the same signed edge
+    angle, shifts it to the next hop slot, drops the oldest slot, and sets layer zero
+    to the receiving node's canonical unit-up arrow. Empty layers stay zero.
     """
     batch = np.asarray(list(embeddings), dtype=np.float32)
     if batch.size == 0:
@@ -492,7 +543,7 @@ def translate_embedding_batch(embeddings: Iterable[np.ndarray], source_to_target
     if tuple(batch.shape[1:]) != EMBEDDING_SHAPE:
         batch = np.stack([resize_embedding_cubic(item, EMBEDDING_SHAPE) for item in batch])
     offset = np.asarray(source_to_target, dtype=np.float64)
-    # tiny packets are faster on CPU due to CUDA launch and transfer overhead
+    # Tiny packets are faster on CPU due to CUDA launch and transfer overhead.
     if _EMBEDDING_DEVICE == "cuda" and len(batch) >= _GPU_BATCH_THRESHOLD:
         return _translate_embedding_batch_torch(batch, offset)
     return _translate_embedding_batch_numpy(batch, offset)
@@ -657,6 +708,7 @@ class Signal:
 
     ``origin_address`` and ``target_address`` are exact 20-byte addresses. Tensor
     embeddings may be blurred/resampled, but these identity bytes and TTL are not.
+    ``embedding_depth`` counts occupied history layers including the current node.
     ``route_path`` and ``return_path`` are internal node indices representing the
     forward path and the remaining reverse acknowledgement route.
     """
@@ -674,6 +726,7 @@ class Signal:
     target_address: Optional[bytes] = None
     route_path: Tuple[int, ...] = ()
     return_path: Tuple[int, ...] = ()
+    embedding_depth: int = 1  # occupied history layers, including the current-node layer
 
     def __post_init__(self) -> None:
         if not self.origin_address:
@@ -698,6 +751,9 @@ class Signal:
             raise ValueError("signal TTL must be >= 0")
         self.route_path = tuple(int(n) for n in self.route_path)
         self.return_path = tuple(int(n) for n in self.return_path)
+        self.embedding_depth = int(self.embedding_depth)
+        if not 1 <= self.embedding_depth <= HOP_BINS:
+            raise ValueError(f"embedding_depth must be in [1, {HOP_BINS}]")
 
     @property
     def signal_id(self) -> bytes:
@@ -718,6 +774,7 @@ class Signal:
             "sequence_id": self.sequence_id,
             "ttl": self.ttl,
             "hop_count": self.hop_count,
+            "embedding_depth": self.embedding_depth,
             "visited_addresses": tuple(address_for_node(n) for n in self.visited),
             "route_path_addresses": tuple(address_for_node(n) for n in self.route_path),
             "return_path_addresses": tuple(address_for_node(n) for n in self.return_path),
@@ -788,12 +845,12 @@ class Message:
             reconstructed = haar_inverse_nd(coefficients)
             reconstructed = np.maximum(reconstructed, 0.0).astype(np.float32, copy=False)
             restored = reconstructed[:len(self.items)].copy()
-            for index in range(len(restored)):
-                mass = float(restored[index].sum())
-                if mass > 1e-10:
-                    restored[index] /= mass
-                else:
-                    restored[index] = make_self_embedding(EMBEDDING_SHAPE)
+            for index, item in enumerate(self.items):
+                restored[index] = normalize_embedding_layers(restored[index], item.embedding_depth)
+                reconstructed[index] = restored[index]
+            # Padding rows are not logical signals, so do not let wavelet noise create data there.
+            if len(self.items) < reconstructed.shape[0]:
+                reconstructed[len(self.items):] = 0.0
             self.decoded_tensor = reconstructed
             self.decoded_items = [replace(item, embedding=restored[i])
                                   for i, item in enumerate(self.items)]
@@ -1251,7 +1308,13 @@ class P2PNode:
         accepted = 0
         for received, is_first, better_path, is_self_loopback, local_embedding in prepared:
             assert local_embedding is not None
-            localized = replace(received, embedding=local_embedding)
+            localized = replace(
+                received, embedding=normalize_embedding_layers(
+                    local_embedding, received.embedding_depth if is_self_loopback else min(HOP_BINS, received.embedding_depth + 1)
+                ),
+                embedding_depth=(received.embedding_depth if is_self_loopback
+                                 else min(HOP_BINS, received.embedding_depth + 1)),
+            )
             if is_first or better_path:
                 self.signals_accepted += 1
 
@@ -1461,12 +1524,9 @@ class P2PNode:
         padded_count = 1 << max(0, (count - 1).bit_length())
         tensor = np.zeros((padded_count, *EMBEDDING_SHAPE), dtype=np.float32)
         for index, signal in enumerate(items):
-            embedding = np.maximum(resize_embedding_cubic(signal.embedding, EMBEDDING_SHAPE), 0.0)
-            mass = float(embedding.sum())
-            if mass > 1e-10:
-                embedding = embedding / mass
-            else:
-                embedding = make_self_embedding(EMBEDDING_SHAPE)
+            embedding = normalize_embedding_layers(
+                resize_embedding_cubic(signal.embedding, EMBEDDING_SHAPE), signal.embedding_depth
+            )
             tensor[index] = embedding
         return tensor
 
@@ -1613,7 +1673,7 @@ class P2PNode:
                     ttl=min(self.sim.initial_ttl, len(return_path)),
                     origin_address=announce.origin_address,
                     target_address=self.address, route_path=forward_path,
-                    return_path=return_path,
+                    return_path=return_path, embedding_depth=announce.embedding_depth,
                 )
                 feedback_work.append(feedback)
                 self.sim.feedback_signals_generated += 1
@@ -1867,18 +1927,53 @@ def run_self_tests() -> None:
     sim2.nodes = pool
     assert pool[0].current_timer is None and pool[0].stunned_at is None and not pool[0].active
 
-    # 3. Compact angle x hop embeddings translate smoothly, and batching agrees with singles.
+    # 3. Fixed eight-layer twisting: rotate every inherited layer, push up-arrow,
+    # preserve empty zero layers, and discard the oldest layer on the ninth hop.
     origin = make_self_embedding(EMBEDDING_SHAPE)
-    offset = hash_to_2d_point(1) - hash_to_2d_point(0)
-    single = translate_embedding(origin, offset)
-    batch = translate_embedding_batch([origin, origin], offset)
+    thirty_degrees = np.array([math.sin(math.radians(30.0)), math.cos(math.radians(30.0))])
+    single = translate_embedding(origin, thirty_degrees)
+    batch = translate_embedding_batch([origin, origin], thirty_degrees)
     assert single.shape == (8, 8) and batch.shape == (2, 8, 8)
     assert np.all(single >= 0.0) and np.all(np.isfinite(single))
     assert np.allclose(single, batch[0], atol=1e-5)
     assert np.allclose(batch[0], batch[1], atol=1e-5)
-    assert abs(float(single[0, 0]) - 1.0) < 1e-6
+    assert np.array_equal(single[:, 0], np.eye(8, dtype=np.float32)[:, 0])
+    assert abs(float(single[:, 1].sum()) - 1.0) < 1e-5
+    assert int(np.argmax(single[:, 1])) == 1, "30 degree twist should point nearest the 45 degree bin"
+    assert np.count_nonzero(single[:, 2:]) == 0, "empty history layers must remain zero"
+    full = np.zeros(EMBEDDING_SHAPE, dtype=np.float32)
+    for layer in range(HOP_BINS):
+        full[layer, layer] = 1.0
+    ninth = translate_embedding(full, np.array([0.0, 1.0]))
+    assert np.array_equal(ninth[:, 0], np.eye(8, dtype=np.float32)[:, 0])
+    for layer in range(1, HOP_BINS):
+        assert np.argmax(ninth[:, layer]) == layer - 1, (layer, np.argmax(ninth[:, layer]))
+        assert abs(float(ninth[:, layer].sum()) - 1.0) < 1e-5
+    # Chained frame changes accumulate rotation: 30 degrees at B, then 45 at C.
+    forty_five_degrees = np.array([math.sin(math.radians(45.0)), math.cos(math.radians(45.0))])
+    at_c = translate_embedding(single, forty_five_degrees)
+    assert np.argmax(at_c[:, 1]) == 1, "B's layer should be rotated to the 45-degree bin"
+    assert np.argmax(at_c[:, 2]) == 2, "A's layer should accumulate 30+45 degrees (nearest 90-degree bin)"
+    assert abs(float(at_c[:, 2].sum()) - 1.0) < 1e-5
+    assert np.count_nonzero(at_c[:, 3:]) == 0
+    # The same hop-history occupancy survives message Haar -> compression -> inverse Haar.
+    layered = Signal("beacon", at_c.copy(), 0, 998, hop_count=2, embedding_depth=3)
+    layered_message = Message(0.0, 0, 1, pool[1], [layered])
+    layer_items = [layered]
+    tensor = np.zeros((1, *EMBEDDING_SHAPE), dtype=np.float32)
+    tensor[0] = normalize_embedding_layers(layered.embedding, layered.embedding_depth)
+    layer_coeff = prepare_wavelet_coefficients(tensor, wavelet_rng, threshold=MESSAGE_WAVELET_THRESHOLD)
+    layer_payload, _ = pack_sparse_wavelet_coefficients(layer_coeff)
+    layered_message.tensor_payload = layer_payload
+    layered_message.tensor_shape = tuple(tensor.shape)
+    layered_message.items = [replace(layered, embedding=np.zeros(EMBEDDING_SHAPE, dtype=np.float32))]
+    restored_layer_items, _ = layered_message.decode_payloads()
+    restored_layered = restored_layer_items[0]
+    assert restored_layered.embedding_depth == 3
+    assert np.count_nonzero(restored_layered.embedding[:, 3:]) == 0
+    assert np.allclose(restored_layered.embedding.sum(axis=0)[:3], np.ones(3), atol=1e-5)
     if torch is not None:
-        torch_batch = _translate_embedding_batch_torch(np.stack([origin, origin]), offset,
+        torch_batch = _translate_embedding_batch_torch(np.stack([origin, origin]), thirty_degrees,
                                                        device_name="cpu")
         assert np.all(np.isfinite(torch_batch)) and np.all(torch_batch >= 0.0)
         assert np.allclose(torch_batch, batch, atol=2e-5), float(np.max(np.abs(torch_batch - batch)))
@@ -1943,8 +2038,8 @@ def run_self_tests() -> None:
     assert abs(float(decoded_items[0].embedding.sum()) - 1.0) < 1e-5
     assert len(decoded_items[0].origin_address) == 20
 
-    print("PASS: all-axis Haar inversion, noise/blur/threshold, sparse node denoise,", flush=True)
-    print("      compressed message tensor and metadata-to-slice round-trip.", flush=True)
+    print("PASS: fixed 8-layer twists, accumulated rotations, empty layers, all-axis Haar,", flush=True)
+    print("      noise/blur/threshold, compressed message reconstruction and sparse node denoise.", flush=True)
 
     # 6. Dynamic topology and active-active announce discovery end-to-end.
     # Keep the integration test intentionally small: the production path now runs
@@ -2186,7 +2281,7 @@ def main() -> None:
     print(f"Node tensor Haar denoise passes / coefficients:      {sim.node_wavelet_filter_passes:,} / {sim.node_wavelet_coefficients:,}")
     print(f"Node tensor sparse keys pruned by filtering:         {sim.node_wavelet_keys_pruned:,}")
     print(f"Initial per-signal TTL:                              {sim.initial_ttl}")
-    print(f"Embedding dimensions (angle x hop):                 {EMBEDDING_SHAPE}")
+    print(f"Embedding dimensions (angle x 8-hop history):        {EMBEDDING_SHAPE}")
     print(f"Logical tensor: Source(8x8) x Target(8x8) x Neighbour(8x1) x Time({active[0].time_depth if active else TIME_DEPTH})")
     print(f"Sparse learned combinations / time slots:           {sum(n.tensor.stored_combinations for n in active):,} / {sum(n.tensor.stored_time_slots for n in active):,}")
     print(f"Largest stun cluster (accepted signal items):      {max(cluster_sizes, default=0):,}")
