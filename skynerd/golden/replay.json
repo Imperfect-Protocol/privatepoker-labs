@@ -1,0 +1,299 @@
+{
+ "schema": "skynerd-golden/1",
+ "environment": {
+  "captured_at": "2026-11-01T17:12:44.980280+00:00",
+  "python": "3.14.6",
+  "numpy": "2.5.4",
+  "platform": "macOS-26.5-arm64-arm-64bit-Mach-O",
+  "git_branch": "skynerd_swarm",
+  "git_commit": "28bc002126c5f1b938cf948f0f907c6c1d009b6a",
+  "git_dirty": true
+ },
+ "clocks": {
+  "physics_hz": 50.0,
+  "physics_dt": 0.02,
+  "physics_dt_effective": 0.02,
+  "motion_hz": 10.0,
+  "vision_hz": 2.0,
+  "episode_horizon_s": 20.0,
+  "decision_window_s": 0.2
+ },
+ "config": {
+  "seed": 42,
+  "episode_seconds": 60.0,
+  "world_half_extent": 1000.0,
+  "physics_hz": 50.0,
+  "motion_hz": 10.0,
+  "vision_hz": 2.0,
+  "radio_range": 300.0,
+  "radio_drop_exponent": 2.0,
+  "radio_delay": 0.02,
+  "initial_ttl": 8,
+  "stun_k": 0.1,
+  "stun_midpoint": 20.0,
+  "beacon_interval": 1.0,
+  "angle_bins": 8,
+  "hop_bins": 8,
+  "time_depth": 8,
+  "hebbian_baseline": 0.1,
+  "hebbian_max_weight": 5.0,
+  "hebbian_reward": 0.35,
+  "beacon_reward": 0.12,
+  "death_reward_scale": 1.5,
+  "mirror_hop_decay": 0.5,
+  "station_merge_rate": 0.01,
+  "servo_state_bins": 8,
+  "servo_surfaces": 4,
+  "servo_reward_scale": 0.1,
+  "eye_bins": 8,
+  "eye_max_sources": 8,
+  "eye_range_max": 500.0,
+  "noise_strength": 1e-05,
+  "gaussian_width": 0.3,
+  "message_threshold": 0.006,
+  "node_threshold": 5e-05,
+  "no_learning": false,
+  "no_noise": false,
+  "no_haar": false,
+  "no_gaussian": false,
+  "no_compression": false,
+  "no_ttl": false,
+  "no_twist": false,
+  "wave_size": 8,
+  "wave_rows": 3,
+  "wave_gap": 60.0,
+  "row_spacing": 40.0
+ },
+ "scenarios": {
+  "learn_to_fly": {
+   "episodes": 30,
+   "survivals": [
+    17.1,
+    10.3,
+    7.86,
+    13.42,
+    9.82,
+    12.780000000000001,
+    7.5,
+    20.0,
+    20.0,
+    20.0,
+    18.66,
+    20.0,
+    7.34,
+    9.32,
+    8.28,
+    15.08,
+    7.58,
+    17.56,
+    11.0,
+    20.0,
+    19.22,
+    8.8,
+    10.44,
+    9.82,
+    17.06,
+    13.68,
+    7.38,
+    11.620000000000001,
+    20.0,
+    9.52
+   ],
+   "outcomes": [
+    "crashed",
+    "crashed",
+    "crashed",
+    "crashed",
+    "crashed",
+    "crashed",
+    "crashed",
+    "alive",
+    "alive",
+    "alive",
+    "crashed",
+    "alive",
+    "crashed",
+    "crashed",
+    "crashed",
+    "crashed",
+    "crashed",
+    "crashed",
+    "crashed",
+    "alive",
+    "crashed",
+    "crashed",
+    "crashed",
+    "crashed",
+    "crashed",
+    "crashed",
+    "crashed",
+    "crashed",
+    "alive",
+    "crashed"
+   ],
+   "mean_survival": 13.371333333333332
+  },
+  "waves": {
+   "waves": 5,
+   "wave_size": 8,
+   "epsilon": 0.05,
+   "per_wave": [
+    {
+     "wave": 0,
+     "survivals": [
+      20.0,
+      12.08,
+      20.0,
+      15.36,
+      19.22,
+      14.3,
+      8.3,
+      15.88
+     ],
+     "deaths": 6,
+     "flock_size": 2
+    },
+    {
+     "wave": 1,
+     "survivals": [
+      18.82,
+      20.0,
+      18.68,
+      20.0,
+      10.98,
+      5.84,
+      12.6,
+      9.02
+     ],
+     "deaths": 6,
+     "flock_size": 4
+    },
+    {
+     "wave": 2,
+     "survivals": [
+      11.16,
+      11.84,
+      6.38,
+      10.66,
+      18.48,
+      12.22,
+      11.38,
+      6.76
+     ],
+     "deaths": 8,
+     "flock_size": 4
+    },
+    {
+     "wave": 3,
+     "survivals": [
+      6.84,
+      11.76,
+      15.3,
+      12.82,
+      11.120000000000001,
+      13.88,
+      16.34,
+      5.82
+     ],
+     "deaths": 8,
+     "flock_size": 4
+    },
+    {
+     "wave": 4,
+     "survivals": [
+      7.36,
+      14.76,
+      10.1,
+      8.620000000000001,
+      8.42,
+      7.78,
+      5.98,
+      7.82
+     ],
+     "deaths": 8,
+     "flock_size": 4
+    }
+   ]
+  },
+  "school": {
+   "lesson_count": 14,
+   "lessons": [
+    {
+     "lesson": "takeoff",
+     "score": 4.614976,
+     "stamps": 30
+    },
+    {
+     "lesson": "level",
+     "score": 3.987664,
+     "stamps": 15
+    },
+    {
+     "lesson": "turn_left_30",
+     "score": 2.398748,
+     "stamps": 17
+    },
+    {
+     "lesson": "turn_right_30",
+     "score": 4.165523,
+     "stamps": 17
+    },
+    {
+     "lesson": "climb_turn_left_30",
+     "score": 1.018919,
+     "stamps": 34
+    },
+    {
+     "lesson": "climb_turn_right_30",
+     "score": 3.094971,
+     "stamps": 1718
+    },
+    {
+     "lesson": "descend_turn_left_30",
+     "score": 2.709728,
+     "stamps": 19
+    },
+    {
+     "lesson": "descend_turn_right_30",
+     "score": 4.528387,
+     "stamps": 21
+    },
+    {
+     "lesson": "steep_turn_left_60",
+     "score": 2.083422,
+     "stamps": 26
+    },
+    {
+     "lesson": "steep_turn_right_60",
+     "score": 4.913881,
+     "stamps": 39
+    },
+    {
+     "lesson": "stall_recovery",
+     "score": 4.043055,
+     "stamps": 38
+    },
+    {
+     "lesson": "spin_recovery",
+     "score": 3.259487,
+     "stamps": 3135
+    },
+    {
+     "lesson": "unusual_attitude_left",
+     "score": 4.010054,
+     "stamps": 35
+    },
+    {
+     "lesson": "unusual_attitude_right",
+     "score": 3.125436,
+     "stamps": 1520
+    }
+   ],
+   "graduate_keys": 127
+  },
+  "will_flight": {
+   "survival": 16.78,
+   "outcome": "crashed"
+  }
+ }
+}
