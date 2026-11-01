@@ -2,6 +2,8 @@
 
 A fully Hebbian drone-swarm simulator, spun off from `privatepoker-labs/p2p_nerual_spatial/simulator_sp.py`.
 
+<p align="center"><img width="640" src="/skynerd/splash/Skynerd.png" alt="Splash" /></p>
+
 One learning mechanism everywhere — no autopilot, no teacher. The swarm learns
 to fly by dying, to fight by watching kills, and to remember through itself:
 every living drone is a shard of the brain, death erases a shard, births are
