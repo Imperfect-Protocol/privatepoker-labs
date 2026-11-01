@@ -7,16 +7,26 @@ to fly by dying, to fight by watching kills, and to remember through itself:
 every living drone is a shard of the brain, death erases a shard, births are
 mosaics of the living. Designed by the Sonia Code & Gemini AI & Open AI (2026).
 
-## The four tensors
+## The tensors
+
+### Swarm memory (one decentralised brain, no station)
 
 | Tensor | Shape | Question |
 |---|---|---|
 | Identity | Src(8×8) × Tgt(8×8) × Nbr(8×1) × Time(8) | *Who* routes to whom |
 | Spatial prior | Angle(8) × Dist(8) × Time(8) | *Which way* delivers |
 | SwarmEye | Src(M) × Az(8) × El(8) × Rng(8) × Time(8) | *What* is happening out there |
-| Servo | State(8) × Surface(4) × Time(8) | *How to fly right now* |
+| Servo | Errors(8⁵) × Surface(8) × Action(4) × Time(8) | *How to fly right now* |
+| Tactics | Context(8⁴) × Intent(4) × Time(8) | *What* this situation paid for (behind a switch) |
+| Will | Mood: Ctx(8⁴) × Desire(16) × Time(8); Aim: Desire(16) × Errors(4); Mix: Desire(16) × Desire(16) | *What* to want next (no labels — desires are unnamed; mood = activation momentum) |
 
-Tactics (context → intent → outcome) are Tensor 3 behind a switch, added later.
+### The classroom (flight school)
+
+| Tensor | Shape | Question |
+|---|---|---|
+| Cockpit panel | ASI(5) × Pitch(5) × Bank(9) × HSI(8) × VSI(9) × Ball(5) × RPM(4); 0 = the instrument's zero vector, else 1 + slot; each reading spreads as a Gaussian over ALL classes (σ=0.55, gain 3.0), circular for HSI | *What the classified instruments say right now* |
+| Dense classroom panel | Panel(5,5,9,8,9,5,4) × Surface(8) × Action(4), dense while in school; after each instructor handback: noise → Haar all axes → Gaussian → threshold → compose; a pristine raw dict keeps repetition idempotent | *Which hands the instructor stamps, and where, live* |
+| Brain | Input(4×4×8×8×8×4×4) → Hebbian stages (ReLU flow-through, each polished once) → situation head (logsig: stall / spin / spiral / upset) → motor head (ReLU analogue deflections); the panel tensor enters with NO activation; polish is transport BETWEEN stages | *How to perceive, decide ("we are in stall"), and actuate the controls* |
 
 ## Principles carried over from p2p_nerual_spatial
 
