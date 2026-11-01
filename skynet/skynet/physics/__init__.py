@@ -1,1 +1,0 @@
-"""Skynet physics package."""

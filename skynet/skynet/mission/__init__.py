@@ -1,1 +1,0 @@
-"""Skynet mission package."""
