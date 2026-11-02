@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Skynerd Genesis — carpet waves</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%E2%9C%88%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>SKYNERD <span class="tag">genesis</span></h1>
+    <p class="sub">carpet waves · distributed Hebbian memory · deterministic port of the Python reference</p>
+  </header>
+
+  <div id="bar">
+    <button id="play" title="space">&#9208; pause</button>
+    <label>speed
+      <select id="speed">
+        <option value="1">1x</option>
+        <option value="2">2x</option>
+        <option value="4" selected>4x</option>
+        <option value="8">8x</option>
+      </select>
+    </label>
+    <label>seed
+      <select id="seed"></select>
+    </label>
+    <button id="restart" title="R">&#8635; restart</button>
+    <span id="badge"></span>
+  </div>
+
+  <div id="stage">
+    <canvas id="sky"></canvas>
+    <aside id="cockpit" hidden>
+      <div class="cockpit-head">
+        <span id="cockpit-title">—</span>
+        <button id="cockpit-close" title="close">&#215;</button>
+      </div>
+      <canvas id="cockpitCanvas"></canvas>
+      <canvas id="controlsCanvas"></canvas>
+      <div id="cockpit-foot"></div>
+    </aside>
+  </div>
+  <div id="status">booting…</div>
+  <canvas id="chart"></canvas>
+
+  <table id="waves">
+    <thead>
+      <tr><th>wave</th><th>mean survival (s)</th><th>deaths</th><th>flock</th><th>python golden</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <p class="foot">Every wave is born as a mosaic of the living flock, flies its episode,
+  and the dying scream their tensors to whoever hears. The simulation is the ported
+  TypeScript core — waves replay the Python reference bit-exactly (see the
+  <code>golden</code> column, from <code>reference/golden-baseline.json</code>).
+  No autopilot, no teacher: drones that die teach by dying.</p>
+
+  <script type="module" src="/build-web/src/app/main.js"></script>
+</body>
+</html>
