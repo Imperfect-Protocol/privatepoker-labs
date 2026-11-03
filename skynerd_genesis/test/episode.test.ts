@@ -1,17 +1,18 @@
 /**
- * Full episode replay against the TS-frozen reference
- * (reference/c172-episodes-frozen.json): three lives of one learned
- * policy, blank start, on the C172 airframe. This is the Milestone 3
- * acceptance gate: comparable trajectories and outcomes under controlled
- * seeds — here "comparable" means exact.
+ * Episode gates for the FIVE-NEURON brain (the pulsating intention
+ * system). The frozen Python episode reference
+ * (reference/c172-episodes-frozen.json) predates the neuron redesign —
+ * its sense keys, tensor shape and choice sequence belong to the old
+ * flat servo tensor, so its exact value gates are retired here
+ * (re-freeze with tools/freeze-episodes.mjs once the design settles).
  *
- * The replay mirrors the real fly_episode (agl-aware step, terminal
- * credit) and the freeze tool tools/freeze-episodes.mjs. The Python
- * reference (flight-ref.json) is the historical record for the old 1.5 kg
- * airframe; the C172 redesign invalidates its trajectories, choices and
- * tensor. Exact gates: outcome, survival tick, every decision choice,
- * final state key, and the learned tensor afterwards. Trajectory samples
- * at 1e-6 (libm ulps).
+ * What this test still gates, exactly:
+ * - REPLAY DETERMINISM: the same episode, twice, from the same policy
+ *   snapshot and the same rng state, is bit-exact — trajectories,
+ *   choices, outcomes.
+ * - flyEpisode PARITY: the real API reproduces the manual replay.
+ * - NEURON MEMORY: the episodes actually teach the servo neuron, and a
+ *   snapshot survives a round trip.
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -26,7 +27,9 @@ import { GRAVITY, RHO_SEA_LEVEL } from "../src/physics/aero.js";
 import {
   DenseReward, EpisodeOutcome, FlightInstruments, classifyOutcome,
 } from "../src/learning/instruments.js";
-import { ServoPolicy, HOLD, PUSH } from "../src/learning/servo-tensor.js";
+import {
+  ServoPolicy, HOLD, PUSH, ELEMENT_FREE_FLIGHT,
+} from "../src/learning/servo-tensor.js";
 import {
   TRIM_COMMAND, TRIM_SPEED, flyEpisode, springTowardNeutral,
 } from "../src/learning/flight.js";
@@ -36,10 +39,79 @@ const refPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "refer
 const ref = JSON.parse(readFileSync(refPath, "utf8"));
 
 const DT = 1.0 / 50.0;
-const TRAJ_TOL = 1e-6;
 
-function close(a: number, b: number, tol: number): boolean {
-  return Math.abs(a - b) <= tol + 1e-12 * Math.abs(b);
+const instruments = new FlightInstruments(TRIM_SPEED);
+const policy = new ServoPolicy();
+
+/** One episode replay against the brain, mirroring flyEpisode exactly
+ *  (agl-aware step, terminal credit at the episode's epoch layer). */
+function replayEpisode(pol: ServoPolicy, epoch: number, rng: NumpyPcg64,
+                       epsilonOverride: number | null,
+                       sample: boolean) {
+  const world = new World({ halfExtent: 800.0 });
+  const body = new RigidBody(new Vec3(0.0, 0.0, 50.0), new Vec3(TRIM_SPEED, 0.0, 0.0));
+  const servos = new SurfacesState();
+  const dense = new DenseReward(instruments, 5.0);
+  dense.reset(body);
+  let commands = Float64Array.from(TRIM_COMMAND);
+  const recent: Array<[number[], Int32Array]> = [];
+  let pending = 0.0;
+  const choices: number[] = [];
+  const samples: number[][] = [];
+  if (epsilonOverride !== null) {
+    pol.epsilon = epsilonOverride;
+  }
+  let outcome: string | null = null;
+  let tick = 0;
+  for (let t = 0; t < 1000; t++) {
+    tick = t;
+    if (tick % 10 === 0) {
+      if (recent.length > 0) {
+        pol.reinforce(recent, pending, epoch);
+      }
+      pending = 0.0;
+      const sense = instruments.senseReading(body, commands);
+      const actions = pol.choose(ELEMENT_FREE_FLIGHT, sense, rng);
+      commands = pol.commandFrom(commands, actions);
+      recent.push([[ELEMENT_FREE_FLIGHT, ...sense.flight, ...sense.controls],
+                   actions]);
+      if (recent.length > 10) {
+        recent.shift();
+      }
+      choices.push(choiceOf(actions));
+    }
+    servos.command(commands, DT);
+    const diag = body.step(servos, DT, GRAVITY, RHO_SEA_LEVEL,
+                           body.position.z - world.terrainHeight(body.position.x, body.position.y));
+    commands = springTowardNeutral(commands, DT);
+    pending += dense.tick(body) + 0.0005;
+    if (sample && tick % 5 === 0) {
+      const q = body.attitude;
+      samples.push([body.position.x, body.position.y, body.position.z,
+                    body.velocity.x, body.velocity.y, body.velocity.z,
+                    q.w, q.x, q.y, q.z,
+                    body.rateP, body.rateQ, body.rateR,
+                    servos.positions[0], servos.positions[1],
+                    servos.positions[2], servos.positions[3],
+                    diag.airspeed, diag.alpha, diag.beta, diag.qDyn,
+                    diag.lift, diag.drag, diag.thrust]);
+    }
+    outcome = classifyOutcome(body, world, (tick + 1) * DT);
+    if (outcome !== null) {
+      break;
+    }
+  }
+  if (outcome === EpisodeOutcome.CRASHED || outcome === EpisodeOutcome.STALLED) {
+    pol.reinforce(recent, -2.0, epoch);
+  } else {
+    pol.reinforce(recent, 0.5, epoch);
+  }
+  return {
+    outcome: outcome ?? EpisodeOutcome.ALIVE,
+    survival: (tick + 1) * DT,
+    choices,
+    samples,
+  };
 }
 
 /** The Python tracer's choice encoding: 0 = hold-all, else 1 + surface*2 + push. */
@@ -52,258 +124,77 @@ function choiceOf(actions: Int32Array): number {
   return 0;
 }
 
-const instruments = new FlightInstruments(TRIM_SPEED);
-const policy = new ServoPolicy();
-
-interface PolicySnapshot {
-  values: Map<number, Float32Array>;
-  epochs: Map<number, Int32Array>;
-  rewardTotal: number;
-  epsilon: number;
-}
-
-function snapshotPolicy(p: ServoPolicy): PolicySnapshot {
-  return {
-    values: new Map([...p.tensor.values].map(([k, v]) => [k, Float32Array.from(v)])),
-    epochs: new Map([...p.tensor.epochs].map(([k, e]) => [k, Int32Array.from(e)])),
-    rewardTotal: p.tensor.rewardTotal,
-    epsilon: p.epsilon,
-  };
-}
-
-function restorePolicy(p: ServoPolicy, snap: PolicySnapshot): void {
-  p.tensor.values.clear();
-  for (const [k, v] of snap.values) {
-    p.tensor.values.set(k, v);
-  }
-  p.tensor.epochs.clear();
-  for (const [k, e] of snap.epochs) {
-    p.tensor.epochs.set(k, e);
-  }
-  p.tensor.rewardTotal = snap.rewardTotal;
-  p.epsilon = snap.epsilon;
-}
-
 ref.episodes.forEach((ep: any) => {
-  section(`episode ${ep.epoch} seed ${1007 + ep.epoch}`);
+  section(`episode ${ep.epoch} seed ${1007 + ep.epoch} (neuron brain)`);
   {
-    const snapshot = snapshotPolicy(policy);
-    const rng = new NumpyPcg64(BigInt(ep.rng_state), BigInt(ep.rng_inc));
-    const world = new World({ halfExtent: 800.0 });
-    const body = new RigidBody(new Vec3(0.0, 0.0, 50.0), new Vec3(TRIM_SPEED, 0.0, 0.0));
-    const servos = new SurfacesState();
-    const dense = new DenseReward(instruments, 5.0);
-    dense.reset(body);
-    let commands = Float64Array.from(TRIM_COMMAND);
-    const recent: Array<[number[], Int32Array]> = [];
-    let pending = 0.0;
-    const choices: number[] = [];
-    let outcome: string | null = null;
-    if (ep.epsilon_override !== null) {
-      policy.epsilon = ep.epsilon_override;
-    }
-    let tick = 0;
-    for (let t = 0; t < 1000; t++) {
-      tick = t;
-      if (tick % 10 === 0) {
-        const timeEpoch = tick + ep.epoch * 100000;
-        if (recent.length > 0) {
-          policy.reinforce(recent, pending, timeEpoch);
-        }
-        pending = 0.0;
-        const stateKey = instruments.stateKey(body, commands[3]);
-        const actions = policy.choose(stateKey, rng);
-        commands = policy.commandFrom(commands, actions);
-        recent.push([stateKey, actions]);
-        if (recent.length > 10) {
-          recent.shift();
-        }
-        choices.push(choiceOf(actions));
-      }
-      servos.command(commands, DT);
-      body.step(servos, DT, GRAVITY, RHO_SEA_LEVEL,
-                body.position.z - world.terrainHeight(body.position.x, body.position.y));
-      commands = springTowardNeutral(commands, DT);
-      pending += dense.tick(body) + 0.0005;
-      outcome = classifyOutcome(body, world, (tick + 1) * DT);
-      if (outcome !== null) {
-        break;
-      }
-    }
-    // Terminal credit, exactly like the real fly_episode: the traced replay
-    // drives the same shared policy the Python reference drove.
-    const timeEpoch = tick + ep.epoch * 100000;
-    if (outcome === EpisodeOutcome.CRASHED || outcome === EpisodeOutcome.STALLED) {
-      policy.reinforce(recent, -2.0, timeEpoch);
-    } else {
-      policy.reinforce(recent, 0.5, timeEpoch);
-    }
-    if (outcome === null) {
-      outcome = EpisodeOutcome.ALIVE;
-    }
-
-    check("outcome exact", outcome === ep.outcome, `got ${outcome} want ${ep.outcome}`);
-    check("survival exact", close((tick + 1) * DT, ep.survival, 1e-12),
-          `got ${(tick + 1) * DT} want ${ep.survival}`);
-    check("decision count", choices.length === ep.choices.length,
-          `got ${choices.length} want ${ep.choices.length}`);
-    let choicesOk = true;
-    for (let i = 0; i < Math.min(choices.length, ep.choices.length); i++) {
-      if (choices[i] !== ep.choices[i]) {
-        choicesOk = false;
-        check(`choice[${i}]`, false, `got ${choices[i]} want ${ep.choices[i]}`);
-        break;
-      }
-    }
-    check("every decision choice exact", choicesOk);
-
-    // Trajectory: restore the pre-episode policy state and replay identically
-    // with sampling enabled (same trick as the Python tracer).
-    restorePolicy(policy, snapshot);
-    const rng2 = new NumpyPcg64(BigInt(ep.rng_state), BigInt(ep.rng_inc));
-    const samples = traceSamples(policy, instruments, ep.epoch, rng2,
-                                 ep.epsilon_override);
-    let samplesOk = true;
-    const failures: string[] = [];
-    for (let i = 0; i < Math.min(samples.length, ep.samples.length); i++) {
-      const got = samples[i];
-      const want = ep.samples[i];
-      const fields: Array<[readonly number[], readonly number[], string]> = [
-        [got.pos, want.pos, "pos"], [got.vel, want.vel, "vel"],
-        [got.quat, want.quat, "quat"], [got.rates, want.rates, "rates"],
-        [got.surfaces, want.surfaces, "surfaces"], [got.diag, want.diag, "diag"],
-      ];
-      for (const [g, w, name] of fields) {
-        for (let j = 0; j < w.length; j++) {
-          if (!close(g[j], w[j], TRAJ_TOL)) {
-            samplesOk = false;
-            failures.push(`sample[${i}].${name}[${j}]: got ${g[j]} want ${w[j]}`);
-          }
-        }
-      }
-    }
-    check("trajectory samples match", samplesOk, failures.slice(0, 2).join("; "));
+    const snapshot = policy.snapshot();
+    const savedEpsilon = policy.epsilon;
+    const rngA = new NumpyPcg64(BigInt(ep.rng_state), BigInt(ep.rng_inc));
+    const runA = replayEpisode(policy, ep.epoch, rngA, ep.epsilon_override, true);
+    // Replay determinism: same snapshot, same dice -> bit-exact flight.
+    policy.restore(snapshot);
+    policy.epsilon = savedEpsilon;
+    const rngB = new NumpyPcg64(BigInt(ep.rng_state), BigInt(ep.rng_inc));
+    const runB = replayEpisode(policy, ep.epoch, rngB, ep.epsilon_override, true);
+    check("outcome identical across replays", runA.outcome === runB.outcome,
+          `got ${runA.outcome} vs ${runB.outcome}`);
+    check("survival identical across replays",
+          runA.survival === runB.survival,
+          `got ${runA.survival} vs ${runB.survival}`);
+    check("choices identical across replays",
+          JSON.stringify(runA.choices) === JSON.stringify(runB.choices));
+    check("trajectory identical across replays",
+          JSON.stringify(runA.samples) === JSON.stringify(runB.samples));
+    check("the episode actually flew",
+          runA.choices.length > 0 && runA.samples.length > 0);
+    void ep.outcome;   // the frozen Python values are retired (see header)
+    void ep.survival;
   }
 });
 
-/** Second identical replay that records trajectory samples. */
-function traceSamples(pol: ServoPolicy, inst: FlightInstruments, epoch: number,
-                      rng: NumpyPcg64, epsilonOverride: number | null) {
-  const world = new World({ halfExtent: 800.0 });
-  const body = new RigidBody(new Vec3(0.0, 0.0, 50.0), new Vec3(TRIM_SPEED, 0.0, 0.0));
-  const servos = new SurfacesState();
-  const dense = new DenseReward(inst, 5.0);
-  dense.reset(body);
-  let commands = Float64Array.from(TRIM_COMMAND);
-  const recent: Array<[number[], Int32Array]> = [];
-  let pending = 0.0;
-  const samples: Array<{ pos: number[]; vel: number[]; quat: number[]; rates: number[];
-                         surfaces: number[]; diag: number[] }> = [];
-  if (epsilonOverride !== null) {
-    pol.epsilon = epsilonOverride;
-  }
-  let outcome: string | null = null;
-  let tick = 0;
-  for (let t = 0; t < 1000; t++) {
-    tick = t;
-    if (tick % 10 === 0) {
-      const timeEpoch = tick + epoch * 100000;
-      if (recent.length > 0) {
-        pol.reinforce(recent, pending, timeEpoch);
-      }
-      pending = 0.0;
-      const stateKey = inst.stateKey(body, commands[3]);
-      const actions = pol.choose(stateKey, rng);
-      commands = pol.commandFrom(commands, actions);
-      recent.push([stateKey, actions]);
-      if (recent.length > 10) {
-        recent.shift();
-      }
-    }
-    servos.command(commands, DT);
-    const diag = body.step(servos, DT, GRAVITY, RHO_SEA_LEVEL,
-                           body.position.z - world.terrainHeight(body.position.x, body.position.y));
-    commands = springTowardNeutral(commands, DT);
-    pending += dense.tick(body) + 0.0005;
-    if (tick % 5 === 0) {
-      const q = body.attitude;
-      samples.push({
-        pos: [body.position.x, body.position.y, body.position.z],
-        vel: [body.velocity.x, body.velocity.y, body.velocity.z],
-        quat: [q.w, q.x, q.y, q.z],
-        rates: [body.rateP, body.rateQ, body.rateR],
-        surfaces: Array.from(servos.positions),
-        diag: [diag.airspeed, diag.alpha, diag.beta, diag.qDyn, diag.lift,
-               diag.drag, diag.thrust],
-      });
-    }
-    outcome = classifyOutcome(body, world, (tick + 1) * DT);
-    if (outcome !== null) {
-      break;
-    }
-  }
-  // Same terminal credit as the main replay so the shared policy's state
-  // stays identical to the Python sequence.
-  const timeEpoch = tick + epoch * 100000;
-  if (outcome === EpisodeOutcome.CRASHED || outcome === EpisodeOutcome.STALLED) {
-    pol.reinforce(recent, -2.0, timeEpoch);
-  } else {
-    pol.reinforce(recent, 0.5, timeEpoch);
-  }
-  return samples;
-}
-
-// The real flyEpisode API on a fresh policy must reproduce episode 0 exactly.
+// flyEpisode parity: the real API reproduces the manual replay's outcome
+// and survival on a fresh brain with the same dice.
 {
-  section("flyEpisode API vs golden episode 0");
+  section("flyEpisode API parity (episode 0)");
   const ep = ref.episodes[0];
   const fresh = new ServoPolicy();
   const rng = new NumpyPcg64(BigInt(ep.rng_state), BigInt(ep.rng_inc));
   const result = flyEpisode(fresh, instruments, ep.epoch, rng);
-  check("outcome", result.outcome === ep.outcome,
-        `got ${result.outcome} want ${ep.outcome}`);
-  check("survival", close(result.survival, ep.survival, 1e-12),
-        `got ${result.survival} want ${ep.survival}`);
-  check("final state key",
-        result.finalStateKey.every((v, i) => v === ep.final_state_key[i]));
+  const manual = new ServoPolicy();
+  const rngManual = new NumpyPcg64(BigInt(ep.rng_state), BigInt(ep.rng_inc));
+  const run = replayEpisode(manual, ep.epoch, rngManual, ep.epsilon_override, false);
+  check("outcome matches the manual replay",
+        result.outcome === run.outcome,
+        `got ${result.outcome} want ${run.outcome}`);
+  check("survival matches the manual replay",
+        Math.abs(result.survival - run.survival) <= 1e-12,
+        `got ${result.survival} want ${run.survival}`);
+  check("final state key exists",
+        result.finalStateKey.length === 5);
 }
 
-// Tensor comparison after the three episodes.
+// The neuron memory after the episodes.
 {
-  section("learned tensor after three episodes");
-  const want = ref.tensor_after;
-  check("key count", policy.tensor.storedCombinations === want.keys,
-        `got ${policy.tensor.storedCombinations} want ${want.keys}`);
-  check("reward total", close(policy.tensor.rewardTotal, want.reward_total, 1e-9),
-        `got ${policy.tensor.rewardTotal} want ${want.reward_total}`);
-  const shape = [8, 8, 8, 8, 8, 8, 4];
-  const strides = [8 * 8 * 8 * 8 * 8 * 4, 8 * 8 * 8 * 8 * 4, 8 * 8 * 8 * 4,
-                   8 * 8 * 4, 8 * 4, 4, 1];
-  const indexOf = (parts: readonly number[]) =>
-    parts.reduce((acc, p, i) => acc + p * strides[i], 0);
-  let entriesOk = true;
-  const firstEntries = want.first_entries as Array<{ key: number[]; values: number[]; epochs: number[] }>;
-  for (const entry of firstEntries) {
-    const index = indexOf(entry.key);
-    const slots = policy.tensor.values.get(index);
-    const slotEpochs = policy.tensor.epochs.get(index);
-    if (slots === undefined || slotEpochs === undefined) {
-      entriesOk = false;
-      check(`entry ${entry.key} present`, false, "missing in TS tensor");
-      break;
-    }
-    for (let s = 0; s < 8; s++) {
-      if (slots[s] !== entry.values[s] || slotEpochs[s] !== entry.epochs[s]) {
-        entriesOk = false;
-        check(`entry ${entry.key} slot ${s}`, false,
-              `got ${slots[s]}@${slotEpochs[s]} want ${entry.values[s]}@${entry.epochs[s]}`);
-        break;
-      }
-    }
-    if (!entriesOk) break;
-  }
-  check("first entries exact (float32 slots + epochs)", entriesOk);
-  void shape;
+  section("neuron memory after the episodes");
+  check("the servo neuron learned",
+        policy.servoNeuron.storedCombinations > 0,
+        `got ${policy.servoNeuron.storedCombinations} keys`);
+  check("the brain holds all five neurons",
+        policy.storedCombinations >= policy.servoNeuron.storedCombinations
+        && policy.goalNeuron.storedCombinations === 0,   // free flight files no goal map
+        `total ${policy.storedCombinations}`);
+  const snap = policy.snapshot();
+  const keysBefore = policy.storedCombinations;
+  policy.imprint(99, 99, { flight: [0, 0, 0, 0, 0, 0], engine: [0],
+                           controls: [0, 0, 0, 0] },
+                 [HOLD, HOLD, HOLD, HOLD], 1.0, 12345);
+  check("imprint fires into the neurons",
+        policy.storedCombinations > keysBefore,
+        `got ${policy.storedCombinations} want > ${keysBefore}`);
+  policy.restore(snap);
+  check("snapshot round-trips the brain",
+        policy.storedCombinations === keysBefore,
+        `got ${policy.storedCombinations} want ${keysBefore}`);
 }
 
 finish("episode.test");

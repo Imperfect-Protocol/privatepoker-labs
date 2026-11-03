@@ -4,7 +4,7 @@
  * airframe — the 1111 kg battle-C172, the body-rate quaternion propagation
  * and the ground-effect glue (agl-aware step). The scenario INPUTS (rng
  * state/inc, epsilon override, epochs) are the frozen Python seeds; the
- * outcomes, choices, trajectories and the learned tensor are re-recorded
+ * outcomes, choices, trajectories and the learned brain are re-recorded
  * TS-side. The replay mirrors test/episode.test.ts exactly (including the
  * agl-aware body.step), so the frozen file is what that test gates against.
  *
@@ -25,7 +25,9 @@ import { GRAVITY, RHO_SEA_LEVEL } from "../build/src/physics/aero.js";
 import {
   DenseReward, EpisodeOutcome, FlightInstruments, classifyOutcome,
 } from "../build/src/learning/instruments.js";
-import { ServoPolicy, HOLD, PUSH } from "../build/src/learning/servo-tensor.js";
+import {
+  ServoPolicy, HOLD, PUSH, GOAL_FREE_FLIGHT, ELEMENT_FREE_FLIGHT,
+} from "../build/src/learning/servo-tensor.js";
 import {
   TRIM_COMMAND, TRIM_SPEED, flyEpisode, springTowardNeutral,
 } from "../build/src/learning/flight.js";
@@ -48,24 +50,11 @@ function choiceOf(actions) {
 }
 
 function snapshotPolicy(p) {
-  return {
-    values: new Map([...p.tensor.values].map(([k, v]) => [k, Float32Array.from(v)])),
-    epochs: new Map([...p.tensor.epochs].map(([k, e]) => [k, Int32Array.from(e)])),
-    rewardTotal: p.tensor.rewardTotal,
-    epsilon: p.epsilon,
-  };
+  return { brain: p.snapshot(), epsilon: p.epsilon };
 }
 
 function restorePolicy(p, snap) {
-  p.tensor.values.clear();
-  for (const [k, v] of snap.values) {
-    p.tensor.values.set(k, v);
-  }
-  p.tensor.epochs.clear();
-  for (const [k, e] of snap.epochs) {
-    p.tensor.epochs.set(k, e);
-  }
-  p.tensor.rewardTotal = snap.rewardTotal;
+  p.restore(snap.brain);
   p.epsilon = snap.epsilon;
 }
 
@@ -89,15 +78,15 @@ function replayEpisode(policy, instruments, ep) {
   for (let t = 0; t < 1000; t++) {
     tick = t;
     if (tick % 10 === 0) {
-      const timeEpoch = tick + ep.epoch * 100000;
       if (recent.length > 0) {
-        policy.reinforce(recent, pending, timeEpoch);
+        policy.reinforce(recent, pending, ep.epoch);
       }
       pending = 0.0;
-      const stateKey = instruments.stateKey(body, commands[3]);
-      const actions = policy.choose(stateKey, rng);
+      const sense = instruments.senseReading(body, commands);
+      const actions = policy.choose(ELEMENT_FREE_FLIGHT, sense, rng);
       commands = policy.commandFrom(commands, actions);
-      recent.push([stateKey, actions]);
+      recent.push([[ELEMENT_FREE_FLIGHT, ...sense.flight, ...sense.controls],
+                   actions]);
       if (recent.length > 10) {
         recent.shift();
       }
@@ -113,11 +102,10 @@ function replayEpisode(policy, instruments, ep) {
       break;
     }
   }
-  const timeEpoch = tick + ep.epoch * 100000;
   if (outcome === EpisodeOutcome.CRASHED || outcome === EpisodeOutcome.STALLED) {
-    policy.reinforce(recent, -2.0, timeEpoch);
+    policy.reinforce(recent, -2.0, ep.epoch);
   } else {
-    policy.reinforce(recent, 0.5, timeEpoch);
+    policy.reinforce(recent, 0.5, ep.epoch);
   }
   if (outcome === null) {
     outcome = EpisodeOutcome.ALIVE;
@@ -151,15 +139,15 @@ function traceSamples(pol, inst, ep) {
   for (let t = 0; t < 1000; t++) {
     tick = t;
     if (tick % 10 === 0) {
-      const timeEpoch = tick + ep.epoch * 100000;
       if (recent.length > 0) {
-        pol.reinforce(recent, pending, timeEpoch);
+        pol.reinforce(recent, pending, ep.epoch);
       }
       pending = 0.0;
-      const stateKey = inst.stateKey(body, commands[3]);
-      const actions = pol.choose(stateKey, rng);
+      const sense = inst.senseReading(body, commands);
+      const actions = pol.choose(ELEMENT_FREE_FLIGHT, sense, rng);
       commands = pol.commandFrom(commands, actions);
-      recent.push([stateKey, actions]);
+      recent.push([[ELEMENT_FREE_FLIGHT, ...sense.flight, ...sense.controls],
+                   actions]);
       if (recent.length > 10) {
         recent.shift();
       }
@@ -186,23 +174,17 @@ function traceSamples(pol, inst, ep) {
       break;
     }
   }
-  const timeEpoch = tick + ep.epoch * 100000;
   if (outcome === EpisodeOutcome.CRASHED || outcome === EpisodeOutcome.STALLED) {
-    pol.reinforce(recent, -2.0, timeEpoch);
+    pol.reinforce(recent, -2.0, ep.epoch);
   } else {
-    pol.reinforce(recent, 0.5, timeEpoch);
+    pol.reinforce(recent, 0.5, ep.epoch);
   }
   return samples;
 }
 
-const TENSOR_DIMS = [8, 8, 8, 8, 8, 8, 4];
-const TENSOR_STRIDES = [8 * 8 * 8 * 8 * 8 * 4, 8 * 8 * 8 * 8 * 4, 8 * 8 * 8 * 4,
-                        8 * 8 * 4, 8 * 4, 4, 1];
-const decodeKey = (index) =>
-  TENSOR_STRIDES.map((st, i) => Math.floor(index / st) % TENSOR_DIMS[i]);
 
 /** The whole acceptance sequence: 3 episodes on one shared policy, the
- *  flyEpisode cross-check, and the learned tensor afterwards. */
+ *  flyEpisode cross-check, and the learned brain afterwards. */
 function runAll() {
   const instruments = new FlightInstruments(TRIM_SPEED);
   const policy = new ServoPolicy();
@@ -242,22 +224,25 @@ function runAll() {
     process.exit(1);
   }
   const firstEntries = [];
-  for (const [index, slots] of policy.tensor.values) {
+  for (const [index, slots] of policy.servoNeuron.values) {
     if (firstEntries.length >= 5) {
       break;
     }
     firstEntries.push({
-      key: decodeKey(index),
+      key: index,
       values: Array.from(slots),
-      epochs: Array.from(policy.tensor.epochs.get(index)),
+      epochs: Array.from(policy.servoNeuron.epochs.get(index)),
     });
   }
   return {
     episodes,
     fly_episode_0: flyEpisode0,
-    tensor_after: {
-      keys: policy.tensor.storedCombinations,
-      reward_total: policy.tensor.rewardTotal,
+    brain_after: {
+      goal_keys: policy.goalNeuron.storedCombinations,
+      flight_keys: policy.flightNeuron.storedCombinations,
+      engine_keys: policy.engineNeuron.storedCombinations,
+      controls_keys: policy.controlsNeuron.storedCombinations,
+      servo_keys: policy.servoNeuron.storedCombinations,
       first_entries: firstEntries,
     },
   };
@@ -274,7 +259,9 @@ for (const ep of a.episodes) {
               `${ep.outcome}, survival ${ep.survival}, ${ep.choices.length} choices, ` +
               `${ep.samples.length} samples ✓`);
 }
-console.log(`tensor after: ${a.tensor_after.keys} keys, reward ${a.tensor_after.reward_total}`);
+console.log(`brain after: ${a.brain_after.servo_keys} servo keys, ` +
+    `${a.brain_after.goal_keys} goal, ${a.brain_after.flight_keys} flight, ` +
+    `${a.brain_after.engine_keys} engine, ${a.brain_after.controls_keys} controls`);
 
 const doc = {
   schema: "c172-episodes-frozen/1",
@@ -283,7 +270,7 @@ const doc = {
         "propagation, ground-effect glue, agl-aware step). The scenario " +
         "seeds (rng state/inc, epochs, epsilon overrides) are the frozen " +
         "Python inputs; outcomes, choices, trajectories and the learned " +
-        "tensor supersede the Python flight-ref.json, which is the " +
+        "brain supersedes the Python flight-ref.json, which is the " +
         "historical record of the old 1.5 kg airframe.",
   ...a,
 };

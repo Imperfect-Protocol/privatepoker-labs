@@ -10,7 +10,7 @@
  *   Cruise throttle 0.8 reads exactly 2300 RPM.
  *
  * Held in a module of its own so the display law is testable
- * (test/app-trace.test.ts).
+ * (test/units.test.ts).
  */
 
 /** Cruise speed in m/s — 85 mph, the C172 economy cruise. */

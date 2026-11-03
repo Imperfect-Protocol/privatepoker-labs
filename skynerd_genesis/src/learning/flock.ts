@@ -19,7 +19,8 @@
  * That is the honest p2p price, and the reason waves must not all die.
  */
 import { NumpyPcg64 } from "../core/rng.js";
-import { ServoPolicy } from "../learning/servo-tensor.js";
+import { ServoPolicy } from "./servo-tensor.js";
+import { PulseNeuron } from "./neurons.js";
 
 export class Flock {
   readonly witnessProb: number;   // chance a peer hears a death scream
@@ -84,43 +85,52 @@ export class Flock {
     }
   }
 
-  /** Blend a random subset of the donor's keys into the recipient. */
+  /** Blend a random subset of each donor neuron into the recipient. */
   private teach(recipient: ServoPolicy, donor: ServoPolicy, rng: NumpyPcg64,
                 rate: number, fraction?: number): void {
-    const keys = [...donor.tensor.values.keys()];   // insertion order, like the Python dict
-    if (keys.length === 0) {
-      return;
-    }
     const share = fraction === undefined ? this.teachFraction : fraction;
-    const count = Math.max(1, Math.trunc(keys.length * share));
-    const chosen = rng.choice(keys.length, count);
-    for (const index of chosen) {
-      Flock.mergeKey(recipient.tensor, donor.tensor, keys[index], rate);
+    const pairs: Array<[PulseNeuron, PulseNeuron]> = [
+      [recipient.goalNeuron, donor.goalNeuron],
+      [recipient.flightNeuron, donor.flightNeuron],
+      [recipient.engineNeuron, donor.engineNeuron],
+      [recipient.controlsNeuron, donor.controlsNeuron],
+      [recipient.servoNeuron, donor.servoNeuron],
+    ];
+    for (const [recipientNeuron, donorNeuron] of pairs) {
+      // Insertion order, like the Python dict.
+      const keys = [...donorNeuron.values.keys()];
+      if (keys.length === 0) {
+        continue;
+      }
+      const count = Math.max(1, Math.trunc(keys.length * share));
+      const chosen = rng.choice(keys.length, count);
+      for (const index of chosen) {
+        Flock.mergeKey(recipientNeuron, donorNeuron, keys[index], rate);
+      }
     }
   }
 
-  /** Newest-slot merge of one key, station law without the station. */
-  private static mergeKey(recipient: ServoPolicy["tensor"], donor: ServoPolicy["tensor"],
+  /** Newest-layer merge of one key, the station law without the station. */
+  private static mergeKey(recipient: PulseNeuron, donor: PulseNeuron,
                           keyIndex: number, rate: number): void {
     const donorEpochs = donor.epochs.get(keyIndex)!;
     let newest = 0;
-    for (let slot = 1; slot < donorEpochs.length; slot++) {
-      if (donorEpochs[slot] > donorEpochs[newest]) {
-        newest = slot;
+    for (let layer = 1; layer < donorEpochs.length; layer++) {
+      if (donorEpochs[layer] > donorEpochs[newest]) {
+        newest = layer;
       }
     }
-    const recipientValues = recipient.values.get(keyIndex);
-    if (recipientValues !== undefined) {
-      const donorValues = donor.values.get(keyIndex)!;
+    const recipientLayers = recipient.values.get(keyIndex);
+    if (recipientLayers !== undefined) {
+      const donorLayers = donor.values.get(keyIndex)!;
       // float32 semantics exactly like NumPy scalar math:
       // diff is float32; rate * diff is float64; the store rounds to float32.
-      const diff = Math.fround(donorValues[newest] - recipientValues[0]);
-      recipientValues[0] = Math.fround(recipientValues[0] + rate * diff);
+      const diff = Math.fround(donorLayers[newest] - recipientLayers[0]);
+      recipientLayers[0] = Math.fround(recipientLayers[0] + rate * diff);
       recipient.epochs.get(keyIndex)![0] = 0;
       return;
     }
     recipient.values.set(keyIndex, Float32Array.from(donor.values.get(keyIndex)!));
     recipient.epochs.set(keyIndex, Int32Array.from(donorEpochs));
-    recipient.updatesSinceFilter += 1;
   }
 }

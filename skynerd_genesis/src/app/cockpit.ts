@@ -28,6 +28,8 @@
  */
 import { mphOf, vsHundredsOf, altFtOf, rpmOf } from "./units.js";
 import { Ground } from "./ground.js";
+import { Flora, type TreeSpot, type HouseSpot } from "./land.js";
+import type { SceneAircraft } from "./scene.js";
 
 /** One aircraft's instantaneous reading, for the cockpit and controls. */
 export interface DroneView {
@@ -47,6 +49,45 @@ export interface DroneView {
   elev: number;
   rud: number;
   alive: boolean;
+  /**
+   * THE HAND'S INPUTS — what the pilot (instructor or student) is
+   * commanding, as distinct from what the airframe's surfaces are doing:
+   *  - handCommands: the 4 raw commanded targets;
+   *  - handChoices: the student's last per-channel decision, PUSH (+1),
+   *    ease (−1), hold (0) per channel — null while the instructor's
+   *    hand eases (no decisions happen);
+   *  - handFresh: a decision window just opened — the 5 Hz brain beat.
+   */
+  handCommands: readonly number[];
+  handChoices: readonly number[] | null;
+  handFresh: boolean;
+}
+
+/**
+ * The panel's view of one scene aircraft: its instruments (the machine's
+ * physical truth) and its controls (the hand's inputs on it), as the
+ * cockpit and controls canvases draw them.
+ */
+export function droneViewOf(entry: SceneAircraft): DroneView {
+  const machine = entry.aircraft;
+  const body = machine.body;
+  const [fwdX, fwdY] = machine.forward;
+  const choices = entry.hand.choices;
+  const hand = machine.handCommands;
+  return {
+    x: body.position.x, y: body.position.y, z: body.position.z,
+    fwdX, fwdY,
+    pitch: machine.pitch, bank: machine.bank,
+    speed: machine.asi, vs: machine.vsi,
+    velX: body.velocity.x, velY: body.velocity.y,
+    throttle: hand[3],
+    ail: machine.aileron, elev: machine.elevator, rud: machine.rudder,
+    handCommands: [hand[0], hand[1], hand[2], hand[3]],
+    handChoices: choices === null
+      ? null : [choices[0], choices[1], choices[2], choices[3]],
+    handFresh: entry.hand.fresh,
+    alive: !entry.dead,
+  };
 }
 
 const FOV_H = (90 * Math.PI) / 180; // the windshield's horizontal field of view
@@ -278,40 +319,250 @@ function drawWorld(ctx: CanvasRenderingContext2D, cam: Camera): void {
   ctx.drawImage(buf.canvas, 0, 0, cam.W, cam.H);
 }
 
-/**
- * The control tower: standing beside the runway, a shaft with a glass cab
- * on top — a true 3D object, projected corner by corner through the
- * camera, so it slides past on takeoff and parks on the horizon in cruise.
- */
-function drawTower(ctx: CanvasRenderingContext2D, cam: Camera): void {
+// --- the landscape's objects: trees, houses, the tower --------------------
+// True 3D objects drawn as projected polygons over the ground texture
+// (like the tower always was): collected each frame from the flora's
+// deterministic world, depth-sorted (painter's algorithm, far to near),
+// with their ground shadows painted first.
+
+/** One drawable 3D thing, at a camera-space depth for sorting. */
+interface WorldObject {
+  depth: number;
+  shadow?: (ctx: CanvasRenderingContext2D, cam: Camera) => void;
+  draw: (ctx: CanvasRenderingContext2D, cam: Camera) => void;
+}
+
+/** The shared flora, reading the ground's own land-use plan. */
+const flora = new Flora(ground.land);
+
+/** The control tower: standing beside the runway, a shaft with a glass
+ *  cab on top — a true 3D object, projected corner by corner through the
+ *  camera, so it slides past on takeoff and parks on the horizon in
+ *  cruise. */
+function pushTower(objects: WorldObject[], cam: Camera): void {
   const TW = { x: 260.0, y: -95.0, base: 6.0, h: 26.0 };   // world metres
   const centreDepth = (TW.x - cam.px) * cam.fx + (TW.y - cam.py) * cam.fy
     + (0.0 - cam.pz) * cam.fz;
   if (centreDepth < 30.0) {
     return;                                  // behind or beside us
   }
-  const quad = (pts: ([number, number] | null)[], fill: string): void => {
-    if (pts.some((p) => p === null)) {
-      return;
+  objects.push({
+    depth: centreDepth,
+    shadow: (ctx, cam2) => {
+      const pS = projectPoint(cam2, TW.x + TW.h * 0.7, TW.y + TW.base, 0.0);
+      if (pS === null) {
+        return;
+      }
+      ctx.fillStyle = "rgba(16,22,14,0.30)";
+      ctx.beginPath();
+      ctx.ellipse(pS[0], pS[1], TW.base * 1.6 * cam2.f / centreDepth,
+                  TW.base * 0.6 * cam2.f / centreDepth, 0, 0, 2 * Math.PI);
+      ctx.fill();
+    },
+    draw: (ctx, cam2) => {
+      const quad = (pts: ([number, number] | null)[], fill: string): void => {
+        if (pts.some((p) => p === null)) {
+          return;
+        }
+        ctx.beginPath();
+        ctx.moveTo(pts[0]![0], pts[0]![1]);
+        for (let i = 1; i < pts.length; i++) {
+          ctx.lineTo(pts[i]![0], pts[i]![1]);
+        }
+        ctx.closePath();
+        ctx.fillStyle = fill;
+        ctx.fill();
+      };
+      const p = (ox: number, oz: number): [number, number] | null =>
+        projectPoint(cam2, TW.x + ox, TW.y, oz);
+      quad([p(-TW.base, 0.0), p(TW.base, 0.0), p(TW.base * 0.6, TW.h),
+            p(-TW.base * 0.6, TW.h)], "#8b96ab");
+      quad([p(-TW.base * 0.9, TW.h), p(TW.base * 0.9, TW.h),
+            p(TW.base * 0.9, TW.h + 4.0), p(-TW.base * 0.9, TW.h + 4.0)], "#9fd8ff");
+      ctx.strokeStyle = "#e8ecf4";
+      ctx.lineWidth = 0.7;
+      ctx.stroke();
+    },
+  });
+}
+
+/** One tree: a trunk stroke plus a canopy — a round deciduous blob or a
+ *  conifer's triangle — projected through the camera, with its shadow on
+ *  the ground. Sub-pixel trees are skipped: the forest tiles' mottled
+ *  texture carries them from altitude. */
+function pushTree(objects: WorldObject[], cam: Camera, t: TreeSpot): void {
+  const pB = projectPoint(cam, t.x, t.y, 0.0);
+  if (pB === null) {
+    return;
+  }
+  const depth = (t.x - cam.px) * cam.fx + (t.y - cam.py) * cam.fy
+              + (0.0 - cam.pz) * cam.fz;
+  if (depth < 3.0) {
+    return;
+  }
+  const cr = (t.r * cam.f) / depth;          // the canopy's projected radius
+  if (cr < 0.8) {
+    return;                                  // sub-pixel: the texture carries
+  }
+  const pT = projectPoint(cam, t.x, t.y, t.h)!;   // same depth as the base
+  const mX = 40.0 + cr * 2.0;
+  if (Math.min(pB[0], pT[0]) < -mX || Math.max(pB[0], pT[0]) > cam.W + mX
+      || Math.min(pB[1], pT[1]) < -mX || Math.max(pB[1], pT[1]) > cam.H + mX) {
+    return;                                  // off the windshield
+  }
+  const trunkTopX = pB[0] + (pT[0] - pB[0]) * 0.75;
+  const trunkTopY = pB[1] + (pT[1] - pB[1]) * 0.75;
+  const canopyX = pB[0] + (pT[0] - pB[0]) * 0.7;
+  const canopyY = pB[1] + (pT[1] - pB[1]) * 0.7;
+  const baseY = pB[1] + (pT[1] - pB[1]) * 0.3;
+  const green = t.shade < 0.5 ? "#2c4a22" : "#356030";
+  objects.push({
+    depth,
+    shadow: (ctx, cam2) => {
+      const pS = projectPoint(cam2, t.x + t.h * 0.6, t.y + t.h * 0.15, 0.0);
+      if (pS === null) {
+        return;
+      }
+      ctx.fillStyle = "rgba(16,22,14,0.30)";
+      ctx.beginPath();
+      ctx.ellipse(pS[0], pS[1], cr * 0.9, cr * 0.35, 0, 0, 2 * Math.PI);
+      ctx.fill();
+    },
+    draw: (ctx) => {
+      ctx.strokeStyle = "#4a3626";            // the trunk
+      ctx.lineWidth = Math.max(0.8, cr * 0.22);
+      ctx.beginPath();
+      ctx.moveTo(pB[0], pB[1]);
+      ctx.lineTo(trunkTopX, trunkTopY);
+      ctx.stroke();
+      ctx.fillStyle = green;                  // the canopy
+      ctx.beginPath();
+      if (t.conifer) {
+        ctx.moveTo(pT[0], pT[1]);
+        ctx.lineTo(canopyX - cr * 1.1, baseY);
+        ctx.lineTo(canopyX + cr * 1.1, baseY);
+        ctx.closePath();
+      } else {
+        ctx.arc(canopyX, canopyY, cr, 0, 2 * Math.PI);
+      }
+      ctx.fill();
+    },
+  });
+}
+
+const WALL: readonly [number, number, number] = [178, 170, 152];
+const ROOF: readonly [number, number, number] = [128, 86, 72];
+const shadeOf = (base: readonly [number, number, number], f: number): string =>
+  `rgb(${Math.round(base[0] * f)}, ${Math.round(base[1] * f)}, ${Math.round(base[2] * f)})`;
+
+/** One house: an axis-aligned box with a ridge roof, every face projected
+ *  and shaded by its orientation, drawn far face first (painter's
+ *  algorithm within the object). */
+function pushHouse(objects: WorldObject[], cam: Camera, h: HouseSpot): void {
+  const depth = (h.x - cam.px) * cam.fx + (h.y - cam.py) * cam.fy
+              + (0.0 - cam.pz) * cam.fz;
+  if (depth < 8.0) {
+    return;
+  }
+  const pC = projectPoint(cam, h.x, h.y, 0.0);
+  if (pC === null) {
+    return;
+  }
+  const extent = (Math.max(h.w, h.d) * cam.f) / depth + 40.0;
+  if (pC[0] < -extent || pC[0] > cam.W + extent
+      || pC[1] < -extent || pC[1] > cam.H + extent) {
+    return;                                  // off the windshield
+  }
+  const x0 = h.x - h.w / 2, x1 = h.x + h.w / 2;
+  const y0 = h.y - h.d / 2, y1 = h.y + h.d / 2;
+  const p = (x: number, y: number, z: number): [number, number] =>
+    projectPoint(cam, x, y, z) ?? [0.0, 0.0];
+  const g: [number, number][] = [p(x0, y0, 0.0), p(x1, y0, 0.0),
+                                p(x1, y1, 0.0), p(x0, y1, 0.0)];
+  const e: [number, number][] = [p(x0, y0, h.wallH), p(x1, y0, h.wallH),
+                                 p(x1, y1, h.wallH), p(x0, y1, h.wallH)];
+  const faceDepth = (x: number, y: number, z: number): number =>
+    (x - cam.px) * cam.fx + (y - cam.py) * cam.fy + (z - cam.pz) * cam.fz;
+  interface Face { depth: number; pts: [number, number][]; colour: string; }
+  const faces: Face[] = [];
+  // walls (up to the eaves), shaded by orientation (sun from the -x side)
+  faces.push({ depth: faceDepth(x0, h.y, h.wallH / 2),
+               pts: [g[0], g[3], e[3], e[0]], colour: shadeOf(WALL, 1.0) });
+  faces.push({ depth: faceDepth(x1, h.y, h.wallH / 2),
+               pts: [g[1], g[2], e[2], e[1]], colour: shadeOf(WALL, 0.72) });
+  faces.push({ depth: faceDepth(h.x, y0, h.wallH / 2),
+               pts: [g[0], g[1], e[1], e[0]], colour: shadeOf(WALL, 0.9) });
+  faces.push({ depth: faceDepth(h.x, y1, h.wallH / 2),
+               pts: [g[3], g[2], e[2], e[3]], colour: shadeOf(WALL, 0.8) });
+  const top = h.wallH + h.roofH;
+  if (h.along === "x") {
+    const r0 = p(x0, h.y, top);
+    const r1 = p(x1, h.y, top);
+    faces.push({ depth: faceDepth(h.x, y0, top),
+                 pts: [e[0], e[1], r1, r0], colour: shadeOf(ROOF, 1.0) });
+    faces.push({ depth: faceDepth(h.x, y1, top),
+                 pts: [e[3], e[2], r1, r0], colour: shadeOf(ROOF, 0.72) });
+    faces.push({ depth: faceDepth(x0, h.y, top),
+                 pts: [e[0], e[3], r0], colour: shadeOf(WALL, 1.0) });
+    faces.push({ depth: faceDepth(x1, h.y, top),
+                 pts: [e[1], e[2], r1], colour: shadeOf(WALL, 0.72) });
+  } else {
+    const r0 = p(h.x, y0, top);
+    const r1 = p(h.x, y1, top);
+    faces.push({ depth: faceDepth(x0, h.y, top),
+                 pts: [e[0], e[3], r1, r0], colour: shadeOf(ROOF, 1.0) });
+    faces.push({ depth: faceDepth(x1, h.y, top),
+                 pts: [e[1], e[2], r1, r0], colour: shadeOf(ROOF, 0.72) });
+    faces.push({ depth: faceDepth(h.x, y0, top),
+                 pts: [e[0], e[1], r0], colour: shadeOf(WALL, 0.9) });
+    faces.push({ depth: faceDepth(h.x, y1, top),
+                 pts: [e[3], e[2], r1], colour: shadeOf(WALL, 0.8) });
+  }
+  faces.sort((a, b) => b.depth - a.depth);
+  objects.push({
+    depth,
+    draw: (ctx) => {
+      for (const f of faces) {
+        ctx.beginPath();
+        ctx.moveTo(f.pts[0][0], f.pts[0][1]);
+        for (let i = 1; i < f.pts.length; i++) {
+          ctx.lineTo(f.pts[i][0], f.pts[i][1]);
+        }
+        ctx.closePath();
+        ctx.fillStyle = f.colour;
+        ctx.fill();
+      }
+    },
+  });
+}
+
+/** Collect and draw the landscape's objects: the tower, the trees within
+ *  700 m, the hamlet houses within 2.5 km — shadows first (ground
+ *  decals), then far to near. */
+function drawWorldObjects(ctx: CanvasRenderingContext2D, cam: Camera): void {
+  const objects: WorldObject[] = [];
+  pushTower(objects, cam);
+  const trees: TreeSpot[] = [];
+  flora.treesNear(cam.px - 700.0, cam.py - 700.0,
+                  cam.px + 700.0, cam.py + 700.0, trees);
+  for (const t of trees) {
+    pushTree(objects, cam, t);
+  }
+  const houses: HouseSpot[] = [];
+  flora.housesNear(cam.px - 2500.0, cam.py - 2500.0,
+                   cam.px + 2500.0, cam.py + 2500.0, houses);
+  for (const h of houses) {
+    pushHouse(objects, cam, h);
+  }
+  for (const o of objects) {
+    if (o.shadow !== undefined) {
+      o.shadow(ctx, cam);
     }
-    ctx.beginPath();
-    ctx.moveTo(pts[0]![0], pts[0]![1]);
-    for (let i = 1; i < pts.length; i++) {
-      ctx.lineTo(pts[i]![0], pts[i]![1]);
-    }
-    ctx.closePath();
-    ctx.fillStyle = fill;
-    ctx.fill();
-  };
-  const p = (ox: number, oz: number): [number, number] | null =>
-    projectPoint(cam, TW.x + ox, TW.y, oz);
-  quad([p(-TW.base, 0.0), p(TW.base, 0.0), p(TW.base * 0.6, TW.h),
-        p(-TW.base * 0.6, TW.h)], "#8b96ab");
-  quad([p(-TW.base * 0.9, TW.h), p(TW.base * 0.9, TW.h),
-        p(TW.base * 0.9, TW.h + 4.0), p(-TW.base * 0.9, TW.h + 4.0)], "#9fd8ff");
-  ctx.strokeStyle = "#e8ecf4";
-  ctx.lineWidth = 0.7;
-  ctx.stroke();
+  }
+  objects.sort((a, b) => b.depth - a.depth);
+  for (const o of objects) {
+    o.draw(ctx, cam);
+  }
 }
 
 /** The HDG tape across the top: ticks and cardinal letters, the current
@@ -596,8 +847,8 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
     ctx.stroke();
     ctx.fillText(String(d), midX + ux * (half + 4), midY + uy * (half + 4) + 3);
   }
-  // the control tower, beside the runway
-  drawTower(ctx, cam);
+  // the landscape's objects: tower, trees, houses, depth-sorted
+  drawWorldObjects(ctx, cam);
   // traffic: other drones in the forward view
   ctx.font = "8px ui-monospace, monospace";
   for (const other of others) {
@@ -730,19 +981,80 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   const s = view;
   const SURF_MAX = 0.35;    // mechanical limit, rad
 
+  // THE HAND'S INPUTS drive this panel — what the pilot at the controls
+  // is commanding right now (the student's own inputs while it flies),
+  // not merely where the airframe's surfaces happen to be.
+  const inAil = s.handCommands[0];
+  const inElev = s.handCommands[1];
+  const inRud = s.handCommands[2];
+  const inThr = Math.max(0.0, Math.min(1.0, s.handCommands[3]));
+
+  // THE LAYOUT: the AERT decision strip sits NORTH of the yoke — dead
+  // above it, on the yoke's own column — with the rudder below and the
+  // throttle lever to the east.
+  const yx = W * 0.32;            // the yoke column
+  const yy = H * 0.53;            // the yoke centre
+  const rx = yx;                  // the rudder rides the yoke column
+  const ry = H * 0.85;
+  const tx = W * 0.80;            // the throttle lever, east side
+  const tyTop = H * 0.18;
+  const tyBot = H * 0.62;
+
+  ctx.textAlign = "left";
+  ctx.font = "9px ui-monospace, monospace";
+
+  // --- AERT decisions (directly above the yoke) -----------------------------
+  // The four control channels and the pilot's decision on each, at every
+  // 0.2 s decision window: A aileron, E elevator, R rudder, T throttle —
+  // ▲ push (+0.05), ▼ ease (−0.05), · hold. The beat dot pulses when a
+  // decision window just opened. While the instructor demonstrates there
+  // are no discrete decisions — its hand eases smoothly — the strip rests.
+  ctx.fillStyle = "#5b6878";
+  ctx.fillText("AERT DECISIONS", yx - 52, 18);
+  ctx.fillStyle = s.handFresh ? "#ff8c3a" : "#2a3242";
+  ctx.beginPath();
+  ctx.arc(yx + 58, 15, 2.5, 0, 2 * Math.PI);
+  ctx.fill();
+  const CHANNEL_LABELS = ["A", "E", "R", "T"];
+  for (let i = 0; i < 4; i++) {
+    const bx = yx - 52 + i * 26;
+    ctx.strokeStyle = "#3a4258";
+    ctx.strokeRect(bx + 0.5, 24.5, 22, 22);
+    ctx.fillStyle = "#5b6878";
+    ctx.fillText(CHANNEL_LABELS[i], bx + 8, 57);
+    const choice = s.handChoices;
+    if (choice === null) {
+      ctx.fillStyle = "#3a4258";            // the instructor eases: no decisions
+      ctx.fillText("\u2014", bx + 8, 40);
+      continue;
+    }
+    if (choice[i] === 2) {                   // PUSH
+      ctx.fillStyle = "#ff8c3a";
+      ctx.fillText("\u25b2", bx + 7, 40);
+    } else if (choice[i] === 0) {            // ease
+      ctx.fillStyle = "#9fd8ff";
+      ctx.fillText("\u25bc", bx + 7, 41);
+    } else {                                 // hold
+      ctx.fillStyle = "#5b6878";
+      ctx.fillText("\u00b7", bx + 10, 39);
+    }
+  }
+  // the channel legend: what each letter commands
+  ctx.fillStyle = "#3d4658";
+  ctx.fillText("A aileron \u00b7 E elevator", yx - 52, 72);
+  ctx.fillText("R rudder \u00b7 T throttle", yx - 52, 84);
+
   // --- yoke (aileron rotates the wheel, elevator pushes/pulls it) -----------
-  const yx = W * 0.3;
-  const yy = H * 0.4;
   const travel = 15;                    // px of push/pull travel
-  const pull = (s.elev / SURF_MAX) * travel;    // nose up = pull = yoke toward pilot
-  const wheelAngle = (s.ail / SURF_MAX) * 1.15; // rad of visual wheel rotation
+  const pull = (inElev / SURF_MAX) * travel;    // nose up = pull = yoke toward pilot
+  const wheelAngle = (inAil / SURF_MAX) * 1.15; // rad of visual wheel rotation
 
   // neutral cross reference
   ctx.strokeStyle = "#232b3d";
   ctx.setLineDash([4, 4]);
   ctx.beginPath();
   ctx.moveTo(yx - 70, yy); ctx.lineTo(yx + 70, yy);
-  ctx.moveTo(yx, yy - 55); ctx.lineTo(yx, yy + 55);
+  ctx.moveTo(yx, yy - 44); ctx.lineTo(yx, yy + 44);
   ctx.stroke();
   ctx.setLineDash([]);
 
@@ -777,18 +1089,15 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   ctx.restore();
   ctx.lineCap = "butt";
   ctx.fillStyle = "#5b6878";
-  ctx.font = "9px ui-monospace, monospace";
-  ctx.fillText("YOKE", yx - 14, yy + 74);
-  ctx.fillText(s.elev >= 0 ? "PULL" : "PUSH", yx + 26, yy + pull - 4);
+  ctx.fillText("YOKE", yx - 14, yy + 58);
+  ctx.fillText(inElev >= 0 ? "PULL" : "PUSH", yx + 26, yy + pull - 4);
 
   // --- rudder pedals ---------------------------------------------------------
-  const rx = W * 0.3;
-  const ry = H * 0.78;
-  const press = (s.rud / SURF_MAX) * 9;      // one pedal forward, one back
+  const press = (inRud / SURF_MAX) * 9;      // one pedal forward, one back
   for (const side of [-1, 1]) {
-    const forward = (s.rud > 0 && side > 0) || (s.rud < 0 && side < 0);
-    const disp = forward ? -press : (s.rud !== 0 ? press * 0.35 : 0);
-    const engaged = (s.rud > 0 && side > 0) || (s.rud < 0 && side < 0);
+    const forward = (inRud > 0 && side > 0) || (inRud < 0 && side < 0);
+    const disp = forward ? -press : (inRud !== 0 ? press * 0.35 : 0);
+    const engaged = (inRud > 0 && side > 0) || (inRud < 0 && side < 0);
     ctx.fillStyle = engaged ? "#ff8c3a" : "#3a4258";
     ctx.fillRect(rx + side * 34 - 9, ry + disp - 16, 18, 30);
   }
@@ -801,13 +1110,10 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   ctx.fillStyle = "#5b6878";
   ctx.fillText("L", rx - 66, ry + 3);
   ctx.fillText("R", rx + 62, ry + 3);
-  ctx.fillText("RUDDER", rx - 21, ry + 26);
+  ctx.fillText("RUDDER", rx - 21, ry + 28);
 
   // --- throttle can: horizontal bars from green (idle) to red (full) ------
-  const tx = W * 0.78;
-  const tyTop = H * 0.16;
-  const tyBot = H * 0.62;
-  const th = Math.max(0.0, Math.min(1.0, s.throttle));
+  const th = Math.max(0.0, Math.min(1.0, inThr));
   const canW = 26;
   const canH = tyBot - tyTop;
   ctx.fillStyle = "#1a2030";
@@ -833,19 +1139,23 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
 
   // --- engine: the RPM lives here, beside the throttle can ---------------
   ctx.fillStyle = "#8b96ab";
-  ctx.font = "9px ui-monospace, monospace";
   ctx.fillText("RPM", tx + 20, tyTop + 6);
-  ctx.fillStyle = rpmOf(s.throttle) > 2450 ? "#ff6a5a" : "#7dff8e";
+  ctx.fillStyle = rpmOf(inThr) > 2450 ? "#ff6a5a" : "#7dff8e";
   ctx.font = "bold 13px ui-monospace, monospace";
-  ctx.fillText(rpmOf(s.throttle).toFixed(0), tx + 20, tyTop + 20);
+  ctx.fillText(rpmOf(inThr).toFixed(0), tx + 20, tyTop + 20);
 
-  // surface readouts, bottom right
+  // surface readouts, bottom right — the HAND (inputs) above the
+  // AIRFRAME (surfaces), so the student's inputs are always readable
   ctx.textAlign = "right";
-  ctx.fillStyle = "#8b96ab";
+  ctx.fillStyle = "#ff8c3a";
   ctx.font = "9px ui-monospace, monospace";
-  ctx.fillText(`AIL ${s.ail >= 0 ? "+" : ""}${s.ail.toFixed(2)}`, W - 10, H - 34);
-  ctx.fillText(`ELEV ${s.elev >= 0 ? "+" : ""}${s.elev.toFixed(2)}`, W - 10, H - 22);
-  ctx.fillText(`RUD ${s.rud >= 0 ? "+" : ""}${s.rud.toFixed(2)}`, W - 10, H - 10);
+  ctx.fillText(`HAND A ${inAil >= 0 ? "+" : ""}${inAil.toFixed(2)}` +
+              ` E ${inElev >= 0 ? "+" : ""}${inElev.toFixed(2)}` +
+              ` R ${inRud >= 0 ? "+" : ""}${inRud.toFixed(2)}`, W - 10, H - 34);
+  ctx.fillStyle = "#8b96ab";
+  ctx.fillText(`SRF  A ${s.ail >= 0 ? "+" : ""}${s.ail.toFixed(2)}` +
+              ` E ${s.elev >= 0 ? "+" : ""}${s.elev.toFixed(2)}` +
+              ` R ${s.rud >= 0 ? "+" : ""}${s.rud.toFixed(2)}`, W - 10, H - 22);
   ctx.textAlign = "left";
 
   if (!s.alive) {
@@ -853,6 +1163,8 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
     ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = "#ff4a3a";
     ctx.font = "bold 11px ui-monospace, monospace";
-    ctx.fillText("CONTROLS FROZEN", 12, H - 12);
+    ctx.textAlign = "center";
+    ctx.fillText("CONTROLS FROZEN", W / 2, H - 10);
+    ctx.textAlign = "left";
   }
 }

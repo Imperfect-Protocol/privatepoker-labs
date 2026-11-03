@@ -45,6 +45,12 @@ export class NumpyPcg64 {
   /** The multiplier constant, for reference tests. */
   static readonly MULTIPLIER = MULTIPLIER;
 
+  /** One raw 64-bit draw — for spawning child streams deterministically
+   *  (a live scene's per-drone dice; no existing consumer changes). */
+  draw64(): bigint {
+    return this.nextUint64();
+  }
+
   private nextUint64(): bigint {
     this.state = (MULTIPLIER * this.state + this.inc) % MOD_128;
     const hi = this.state >> 64n;

@@ -27,6 +27,7 @@ function recCtx(ops) {
     moveTo(x, y) { ops.push(["m", x, y]); },
     lineTo(x, y) { ops.push(["l", x, y]); },
     arc(x, y, r) { ops.push(["arc", x, y, r]); },
+    ellipse() {},
     closePath() {}, fill() {}, stroke() {},
     fillText() {}, setLineDash() {}, globalAlpha: 1,
     font: "", textAlign: "left", lineWidth: 1, lineJoin: "miter",
@@ -107,8 +108,8 @@ const FTm = 0.3048;
 const { Ground: GroundCls } = await import("../build/src/app/ground.js");
 const g = new GroundCls();
 {
-  const norm = (c) => (c[0] - 76.0) / (84 - 76.0);   // 1.0 = level-0 bright
-  const lvl0Bright = [84, 62, 40];
+  const norm = (c) => (c[0] - 66.0) / (74.0 - 66.0);   // 1.0 = level-0 bright (Grass)
+  const lvl0Bright = [74, 106, 56];
   // ON THE GROUND (eye 3 m): the base map — even a HUGE footprint reads
   // level 0, because the level comes from ALTITUDE, not footprint.
   const tiny = g.sample(306.0, 208.0, 0.05, 0.05, 0.05, 0.05, 100.0, 3.0);
@@ -123,9 +124,9 @@ const g = new GroundCls();
   // AT 4000 ft: the TOP map — the same checker, same apparent size, brighter
   // (u = 4032: the centre of the 384 m bright cell [3840, 4224])
   const top = g.sample(4032.0, 4032.0, 4000.0, 0.0, 0.0, 4000.0, 100.0, 4000 * FTm);
-  const topOk = Math.abs(top[0] - 148) < 6;
+  const topOk = Math.abs(top[0] - 130) < 6;
   console.log(`  4000 ft: rgb(${top.map((c) => c.toFixed(0)).join(",")})` +
-              ` — the top map, crisp ${[148, 109, 70].join(",")}` +
+              ` — the top map, crisp ${[130, 187, 99].join(",")}` +
               `${topOk ? "  ✓ same size, brighter" : "  ✗"}`);
   console.log(`  apparent size: 12 m from 125 ft = ${(12 / (125 * FTm)).toFixed(4)} rad,` +
               ` 384 m from 4000 ft = ${(384 / (4000 * FTm)).toFixed(4)} rad` +

@@ -7,78 +7,61 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%E2%9C%88%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="/style.css">
 </head>
-<body data-mode="school">
-  <header>
-    <h1>SKYNERD <span class="tag">genesis</span></h1>
-    <p class="sub">interactive simulation · deterministic port of the Python reference · physics steps live in your browser</p>
-  </header>
+<body>
+  <div id="app">
+    <div id="bar">
+      <span class="brand">SKYNERD <span class="tag">genesis</span></span>
+      <button id="play" title="space">&#9208; pause</button>
+      <label>speed
+        <select id="speed">
+          <option value="0.2">0.2x</option>
+          <option value="0.3">0.3x</option>
+          <option value="0.5">0.5x</option>
+          <option value="1" selected>1x</option>
+          <option value="2">2x</option>
+          <option value="3">3x</option>
+          <option value="5">5x</option>
+          <option value="10">10x</option>
+        </select>
+      </label>
+      <label>scenario
+        <select id="scenario"></select>
+      </label>
+      <label>aircraft
+        <select id="aircraft"></select>
+      </label>
+      <button id="next" title="N — next maneuver">&#9654; next maneuver</button>
+      <button id="restart" title="R — restart">&#8635; restart</button>
+      <button id="zoomIn" title="zoom in">+</button>
+      <button id="zoomOut" title="zoom out">&minus;</button>
+      <button id="zoomReset" title="reset view">reset</button>
+      <span id="badge"></span>
+    </div>
 
-  <div id="bar">
-    <button id="play" title="space">&#9208; pause</button>
-    <label>speed
-      <select id="speed">
-        <option value="0.2">0.2x</option>
-        <option value="0.3">0.3x</option>
-        <option value="0.5">0.5x</option>
-        <option value="1" selected>1x</option>
-        <option value="2">2x</option>
-        <option value="3">3x</option>
-        <option value="5">5x</option>
-        <option value="10">10x</option>
-      </select>
-    </label>
-    <label>view
-      <select id="mode">
-        <option value="school" selected>flight school</option>
-        <option value="carpet">carpet waves</option>
-      </select>
-    </label>
-    <label>seed
-      <select id="seed"></select>
-    </label>
-    <button id="restart" title="R">&#8635; restart</button>
-    <button id="zoomIn" title="zoom in">+</button>
-    <button id="zoomOut" title="zoom out">&minus;</button>
-    <button id="zoomReset" title="reset view">reset</button>
-    <span id="badge"></span>
-  </div>
+    <div id="stage">
+      <div id="narration" class="narration"></div>
+      <canvas id="sky"></canvas>
+      <div id="status">booting…</div>
+    </div>
 
-  <div id="narration" class="narration"></div>
-
-  <div id="stage">
-    <canvas id="sky"></canvas>
     <aside id="cockpit">
       <div class="cockpit-head">
         <span id="cockpit-title">—</span>
-        <button id="cockpit-close" title="close">&#215;</button>
       </div>
       <canvas id="cockpitCanvas"></canvas>
       <canvas id="controlsCanvas"></canvas>
       <div id="cockpit-foot"></div>
     </aside>
+
+    <div id="results">
+      <table id="school">
+        <thead>
+          <tr><th>maneuver</th><th>attempts</th><th>goal score</th><th>goals</th><th>match</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </div>
-  <div id="status">booting…</div>
-  <canvas id="chart"></canvas>
-
-  <table id="school">
-    <thead>
-      <tr><th>lesson</th><th>stamps</th><th>score</th><th>python golden</th><th>match</th></tr>
-    </thead>
-    <tbody></tbody>
-  </table>
-
-  <table id="waves">
-    <thead>
-      <tr><th>wave</th><th>mean survival (s)</th><th>deaths</th><th>flock</th><th>python golden</th></tr>
-    </thead>
-    <tbody></tbody>
-  </table>
-
-  <p class="foot"><span id="foot-school">The flight school runs live: the instructor demonstrates each maneuver and the
-  student repeats it — the same classroom the Python reference teaches, graded against its golden report card.
-  The graduate's memory is what the carpet inherits.</span>
-  <span id="foot-carpet" hidden>Every wave is born as a mosaic of the living flock, flies its episode,
-  and the dying scream their tensors to whoever hears. No autopilot, no teacher: drones that die teach by dying.</span></p>
 
   <script type="module" src="/build-web/src/app/main.js"></script>
 </body>

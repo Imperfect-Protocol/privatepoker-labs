@@ -14,7 +14,10 @@ export { SurfacesState, SURFACE_LIMITS, SURFACE_SLEW_RATE, AILERON, ELEVATOR, RU
 export { RigidBody } from "./physics/rigid-body.js";
 export { FlightInstruments, DenseReward, EpisodeOutcome, classifyOutcome, binError, ERROR_BINS } from "./learning/instruments.js";
 export type { EpisodeOutcomeName } from "./learning/instruments.js";
-export { SparseHebbianTensor, ServoPolicy, EASE_OFF, HOLD, PUSH, ACTION_AXIS, SURFACE_AXIS, HOLD_ALL_SURFACE, ACTION_DELTA } from "./learning/servo-tensor.js";
+export { ServoPolicy, EASE_OFF, HOLD, PUSH, ACTION_AXIS, SURFACE_AXIS, HOLD_ALL_SURFACE, ACTION_DELTA, GOAL_AXIS, ELEMENT_AXIS, GOAL_FOLLOW_INSTRUCTOR, GOAL_FREE_FLIGHT, ELEMENT_FREE_FLIGHT, NEURON_EMA } from "./learning/servo-tensor.js";
+export { PulseNeuron, Refractory, denoiseProjection, NEURON_LAYERS } from "./learning/neurons.js";
+export type { NeuronSnapshot, BrainSnapshot } from "./learning/servo-tensor.js";
+export type { NeuronSpec } from "./learning/neurons.js";
 export { TRIM_SPEED, HORIZON, TRIM_COMMAND, springTowardNeutral, flyEpisode } from "./learning/flight.js";
 export type { EpisodeResult, EpisodeOptions } from "./learning/flight.js";
 export { Flock } from "./learning/flock.js";

@@ -9,37 +9,54 @@
   --line: #1a2030;
 }
 * { box-sizing: border-box; }
+html, body { height: 100%; }
 body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
   font: 14px/1.45 "SF Mono", ui-monospace, Menlo, Consolas, monospace;
-  padding: 18px clamp(12px, 4vw, 48px) 40px;
-  max-width: 1280px;
-  margin-inline: auto;
+  overflow: hidden;
 }
-header h1 {
-  margin: 0;
-  font-size: 22px;
-  letter-spacing: 3px;
-  color: var(--accent);
+
+/* --- the app shell: full width, four regions -------------------------------
+ *   toolbar across the top edge;
+ *   the instrument sidebar down the right edge, below the toolbar;
+ *   the main view filling the rest;
+ *   the results panel along the bottom edge, ending at the sidebar's
+ *   left edge.
+ */
+#app {
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "toolbar toolbar"
+    "main sidebar"
+    "bottom sidebar";
 }
-header .tag {
-  font-size: 12px;
-  letter-spacing: 2px;
-  color: var(--dim);
-  text-transform: lowercase;
-}
-.sub { margin: 2px 0 14px; color: var(--dim); font-size: 12px; }
+
+/* --- toolbar (top edge, full width) --------------------------------------- */
 #bar {
+  grid-area: toolbar;
   display: flex;
   gap: 12px;
   align-items: center;
   flex-wrap: wrap;
-  margin-bottom: 10px;
-}
-button, select {
+  padding: 10px 14px;
   background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.brand {
+  color: var(--accent);
+  letter-spacing: 3px;
+  font-size: 15px;
+  margin-right: 10px;
+  white-space: nowrap;
+}
+.brand .tag { color: var(--dim); font-size: 11px; letter-spacing: 2px; }
+button, select {
+  background: var(--bg);
   color: var(--ink);
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -49,29 +66,86 @@ button, select {
 }
 button:hover, select:hover { border-color: var(--accent); }
 label { color: var(--dim); font-size: 12px; display: inline-flex; gap: 6px; align-items: center; }
-#badge { font-size: 12px; }
+#badge { font-size: 12px; margin-left: auto; }
 #badge.ok { color: var(--good); }
 #badge.bad { color: var(--bad); }
+
+/* --- main view (narration, the sky, the status line) ----------------------- */
+#stage {
+  grid-area: main;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  gap: 8px;
+  padding: 10px 12px 8px;
+}
+#narration {
+  font-size: 16px;
+  letter-spacing: 0.5px;
+  color: var(--ink);
+  min-height: 24px;
+}
+#narration.stage-demo { color: var(--accent); }
+#narration.stage-repeat { color: #9fd8ff; }
+#narration.stage-waves { color: #ffb84a; }
 #sky {
+  flex: 1;
+  min-height: 0;
   width: 100%;
-  height: 440px;
   background: #0d1018;
   border: 1px solid var(--line);
   border-radius: 10px;
   display: block;
 }
 #status {
-  margin: 10px 2px;
   color: var(--dim);
   font-size: 12px;
   min-height: 18px;
 }
-#chart {
-  width: 100%;
-  height: 90px;
-  display: block;
-  margin-bottom: 12px;
+
+/* --- instrument sidebar (right edge, below the toolbar) ---------------------
+ * The sidebar's WIDTH follows its panels: both canvases are sized by the
+ * vertical space (JS sets their pixel sizes), each exactly 3:2, filling
+ * the whole column — so the column is exactly wide enough and no space
+ * is left under the controls panel. */
+#cockpit {
+  grid-area: sidebar;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  overflow: hidden;         /* the panels size themselves; nothing spills */
 }
+.cockpit-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+#cockpit-title { color: var(--accent); font-size: 12px; letter-spacing: 1px; }
+#cockpitCanvas,
+#controlsCanvas {
+  display: block;
+  background: #05070c;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  /* pixel width/height are set by layoutSidebar(): each panel 3:2,
+   * both the same size, together filling the sidebar's full height */
+}
+#cockpit-foot { color: var(--dim); font-size: 10.5px; min-height: 14px; }
+
+/* --- results panel (bottom edge, ending at the sidebar's left edge) -------- */
+#results {
+  grid-area: bottom;
+  max-height: 30vh;
+  overflow: auto;
+  padding: 8px 12px;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+}
+#results[hidden] { display: none; }
 table {
   border-collapse: collapse;
   width: 100%;
@@ -83,77 +157,14 @@ th, td {
   text-align: right;
 }
 th:first-child, td:first-child { text-align: left; }
-th { color: var(--dim); font-weight: 400; background: var(--panel); }
+th {
+  color: var(--dim);
+  font-weight: 400;
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+}
 td .ok { color: var(--good); }
 td .bad { color: var(--bad); }
 td .na { color: var(--dim); }
-.foot { color: var(--dim); font-size: 11.5px; max-width: 720px; }
-.foot code { color: var(--ink); }
-
-/* --- cockpit panel ------------------------------------------------------- */
-#stage { position: relative; }
-#sky { width: 100%; }
-#cockpit {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  width: 342px;
-  background: rgba(13, 16, 24, 0.93);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  padding: 8px 10px 10px;
-}
-#cockpit:not([hidden]) { display: block; animation: slidein 0.16s ease; }
-@keyframes slidein {
-  from { transform: translateX(14px); opacity: 0.2; }
-  to { transform: none; opacity: 1; }
-}
-.cockpit-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 6px;
-}
-#cockpit-title { color: var(--accent); font-size: 12px; letter-spacing: 1px; }
-#cockpit-close { padding: 0 8px; font-size: 13px; line-height: 1.4; }
-#cockpitCanvas {
-  width: 100%;
-  height: 238px;
-  background: #05070c;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  display: block;
-}
-#controlsCanvas {
-  width: 100%;
-  height: 238px;
-  margin-top: 8px;
-  background: #05070c;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  display: block;
-}
-#cockpit-foot { margin-top: 6px; color: var(--dim); font-size: 10.5px; min-height: 14px; }
-
-/* --- flight school view --------------------------------------------------- */
-#narration {
-  font-size: 16px;
-  letter-spacing: 0.5px;
-  color: var(--ink);
-  min-height: 24px;
-  margin: 0 2px 10px;
-}
-#narration.stage-demo { color: var(--accent); }
-#narration.stage-exam,
-#narration.stage-repeat { color: #9fd8ff; }
-#narration.takeover { color: #ffb84a; }
-#narration.stage-drilling { color: var(--dim); font-style: italic; }
-#narration.stage-done { color: var(--good); }
-
-body[data-mode="school"] #chart,
-body[data-mode="school"] #waves,
-body[data-mode="school"] #foot-carpet { display: none; }
-body[data-mode="carpet"] #school,
-body[data-mode="carpet"] #foot-school { display: none; }
-#school { margin-bottom: 14px; }
 #school td:nth-child(2) { color: var(--dim); }

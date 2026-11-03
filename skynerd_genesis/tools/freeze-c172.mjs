@@ -30,7 +30,7 @@ function runClassroom() {
   return {
     rounds: session.rounds,
     failed: [...session.failed],
-    graduate_keys: session.graduate === null ? 0 : session.graduate.tensor.values.size,
+    graduate_keys: session.graduate === null ? 0 : session.graduate.storedCombinations,
     lessons,
   };
 }
