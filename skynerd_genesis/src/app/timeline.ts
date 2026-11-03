@@ -10,6 +10,7 @@ import { World } from "../core/world.js";
 import { NumpyPcg64 } from "../core/rng.js";
 import { RigidBody } from "../physics/rigid-body.js";
 import { SurfacesState } from "../physics/surfaces.js";
+import { GRAVITY, RHO_SEA_LEVEL } from "../physics/aero.js";
 import {
   DenseReward, EpisodeOutcome, FlightInstruments, classifyOutcome,
 } from "../learning/instruments.js";
@@ -29,6 +30,8 @@ export interface DroneSample {
   bank: number;     // rad, positive right wing down
   speed: number;    // m/s
   vs: number;       // m/s, vertical speed
+  velX: number;     // velocity components, m/s (drive the flight path marker)
+  velY: number;
   throttle: number; // 0..1 commanded
   ail: number;      // aileron position, rad (physical, slewed)
   elev: number;     // elevator position, rad
@@ -98,17 +101,20 @@ function tracedEpisode(policy: ServoPolicy, instruments: FlightInstruments,
       }
     }
     servos.command(commands, DT);
-    body.step(servos, DT);
+    body.step(servos, DT, GRAVITY, RHO_SEA_LEVEL,
+              body.position.z - world.terrainHeight(body.position.x, body.position.y));
     commands = springTowardNeutral(commands, DT);
     pending += dense.tick(body) + 0.0005;
-    const [fwd, right] = body.bodyAxes;
+    const [fwd] = body.bodyAxes;
     samples.push({
       x: body.position.x, y: body.position.y, z: body.position.z,
       fwdX: fwd.x, fwdY: fwd.y,
-      pitch: Math.asin(Math.max(-1.0, Math.min(1.0, fwd.z))),
-      bank: -Math.asin(Math.max(-1.0, Math.min(1.0, right.z))),
+      pitch: body.deckPitch,
+      bank: body.bank,
       speed: body.velocity.length(),
       vs: body.velocity.z,
+      velX: body.velocity.x,
+      velY: body.velocity.y,
       throttle: commands[3],
       ail: servos.positions[0],
       elev: servos.positions[1],

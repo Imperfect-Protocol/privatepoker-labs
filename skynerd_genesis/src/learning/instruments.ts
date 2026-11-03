@@ -43,9 +43,7 @@ export class FlightInstruments {
   /** (vsErr, bankErr, speedErr), each normalized to [-1, 1]. */
   errors(body: RigidBody): Vec3 {
     const vsErr = Math.max(-1.0, Math.min(1.0, body.velocity.z / this.vsBand));
-    const [, right] = body.bodyAxes;
-    // Rolled right => right wing down => right.z < 0 => bank positive.
-    const bank = -Math.asin(Math.max(-1.0, Math.min(1.0, right.z)));
+    const bank = body.bank;
     const bankErr = Math.max(-1.0, Math.min(1.0, bank / (Math.PI / 4.0)));
     const speed = body.velocity.length();
     const speedErr = Math.max(-1.0, Math.min(1.0, (speed - this.trimSpeed) / this.speedBand));

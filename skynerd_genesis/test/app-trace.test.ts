@@ -1,8 +1,10 @@
 /**
- * The app's traced wave runner must produce exactly what the Python golden
- * baseline recorded (scenario "waves": seed 42, 5 waves of 8, epsilon 0.05)
- * — the browser visualises this data, so its source is held to the same
- * bit-exact gate as the WaveRunner port itself.
+ * The app's traced wave runner must produce exactly what the TS-frozen
+ * C172 waves reference recorded (reference/c172-waves-frozen.json, traced
+ * section: seed 42, 5 waves of 8, epsilon 0.05) — the browser visualises
+ * this data, so its source is held to the same bit-exact gate as the
+ * WaveRunner itself. The Python golden-baseline.json waves are the
+ * historical record of the old 1.5 kg airframe.
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -15,19 +17,19 @@ import { check, finish, section } from "./harness.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const rngRef = JSON.parse(readFileSync(join(here, "..", "..", "reference", "rng-ref.json"), "utf8"));
-const baseline = JSON.parse(readFileSync(join(here, "..", "..", "reference", "golden-baseline.json"), "utf8"));
+const frozen = JSON.parse(readFileSync(join(here, "..", "..", "reference", "c172-waves-frozen.json"), "utf8"));
 
-section("traced waves (app timeline) vs python golden baseline");
+section("traced waves (app timeline) vs c172 frozen reference");
 {
   const seed42 = rngRef.seeds.find((s: { seed: number }) => s.seed === 42);
   check("seed 42 in rng-ref", seed42 !== undefined);
-  const golden = baseline.scenarios.waves;
+  const golden = frozen.traced;
   const run = runTracedWaves({ state: seed42.state, inc: seed42.inc },
-                             golden.waves);
+                             frozen.waves);
   check("flock births = wave count x wave size",
-        run.flock.births === golden.waves * golden.wave_size,
+        run.flock.births === frozen.waves * frozen.wave_size,
         `got ${run.flock.births}`);
-  for (let i = 0; i < golden.waves; i++) {
+  for (let i = 0; i < frozen.waves; i++) {
     const trace = run.traces[i];
     const want = golden.per_wave[i];
     check(`wave ${i} survivals exact`,
@@ -50,8 +52,9 @@ section("traced waves (app timeline) vs python golden baseline");
       && Math.abs(s.elev) <= 0.35 + 1e-9 && Math.abs(s.rud) <= 0.35 + 1e-9)));
   section("cockpit units (panel law)");
   {
-    check("cruise 10.5 m/s reads 80 mph", mphOf(10.5) === 80.0);
+    check("cruise 38 m/s reads 85 mph", mphOf(38.0) === 85.00372);
     check("trim throttle 0.15 reads 1000 rpm", rpmOf(0.15) === 1000.0);
+    check("cruise throttle 0.8 reads 2300 rpm", rpmOf(0.8) === 2300.0);
     check("closed throttle reads 0 rpm", rpmOf(0.0) === 0.0);
     check("full throttle reads 2700 rpm", rpmOf(1.0) === FULL_THROTTLE_RPM);
     check("1 m/s climb reads 1.9685 x100 fpm",

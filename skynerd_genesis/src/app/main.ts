@@ -1,14 +1,34 @@
 /**
- * Skynerd Genesis web app: record carpet waves with the ported simulator and
- * play them back on a 2D canvas. Visualisation is not the world model — the
- * waves are recorded by src/app/timeline.ts (validated bit-exact against the
- * Python golden baseline) and this file only renders and drives the clock.
+ * Skynerd Genesis web app: the swarm's world, live.
+ *
+ * Two views of the same ported simulator core:
+ * - FLIGHT SCHOOL: the classroom run live, one 50 Hz tick at a time — the
+ *   instructor demonstrates each lesson, the student repeats it, the
+ *   cockpit shows the flying drone's own instruments and controls, and the
+ *   report card at the end is graded against the TS-frozen C172 reference
+ *   (reference/c172-frozen.json).
+ * - CARPET WAVES: the generations of the swarm (currently played back from
+ *   a bit-exact recording; the live carpet rebuild is the next milestone),
+ *   compared against the TS-frozen waves reference
+ *   (reference/c172-waves-frozen.json).
+ *
+ * The clock is a fixed-dt accumulator: wall time x speed becomes sim ticks
+ * at exactly 1/50 s each — physics never sees a variable dt.
  */
 import { runTracedWaves, type WaveTrace, type SeedRef } from "./timeline.js";
 import { mphOf, vsHundredsOf, altFtOf, rpmOf } from "./units.js";
+import {
+  drawCockpitView, drawControlsView, type DroneView,
+} from "./cockpit.js";
+import {
+  FlightSchoolShow,
+} from "./school-show.js";
 
 interface SeedEntry extends SeedRef { seed: number }
 interface GoldenWave { wave: number; survivals: number[]; deaths: number; flock_size: number }
+interface GoldenLesson { lesson: string; score: number; stamps: number }
+
+type Mode = "school" | "carpet";
 
 const DT = 0.02;
 const WORLD = { minX: -880, maxX: 880, minY: -270, maxY: 270 };
@@ -17,38 +37,52 @@ const els = {
   sky: document.getElementById("sky") as HTMLCanvasElement,
   chart: document.getElementById("chart") as HTMLCanvasElement,
   status: document.getElementById("status")!,
+  narration: document.getElementById("narration")!,
   play: document.getElementById("play") as HTMLButtonElement,
   speed: document.getElementById("speed") as HTMLSelectElement,
+  mode: document.getElementById("mode") as HTMLSelectElement,
   seed: document.getElementById("seed") as HTMLSelectElement,
   restart: document.getElementById("restart") as HTMLButtonElement,
+  zoomIn: document.getElementById("zoomIn") as HTMLButtonElement,
+  zoomOut: document.getElementById("zoomOut") as HTMLButtonElement,
+  zoomReset: document.getElementById("zoomReset") as HTMLButtonElement,
   badge: document.getElementById("badge")!,
   tbody: document.querySelector("#waves tbody") as HTMLElement,
+  schoolTbody: document.querySelector("#school tbody") as HTMLElement,
   cockpit: document.getElementById("cockpit") as HTMLElement,
   cockpitTitle: document.getElementById("cockpit-title")!,
-  cockpitCanvas: document.getElementById("cockpitCanvas") as HTMLCanvasElement,
-  controlsCanvas: document.getElementById("controlsCanvas") as HTMLCanvasElement,
   cockpitFoot: document.getElementById("cockpit-foot")!,
   cockpitClose: document.getElementById("cockpit-close") as HTMLButtonElement,
+  cockpitCanvas: document.getElementById("cockpitCanvas") as HTMLCanvasElement,
+  controlsCanvas: document.getElementById("controlsCanvas") as HTMLCanvasElement,
 };
 
 const state = {
+  mode: "school" as Mode,
+  // --- carpet (playback of the bit-exact recording, until the live rebuild)
   seeds: [] as SeedEntry[],
-  golden: null as null | { perWave: GoldenWave[] },
+  golden: null as null | { perWave: GoldenWave[]; lessons: GoldenLesson[] },
   traces: [] as WaveTrace[],
   births: 0,
   obituaries: 0,
   waveIdx: 0,
   t: 0.0,
-  playing: true,
   done: false,
   selected: null as { slot: number } | null,
+  // --- school (live)
+  show: null as FlightSchoolShow | null,
+  acc: 0.0,
+  playing: true,
+  reportKey: "",
+  /** The school top-view zoom: metres spanned across the canvas. */
+  span: 260.0,
 };
 
 function waveDuration(wave: WaveTrace): number {
   return wave.survivals.reduce((a, b) => Math.max(a, b), 0.0);
 }
 
-// --- recording ----------------------------------------------------------------
+// --- carpet: recording + golden comparison -------------------------------------
 
 function record(seed: SeedEntry): void {
   const run = runTracedWaves(seed, 5);
@@ -57,14 +91,11 @@ function record(seed: SeedEntry): void {
   state.obituaries = run.flock.obituariesHeard;
   state.waveIdx = 0;
   state.t = 0.0;
-  state.playing = true;
   state.done = false;
   setSelected(null);
   els.tbody.innerHTML = "";
   updateBadge();
 }
-
-// --- golden comparison ---------------------------------------------------------
 
 function goldenFor(waveIdx: number): GoldenWave | null {
   if (!state.golden || Number(els.seed.value) !== 42) {
@@ -85,6 +116,21 @@ function waveMatchesGolden(waveIdx: number): boolean | null {
 }
 
 function updateBadge(): void {
+  if (state.mode === "school") {
+    const show = state.show;
+    if (show === null || !show.done) {
+      els.badge.textContent = "";
+      els.badge.className = "";
+      return;
+    }
+    const rows = show.reportRows(state.golden?.lessons ?? []);
+    const exact = rows.length > 0 && rows.every((r) => r.exact === true);
+    els.badge.textContent = exact
+      ? "golden: \u2713 bit-exact classroom"
+      : "golden: \u2717 mismatch";
+    els.badge.className = exact ? "ok" : "bad";
+    return;
+  }
   const results = state.traces.map((_, i) => waveMatchesGolden(i));
   if (Number(els.seed.value) !== 42) {
     els.badge.textContent = "golden: n/a (seed 42 only)";
@@ -103,7 +149,7 @@ function updateBadge(): void {
   }
 }
 
-// --- canvas --------------------------------------------------------------------
+// --- shared canvas helpers ------------------------------------------------------
 
 function fitCanvas(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
   const dpr = window.devicePixelRatio || 1;
@@ -124,13 +170,196 @@ function altitudeTint(z: number): string {
   return `rgb(${r},${g},${b})`;
 }
 
+function drawDroneTriangle(ctx: CanvasRenderingContext2D, px: number, py: number,
+                           heading: number, size: number, fill: string): void {
+  ctx.save();
+  ctx.translate(px, py);
+  // From-sky top view: heading 0 (+X, north) points UP, so the triangle
+  // (drawn pointing screen-right) rotates by heading − 90°.
+  ctx.rotate(heading - Math.PI / 2);
+  ctx.fillStyle = fill;
+  ctx.beginPath();
+  ctx.moveTo(size * 1.6, 0);
+  ctx.lineTo(-size, size * 0.8);
+  ctx.lineTo(-size * 0.55, 0);
+  ctx.lineTo(-size, -size * 0.8);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+// --- school view (live) -----------------------------------------------------------
+
+function drawSchoolSky(): void {
+  const ctx = fitCanvas(els.sky);
+  const W = els.sky.clientWidth;
+  const H = els.sky.clientHeight;
+  ctx.clearRect(0, 0, W, H);
+  const show = state.show;
+  const view = show?.view ?? null;
+  if (show === null || view === null) {
+    return;
+  }
+  // follow camera: the classroom aircraft stays centred. FROM-SKY top view:
+  // north (+X) points up the screen, east (+Y) points right.
+  const span = state.span;                    // metres across the canvas (zoom)
+  const scale = W / span;
+  const halfY = H / 2 / scale;
+  const sx = (y: number) => W / 2 + (y - view.y) * scale;
+  const sy = (x: number) => H / 2 - (x - view.x) * scale;
+
+  // world grid, fixed to the ground
+  ctx.strokeStyle = "#161c2a";
+  ctx.lineWidth = 1;
+  for (let gy = Math.floor((view.y - span / 2) / 50) * 50;
+       gy <= view.y + span / 2; gy += 50) {
+    ctx.beginPath();
+    ctx.moveTo(sx(gy), 0);
+    ctx.lineTo(sx(gy), H);
+    ctx.stroke();
+  }
+  for (let gx = Math.floor((view.x - halfY) / 50) * 50;
+       gx <= view.x + halfY; gx += 50) {
+    ctx.beginPath();
+    ctx.moveTo(0, sy(gx));
+    ctx.lineTo(W, sy(gx));
+    ctx.stroke();
+  }
+
+  // the lesson's demonstration path, ghosted behind the repeat
+  const ghost = show.ghost;
+  if (ghost !== null && ghost.length > 1) {
+    ctx.strokeStyle = "rgba(139,150,171,0.30)";
+    ctx.lineWidth = 1.2;
+    ctx.setLineDash([5, 6]);
+    ctx.beginPath();
+    ctx.moveTo(sx(ghost[0].y), sy(ghost[0].x));
+    for (const p of ghost) {
+      ctx.lineTo(sx(p.y), sy(p.x));
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // this flight's trail, altitude-tinted
+  ctx.lineWidth = 1.8;
+  for (let i = 1; i < show.trail.length; i++) {
+    const a = show.trail[i - 1];
+    const b = show.trail[i];
+    ctx.globalAlpha = 0.15 + 0.55 * (i / show.trail.length);
+    ctx.strokeStyle = altitudeTint(b.z);
+    ctx.beginPath();
+    ctx.moveTo(sx(a.y), sy(a.x));
+    ctx.lineTo(sx(b.y), sy(b.x));
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1.0;
+
+  // the aircraft
+  const heading = Math.atan2(view.fwdY, view.fwdX);
+  drawDroneTriangle(ctx, sx(view.y), sy(view.x), heading, 10,
+                    view.alive ? altitudeTint(view.z) : "#ff4a3a");
+  if (!view.alive) {
+    ctx.strokeStyle = "#ff4a3a";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(sx(view.y) - 6, sy(view.x) - 6);
+    ctx.lineTo(sx(view.y) + 6, sy(view.x) + 6);
+    ctx.stroke();
+  }
+}
+
+function drawSchoolCockpit(): void {
+  const show = state.show;
+  const view = show?.view ?? null;
+  if (show === null || view === null) {
+    return;
+  }
+  const moment = show.moment;
+  const phrase = moment.lessonName.replace(/_/g, " ");
+  const title = `FLIGHT SCHOOL \u00b7 LESSON ${moment.lessonIndex}/${moment.lessonCount} \u00b7 ${phrase.toUpperCase()}`;
+  const foot = view.alive
+    ? `t ${moment.seconds.toFixed(1)}s \u00b7 ${altFtOf(view.z).toFixed(0)} ft \u00b7 ` +
+      `${view.vs >= 0 ? "+" : ""}${vsHundredsOf(view.vs).toFixed(1)}\u00d7100fpm \u00b7 ` +
+      `${mphOf(view.speed).toFixed(0)} mph \u00b7 ${rpmOf(view.throttle).toFixed(0)} rpm`
+    : "crashed \u2014 the lesson ends on the ground";
+  drawCockpitView(els.cockpitCanvas, title, view, [], foot,
+                  els.cockpitTitle, els.cockpitFoot);
+  drawControlsView(els.controlsCanvas, view);
+}
+
+function renderSchool(): void {
+  const show = state.show;
+  if (show === null) {
+    return;
+  }
+  const moment = show.moment;
+  drawSchoolSky();
+  drawSchoolCockpit();
+
+  els.narration.textContent = moment.narration;
+  els.narration.className = `narration stage-${moment.stage}`
+    + (moment.takeover ? " takeover" : "");
+
+  const round = moment.round > 0 ? ` \u00b7 drill round ${moment.round}` : "";
+  const score = show.session.scores.get(moment.lessonName);
+  const scoreText = score === undefined ? "" : ` \u00b7 last score ${score.toFixed(2)}`;
+  if (show.done) {
+    const failed = show.session.failed;
+    els.status.textContent = failed.length === 0
+      ? `class graduates after ${show.session.rounds} drill round(s) \u2014 ` +
+        `graduate memory ${show.graduateKeys ?? "?"} keys`
+      : `${failed.length} lesson(s) below the pass mark after ` +
+        `${show.session.rounds} rounds (${failed.join(", ")}) \u2014 ` +
+        `graduate memory ${show.graduateKeys ?? "?"} keys`;
+  } else {
+    els.status.textContent =
+      `lesson ${moment.lessonIndex}/${moment.lessonCount} \u00b7 ${moment.lessonName}` +
+      `${round}${scoreText} \u00b7 t ${moment.seconds.toFixed(1)}s \u00b7 ` +
+      `${moment.stage === "demo" ? "instructor at the controls"
+        : moment.takeover ? "instructor has the controls"
+        : "student at the controls"}`;
+  }
+  refreshSchoolTable();
+}
+
+function refreshSchoolTable(): void {
+  const show = state.show;
+  if (show === null) {
+    return;
+  }
+  const moment = show.moment;
+  const key = `${show.done}|${moment.lessonIndex}|${moment.lessonName}|` +
+    `${moment.round}|${show.session.scores.size}|${show.session.counts.size}`;
+  if (key === state.reportKey) {
+    return;
+  }
+  state.reportKey = key;
+  const rows = show.reportRows(state.golden?.lessons ?? []);
+  const body = rows.map((row) => {
+    const score = row.score === null ? "\u2026"
+      : `${row.score.toFixed(2)} (${row.grade ?? ""})`;
+    const mark = row.exact === null
+      ? `<span class="na">\u2026</span>`
+      : row.exact ? `<span class="ok">\u2713 exact</span>`
+        : `<span class="bad">\u2717 mismatch</span>`;
+    return `<tr><td>${row.lesson.replace(/_/g, " ")}</td>` +
+      `<td>${row.stamps}</td><td>${score}</td>` +
+      `<td>${row.goldenScore.toFixed(2)}</td><td>${mark}</td></tr>`;
+  });
+  els.schoolTbody.innerHTML = body.join("");
+}
+
+// --- carpet view (playback of the bit-exact recording) ----------------------------
+
 function drawSky(): void {
   const ctx = fitCanvas(els.sky);
   const W = els.sky.clientWidth;
   const H = els.sky.clientHeight;
   const scale = Math.min(W / (WORLD.maxX - WORLD.minX), H / (WORLD.maxY - WORLD.minY));
-  const sx = (x: number) => W / 2 + x * scale;
-  const sy = (y: number) => H / 2 - y * scale;
+  // FROM-SKY top view: north (+X) up, east (+Y) right.
+  const sx = (y: number) => W / 2 + y * scale;
+  const sy = (x: number) => H / 2 - x * scale;
 
   ctx.clearRect(0, 0, W, H);
 
@@ -163,7 +392,7 @@ function drawSky(): void {
   ctx.fillStyle = "#3a4258";
   for (let slot = 0; slot < 8; slot++) {
     const y = (slot - 8 / 2.0) * 40.0;
-    ctx.fillRect(sx(0) - 8, sy(y) - 1.5, 16, 3);
+    ctx.fillRect(sx(y) - 8, sy(0) - 1.5, 16, 3);
   }
 
   if (state.traces.length === 0) {
@@ -171,7 +400,7 @@ function drawSky(): void {
   }
   const wave = state.traces[state.waveIdx];
   if (!wave) {
-    return;   // between waves or before boot: nothing to draw
+    return;
   }
   const t = state.t;
 
@@ -190,35 +419,23 @@ function drawSky(): void {
       ctx.globalAlpha = 0.12 + 0.5 * ((i - from) / (idx - from + 1));
       ctx.strokeStyle = altitudeTint(b.z);
       ctx.beginPath();
-      ctx.moveTo(sx(a.x), sy(a.y));
-      ctx.lineTo(sx(b.x), sy(b.y));
+      ctx.moveTo(sx(a.y), sy(a.x));
+      ctx.lineTo(sx(b.y), sy(b.x));
       ctx.stroke();
     }
     ctx.globalAlpha = 1.0;
 
     const sample = episode.samples[idx];
-    const px = sx(sample.x);
-    const py = sy(sample.y);
+    const px = sx(sample.y);
+    const py = sy(sample.x);
     if (t < episode.survival) {
-      // drone triangle, heading from the body frame forward
       const heading = Math.atan2(sample.fwdY, sample.fwdX);
       const size = 5 + sample.z * 0.045;
-      ctx.save();
-      ctx.translate(px, py);
-      ctx.rotate(-heading);
-      ctx.fillStyle = altitudeTint(sample.z);
-      ctx.beginPath();
-      ctx.moveTo(size * 1.6, 0);
-      ctx.lineTo(-size, size * 0.8);
-      ctx.lineTo(-size * 0.55, 0);
-      ctx.lineTo(-size, -size * 0.8);
-      ctx.closePath();
-      ctx.fill();
-      ctx.restore();
+      drawDroneTriangle(ctx, px, py, heading, size, altitudeTint(sample.z));
     } else {
       // death marker
-      const dx = sx(episode.deathX);
-      const dy = sy(episode.deathY);
+      const dx = sx(episode.deathY);
+      const dy = sy(episode.deathX);
       ctx.strokeStyle = "#ff4a3a";
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -280,8 +497,6 @@ function drawChart(): void {
   }
 }
 
-// --- hud -----------------------------------------------------------------------
-
 function updateHud(): void {
   if (state.traces.length === 0) {
     els.status.textContent = "no waves recorded";
@@ -321,25 +536,74 @@ function refreshTable(): void {
       `<td>${trace.deaths}/8</td><td>${trace.flockSize}</td><td>${mark}</td></tr>`);
   }
   if (state.traces.length > 0 && !state.done && completed < state.traces.length) {
-    const trace = state.traces[completed];
     rows.push(`<tr><td>wave ${completed} (flying)</td><td>…</td>` +
       `<td>…</td><td>…</td><td><span class="na">…</span></td></tr>`);
   }
   els.tbody.innerHTML = rows.join("");
 }
 
-// --- cockpit ---------------------------------------------------------------------
+// --- carpet cockpit (view adapter over the recording) -------------------------------
 
-const FOV_H = (40 * Math.PI) / 180;
-const FOV_V = (22 * Math.PI) / 180;
-const wrapPi = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
+function carpetCockpit(): void {
+  if (state.selected === null || els.cockpit.hidden) {
+    return;
+  }
+  const wave = state.traces[state.waveIdx];
+  if (!wave) {
+    return;
+  }
+  const slot = state.selected.slot;
+  const episode = wave.episodes[slot];
+  if (!episode) {
+    return;
+  }
+  const idx = Math.min(Math.floor(state.t / DT), episode.samples.length - 1);
+  const s = episode.samples[idx];
+  const alive = state.t < episode.survival;
+  const view: DroneView = {
+    x: s.x, y: s.y, z: s.z,
+    fwdX: s.fwdX, fwdY: s.fwdY,
+    pitch: s.pitch, bank: s.bank,
+    speed: s.speed, vs: s.vs,
+    velX: s.velX, velY: s.velY,
+    throttle: s.throttle,
+    ail: s.ail, elev: s.elev, rud: s.rud,
+    alive,
+  };
+  const others: DroneView[] = [];
+  for (let i = 0; i < wave.episodes.length; i++) {
+    if (i === slot) {
+      continue;
+    }
+    const other = wave.episodes[i];
+    const os = other.samples[Math.min(idx, other.samples.length - 1)];
+    others.push({
+      x: os.x, y: os.y, z: os.z,
+      fwdX: os.fwdX, fwdY: os.fwdY,
+      pitch: os.pitch, bank: os.bank,
+      speed: os.speed, vs: os.vs,
+      velX: os.velX, velY: os.velY,
+      throttle: os.throttle,
+      ail: os.ail, elev: os.elev, rud: os.rud,
+      alive: state.t < other.survival,
+    });
+  }
+  const title = `DRONE ${slot + 1} \u00b7 WAVE ${state.waveIdx + 1}`;
+  const foot = alive
+    ? `t ${state.t.toFixed(1)}s \u00b7 ${altFtOf(s.z).toFixed(0)} ft \u00b7 ` +
+      `${s.vs >= 0 ? "+" : ""}${vsHundredsOf(s.vs).toFixed(1)}\u00d7100fpm \u00b7 ` +
+      `${mphOf(s.speed).toFixed(0)} mph \u00b7 ${rpmOf(s.throttle).toFixed(0)} rpm`
+    : `crashed at ${episode.survival.toFixed(2)}s \u2014 the shard screamed to the flock`;
+  drawCockpitView(els.cockpitCanvas, title, view, others, foot,
+                  els.cockpitTitle, els.cockpitFoot);
+  drawControlsView(els.controlsCanvas, view);
+}
 
 function setSelected(slot: number | null): void {
   state.selected = slot === null ? null : { slot };
   els.cockpit.hidden = state.selected === null;
   if (state.selected !== null) {
-    drawCockpit();
-    drawControls();
+    carpetCockpit();
   }
 }
 
@@ -359,8 +623,8 @@ function hitTest(mx: number, my: number): number | null {
   for (let i = 0; i < wave.episodes.length; i++) {
     const sample = wave.episodes[i].samples[
       Math.min(idx, wave.episodes[i].samples.length - 1)];
-    const px = width / 2 + sample.x * scale;
-    const py = height / 2 - sample.y * scale;
+    const px = width / 2 + sample.y * scale;
+    const py = height / 2 - sample.x * scale;
     const d = Math.hypot(px - mx, py - my);
     if (d < bestDist) {
       bestDist = d;
@@ -370,358 +634,9 @@ function hitTest(mx: number, my: number): number | null {
   return best;
 }
 
-function drawGauge(ctx: CanvasRenderingContext2D, x: number, y: number, r: number,
-                   value: number, min: number, max: number, label: string): void {
-  const a0 = Math.PI * 0.75;
-  const sweep = Math.PI * 1.5;
-  ctx.strokeStyle = "#3a4258";
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.arc(x, y, r, a0, a0 + sweep);
-  ctx.stroke();
-  for (let i = 0; i <= 4; i++) {
-    const a = a0 + (i / 4) * sweep;
-    ctx.beginPath();
-    ctx.moveTo(x + Math.cos(a) * r, y + Math.sin(a) * r);
-    ctx.lineTo(x + Math.cos(a) * (r - 4), y + Math.sin(a) * (r - 4));
-    ctx.stroke();
-  }
-  const t = Math.max(0.0, Math.min(1.0, (value - min) / (max - min)));
-  const a = a0 + t * sweep;
-  ctx.strokeStyle = "#ff8c3a";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(x, y);
-  ctx.lineTo(x + Math.cos(a) * (r - 6), y + Math.sin(a) * (r - 6));
-  ctx.stroke();
-  ctx.fillStyle = "#5b6878";
-  ctx.font = "9px ui-monospace, monospace";
-  ctx.textAlign = "center";
-  ctx.fillText(label, x, y + r + 10);
-  ctx.fillStyle = "#c9d4e3";
-  ctx.font = "10px ui-monospace, monospace";
-  ctx.fillText(value >= 100 ? value.toFixed(0) : value.toFixed(1), x, y + 3);
-  ctx.textAlign = "left";
-}
-
-/** The selected drone's cockpit: ADI, traffic, gauges — its view of the world. */
-function drawCockpit(): void {
-  if (state.selected === null || els.cockpit.hidden) {
-    return;
-  }
-  const wave = state.traces[state.waveIdx];
-  if (!wave) {
-    return;
-  }
-  const slot = state.selected.slot;
-  const episode = wave.episodes[slot];
-  if (!episode) {
-    return;
-  }
-  const ctx = fitCanvas(els.cockpitCanvas);
-  const W = els.cockpitCanvas.clientWidth;
-  const H = els.cockpitCanvas.clientHeight;
-  ctx.clearRect(0, 0, W, H);
-  const DEG = 180 / Math.PI;
-  const idx = Math.min(Math.floor(state.t / DT), episode.samples.length - 1);
-  const s = episode.samples[idx];
-  const alive = state.t < episode.survival;
-  const heading = Math.atan2(s.fwdY, s.fwdX);
-
-  const cx = W / 2;
-  const cy = H * 0.5;
-  const R = Math.min(W, H) * 0.33;
-  const Ky = R / Math.tan(FOV_V);
-  const Kx = R / Math.tan(FOV_H);
-  const y0 = Math.tan(s.pitch) * Ky;         // horizon offset: nose up, horizon down
-
-  // the round window: horizon card + traffic, clipped
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(cx, cy, R, 0, 2 * Math.PI);
-  ctx.clip();
-  ctx.save();
-  ctx.translate(cx, cy);
-  ctx.rotate(-s.bank);                       // the world tilts opposite the bank
-
-  ctx.fillStyle = "#243356";                 // sky
-  ctx.fillRect(-2 * R, y0 - 2 * R, 4 * R, 2 * R);
-  ctx.fillStyle = "#4a3320";                 // ground
-  ctx.fillRect(-2 * R, y0, 4 * R, 2 * R);
-
-  // pitch ladder
-  ctx.strokeStyle = "rgba(226,232,244,0.55)";
-  ctx.fillStyle = "rgba(226,232,244,0.75)";
-  ctx.font = "8px ui-monospace, monospace";
-  ctx.lineWidth = 1;
-  for (const d of [-20, -10, 10, 20]) {
-    const ly = y0 - Math.tan((d * Math.PI) / 180) * Ky;
-    const half = Math.abs(d) === 20 ? 26 : 15;
-    ctx.beginPath();
-    ctx.moveTo(-half, ly);
-    ctx.lineTo(-6, ly);
-    ctx.moveTo(6, ly);
-    ctx.lineTo(half, ly);
-    ctx.stroke();
-    ctx.fillText(String(d), half + 4, ly + 3);
-  }
-  ctx.strokeStyle = "#f2f5fa";               // horizon line
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(-R, y0);
-  ctx.lineTo(R, y0);
-  ctx.stroke();
-
-  // traffic: wave-mates in the forward view
-  for (let i = 0; i < wave.episodes.length; i++) {
-    if (i === slot || state.t >= wave.episodes[i].survival) {
-      continue;
-    }
-    const other = wave.episodes[i];
-    const os = other.samples[Math.min(idx, other.samples.length - 1)];
-    const dx = os.x - s.x, dy = os.y - s.y, dz = os.z - s.z;
-    const range = Math.hypot(dx, dy);
-    if (range < 1.0) {
-      continue;
-    }
-    const rel = wrapPi(Math.atan2(dy, dx) - heading);
-    if (Math.abs(rel) >= FOV_H) {
-      continue;
-    }
-    const elev = Math.atan2(dz, range) - s.pitch;
-    if (Math.abs(elev) >= FOV_V) {
-      continue;
-    }
-    const tx = Math.tan(rel) * Kx;
-    const ty = y0 + Math.tan(elev) * Ky;
-    const size = Math.max(3.0, Math.min(9.0, 260.0 / range));
-    ctx.fillStyle = dz > 2 ? "#9fd8ff" : dz < -2 ? "#ffb066" : "#e8ecf4";
-    ctx.beginPath();
-    ctx.moveTo(tx, ty - size);
-    ctx.lineTo(tx + size * 0.7, ty + size * 0.6);
-    ctx.lineTo(tx - size * 0.7, ty + size * 0.6);
-    ctx.closePath();
-    ctx.fill();
-    ctx.fillStyle = "rgba(200,210,228,0.7)";
-    ctx.font = "8px ui-monospace, monospace";
-    ctx.fillText(`${Math.round(range)}m`, tx + size + 2, ty + 3);
-  }
-  ctx.restore();                             // un-rotate
-
-  // fixed centre symbol (the aircraft)
-  ctx.strokeStyle = "#ffb84a";
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(cx - R * 0.6, cy); ctx.lineTo(cx - R * 0.18, cy);
-  ctx.moveTo(cx + R * 0.18, cy); ctx.lineTo(cx + R * 0.6, cy);
-  ctx.moveTo(cx - R * 0.18, cy); ctx.lineTo(cx - R * 0.18, cy - 7);
-  ctx.moveTo(cx + R * 0.18, cy); ctx.lineTo(cx + R * 0.18, cy - 7);
-  ctx.stroke();
-  ctx.fillStyle = "#ffb84a";
-  ctx.beginPath();
-  ctx.arc(cx, cy, 2.6, 0, 2 * Math.PI);
-  ctx.fill();
-
-  // bank pointer (rides the card) + fixed reference tick
-  ctx.save();
-  ctx.translate(cx, cy);
-  ctx.rotate(-s.bank);
-  ctx.fillStyle = "#ffb84a";
-  ctx.beginPath();
-  ctx.moveTo(-5, -R + 2);
-  ctx.lineTo(5, -R + 2);
-  ctx.lineTo(0, -R + 10);
-  ctx.closePath();
-  ctx.fill();
-  ctx.restore();
-  ctx.strokeStyle = "#8b96ab";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(cx, cy - R);
-  ctx.lineTo(cx, cy - R + 7);
-  ctx.stroke();
-  ctx.restore();                             // un-clip
-
-  ctx.strokeStyle = "#3a4258";               // bezel
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(cx, cy, R, 0, 2 * Math.PI);
-  ctx.stroke();
-
-  // top readouts
-  ctx.font = "10px ui-monospace, monospace";
-  ctx.fillStyle = "#8b96ab";
-  ctx.fillText(`ALT ${altFtOf(s.z).toFixed(0)} ft`, 10, 14);
-  ctx.textAlign = "center";
-  ctx.fillText(`HDG ${String(Math.round(((heading * DEG) % 360 + 360) % 360)).padStart(3, "0")}\u00b0`, cx, 14);
-  ctx.textAlign = "right";
-  ctx.fillText(`SPD ${mphOf(s.speed).toFixed(0)} mph`, W - 10, 14);
-  ctx.textAlign = "left";
-
-  // gauges + throttle
-  drawGauge(ctx, 52, H - 44, 26, mphOf(s.speed), 0, 170, "ASI mph");
-  drawGauge(ctx, cx, H - 44, 26, vsHundredsOf(s.vs), -16, 16, "VSI \u00d7100 fpm");
-  drawGauge(ctx, W - 52, H - 44, 26, rpmOf(s.throttle), 0, 2700, "RPM");
-
-  // crashed overlay: the postmortem view
-  if (!alive) {
-    ctx.fillStyle = "rgba(255,58,48,0.18)";
-    ctx.fillRect(0, cy - 15, W, 30);
-    ctx.fillStyle = "#ff4a3a";
-    ctx.font = "bold 13px ui-monospace, monospace";
-    ctx.textAlign = "center";
-    ctx.fillText("CRASHED", cx, cy + 5);
-    ctx.textAlign = "left";
-  }
-
-  els.cockpitTitle.textContent = `DRONE ${slot + 1} \u00b7 WAVE ${state.waveIdx + 1}`;
-  els.cockpitFoot.textContent = alive
-    ? `t ${state.t.toFixed(1)}s \u00b7 ${altFtOf(s.z).toFixed(0)} ft \u00b7 ` +
-      `${s.vs >= 0 ? "+" : ""}${vsHundredsOf(s.vs).toFixed(1)}\u00d7100fpm \u00b7 ` +
-      `${mphOf(s.speed).toFixed(0)} mph \u00b7 ${rpmOf(s.throttle).toFixed(0)} rpm`
-    : `crashed at ${episode.survival.toFixed(2)}s \u2014 the shard screamed to the flock`;
-}
-
-/** The selected drone's controls square: yoke, rudder pedals, throttle. */
-function drawControls(): void {
-  if (state.selected === null || els.cockpit.hidden) {
-    return;
-  }
-  const wave = state.traces[state.waveIdx];
-  if (!wave) {
-    return;
-  }
-  const episode = wave.episodes[state.selected.slot];
-  if (!episode) {
-    return;
-  }
-  const ctx = fitCanvas(els.controlsCanvas);
-  const W = els.controlsCanvas.clientWidth;
-  const H = els.controlsCanvas.clientHeight;
-  ctx.clearRect(0, 0, W, H);
-  const idx = Math.min(Math.floor(state.t / DT), episode.samples.length - 1);
-  const s = episode.samples[idx];
-  const alive = state.t < episode.survival;
-  const SURF_MAX = 0.35;    // mechanical limit, rad
-
-  // --- yoke (aileron rotates the wheel, elevator pushes/pulls it) -----------
-  const yx = W * 0.3;
-  const yy = H * 0.4;
-  const travel = 15;                    // px of push/pull travel
-  const pull = (s.elev / SURF_MAX) * travel;    // nose up = pull = yoke toward pilot (down)
-  const wheelAngle = (s.ail / SURF_MAX) * 1.15; // rad of visual wheel rotation
-
-  // neutral cross reference
-  ctx.strokeStyle = "#232b3d";
-  ctx.setLineDash([4, 4]);
-  ctx.beginPath();
-  ctx.moveTo(yx - 70, yy); ctx.lineTo(yx + 70, yy);
-  ctx.moveTo(yx, yy - 55); ctx.lineTo(yx, yy + 55);
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  ctx.save();
-  ctx.translate(yx, yy + pull);
-  ctx.rotate(wheelAngle);
-  // the W: wheel bar with two horns
-  ctx.strokeStyle = alive ? "#c9d4e3" : "#5b6878";
-  ctx.lineWidth = 5;
-  ctx.lineCap = "round";
-  ctx.beginPath();
-  ctx.moveTo(-46, 0);
-  ctx.lineTo(-46, -26);
-  ctx.moveTo(-24, 0);
-  ctx.lineTo(-24, 10);
-  ctx.lineTo(24, 10);
-  ctx.lineTo(24, 0);
-  ctx.moveTo(46, 0);
-  ctx.lineTo(46, -26);
-  ctx.stroke();
-  ctx.fillStyle = alive ? "#8b96ab" : "#3d4658";
-  for (const hx of [-46, 46]) {
-    ctx.beginPath();
-    ctx.arc(hx, -28, 5, 0, 2 * Math.PI);
-    ctx.fill();
-  }
-  // center hub
-  ctx.fillStyle = "#ff8c3a";
-  ctx.beginPath();
-  ctx.arc(0, 0, 4, 0, 2 * Math.PI);
-  ctx.fill();
-  ctx.restore();
-  ctx.lineCap = "butt";
-  ctx.fillStyle = "#5b6878";
-  ctx.font = "9px ui-monospace, monospace";
-  ctx.fillText("YOKE", yx - 14, yy + 74);
-  ctx.fillText(s.elev >= 0 ? "PULL" : "PUSH", yx + 26, yy + pull - 4);
-
-  // --- rudder pedals ---------------------------------------------------------
-  const rx = W * 0.3;
-  const ry = H * 0.78;
-  const press = (s.rud / SURF_MAX) * 9;      // one pedal forward, one back
-  for (const side of [-1, 1]) {
-    const forward = (s.rud > 0 && side > 0) || (s.rud < 0 && side < 0);
-    const disp = forward ? -press : (s.rud !== 0 ? press * 0.35 : 0);
-    const engaged = (s.rud > 0 && side > 0) || (s.rud < 0 && side < 0);
-    ctx.fillStyle = engaged ? "#ff8c3a" : "#3a4258";
-    ctx.fillRect(rx + side * 34 - 9, ry + disp - 16, 18, 30);
-  }
-  ctx.strokeStyle = "#232b3d";
-  ctx.setLineDash([4, 4]);
-  ctx.beginPath();
-  ctx.moveTo(rx - 62, ry); ctx.lineTo(rx + 62, ry);
-  ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.fillStyle = "#5b6878";
-  ctx.fillText("L", rx - 66, ry + 3);
-  ctx.fillText("R", rx + 62, ry + 3);
-  ctx.fillText("RUDDER", rx - 21, ry + 26);
-
-  // --- throttle lever ---------------------------------------------------------
-  const tx = W * 0.78;
-  const tyTop = H * 0.16;
-  const tyBot = H * 0.62;
-  const th = Math.max(0.0, Math.min(1.0, s.throttle));
-  ctx.fillStyle = "#1a2030";
-  ctx.fillRect(tx - 7, tyTop, 14, tyBot - tyTop);
-  ctx.strokeStyle = "#3a4258";
-  ctx.strokeRect(tx - 7, tyTop, 14, tyBot - tyTop);
-  const knobY = tyBot - th * (tyBot - tyTop);
-  ctx.fillStyle = alive ? "#ff8c3a" : "#5b4a30";
-  ctx.beginPath();
-  ctx.arc(tx, knobY, 9, 0, 2 * Math.PI);
-  ctx.fill();
-  ctx.strokeStyle = "#0b0e14";
-  ctx.beginPath();
-  ctx.arc(tx, knobY, 9, 0, 2 * Math.PI);
-  ctx.stroke();
-  ctx.fillStyle = "#5b6878";
-  ctx.fillText("THROTTLE", tx - 27, tyBot + 16);
-  ctx.fillStyle = "#c9d4e3";
-  ctx.fillText(`${Math.round(th * 100)}%`, tx - 10, tyBot + 28);
-
-  // surface readouts, bottom right
-  ctx.textAlign = "right";
-  ctx.fillStyle = "#8b96ab";
-  ctx.font = "9px ui-monospace, monospace";
-  ctx.fillText(`AIL ${s.ail >= 0 ? "+" : ""}${s.ail.toFixed(2)}`, W - 10, H - 34);
-  ctx.fillText(`ELEV ${s.elev >= 0 ? "+" : ""}${s.elev.toFixed(2)}`, W - 10, H - 22);
-  ctx.fillText(`RUD ${s.rud >= 0 ? "+" : ""}${s.rud.toFixed(2)}`, W - 10, H - 10);
-  ctx.textAlign = "left";
-
-  if (!alive) {
-    ctx.fillStyle = "rgba(255,58,48,0.16)";
-    ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = "#ff4a3a";
-    ctx.font = "bold 11px ui-monospace, monospace";
-    ctx.fillText("CONTROLS FROZEN", 12, H - 12);
-  }
-}
-
 /**
  * The selected drone crashed: hand the cockpit to the next drone still
- * flying (next seat number, wrapping). When nobody in the wave is alive
- * the panel keeps the postmortem until the wave tail ends the show.
+ * flying (next seat number, wrapping).
  */
 function autoAdvanceSelection(): void {
   if (state.selected === null) {
@@ -745,63 +660,129 @@ function autoAdvanceSelection(): void {
   }
 }
 
-// --- clock ---------------------------------------------------------------------
+// --- mode plumbing -----------------------------------------------------------------
+
+function setMode(mode: Mode): void {
+  state.mode = mode;
+  els.mode.value = mode;
+  document.body.dataset.mode = mode;
+  els.seed.disabled = mode === "school";
+  els.narration.textContent = mode === "school" ? "" : "carpet waves — the swarm's generations";
+  els.narration.className = "narration";
+  state.playing = true;
+  els.play.textContent = "\u23f8 pause";
+  state.reportKey = "";
+  els.cockpit.hidden = mode === "carpet";
+  els.cockpitClose.hidden = mode === "school";
+  if (mode === "school") {
+    state.show = FlightSchoolShow.withFreshPolicy();
+    state.acc = 0.0;
+    updateBadge();
+  } else {
+    state.show = null;
+    const seed = state.seeds.find((s) => s.seed === Number(els.seed.value))
+      ?? state.seeds[0];
+    record(seed);
+  }
+}
+
+function restart(): void {
+  setMode(state.mode);
+}
+
+// --- clock -------------------------------------------------------------------------
 
 let lastTs = 0;
 function frame(ts: number): void {
-  const dt = Math.min(0.05, (ts - lastTs) / 1000);
+  const wall = Math.min(0.05, (ts - lastTs) / 1000);
   lastTs = ts;
-  if (state.playing && !state.done) {
-    state.t += dt * Number(els.speed.value);
-    const duration = waveDuration(state.traces[state.waveIdx]) + 1.5;
-    if (state.t >= duration) {
-      if (state.waveIdx + 1 < state.traces.length) {
-        state.waveIdx += 1;
-        state.t = 0.0;
-        setSelected(null);       // a new wave is new drones: selection resets
-      } else {
-        // Hold the final frame, fully drawn; never index past the last wave.
-        state.done = true;
+  const speed = Number(els.speed.value);
+  if (state.playing) {
+    if (state.mode === "school" && state.show !== null) {
+      state.acc += wall * speed;
+      while (state.acc >= DT && !state.show.done) {
+        state.show.step();
+        state.acc -= DT;
+      }
+      if (state.show.done) {
+        state.acc = 0.0;
         state.playing = false;
-        state.t = duration;
-        els.play.textContent = "▶ play";
+        els.play.textContent = "\u25b6 play";
         updateBadge();
+      }
+    } else if (state.mode === "carpet" && state.traces.length > 0) {
+      state.t += wall * speed;
+      const duration = waveDuration(state.traces[state.waveIdx]) + 1.5;
+      if (state.t >= duration) {
+        if (state.waveIdx + 1 < state.traces.length) {
+          state.waveIdx += 1;
+          state.t = 0.0;
+          setSelected(null);
+        } else {
+          // Hold the final frame, fully drawn; never index past the last wave.
+          state.done = true;
+          state.playing = false;
+          state.t = duration;
+          els.play.textContent = "\u25b6 play";
+          updateBadge();
+        }
       }
     }
   }
-  autoAdvanceSelection();
-  drawSky();
-  drawCockpit();
-  drawControls();
-  drawChart();
-  updateHud();
+  if (state.mode === "school") {
+    renderSchool();
+  } else {
+    autoAdvanceSelection();
+    drawSky();
+    carpetCockpit();
+    drawChart();
+    updateHud();
+  }
   requestAnimationFrame(frame);
 }
 
 // --- controls ------------------------------------------------------------------
 
 els.play.addEventListener("click", () => {
-  if (state.done) {
+  if (state.mode === "school" && state.show !== null && state.show.done) {
+    return;
+  }
+  if (state.mode === "carpet" && state.done) {
     return;
   }
   state.playing = !state.playing;
-  els.play.textContent = state.playing ? "⏸ pause" : "▶ play";
+  els.play.textContent = state.playing ? "\u23f8 pause" : "\u25b6 play";
 });
-els.restart.addEventListener("click", () => {
-  const seed = state.seeds.find((s) => s.seed === Number(els.seed.value))!;
-  record(seed);
-  els.play.textContent = "⏸ pause";
+els.restart.addEventListener("click", restart);
+els.zoomIn.addEventListener("click", () => {
+  state.span = Math.max(60.0, state.span / 1.3);
 });
+els.zoomOut.addEventListener("click", () => {
+  state.span = Math.min(4000.0, state.span * 1.3);
+});
+els.zoomReset.addEventListener("click", () => {
+  state.span = 260.0;
+});
+els.mode.addEventListener("change", () => setMode(els.mode.value as Mode));
 els.seed.addEventListener("change", () => {
-  const seed = state.seeds.find((s) => s.seed === Number(els.seed.value))!;
-  record(seed);
-  els.play.textContent = "⏸ pause";
+  if (state.mode === "carpet") {
+    const seed = state.seeds.find((s) => s.seed === Number(els.seed.value))!;
+    record(seed);
+    els.play.textContent = "\u23f8 pause";
+  }
 });
 els.sky.addEventListener("click", (event) => {
+  if (state.mode !== "carpet") {
+    return;
+  }
   const rect = els.sky.getBoundingClientRect();
   setSelected(hitTest(event.clientX - rect.left, event.clientY - rect.top));
 });
 els.sky.addEventListener("mousemove", (event) => {
+  if (state.mode !== "carpet") {
+    els.sky.style.cursor = "default";
+    return;
+  }
   const rect = els.sky.getBoundingClientRect();
   els.sky.style.cursor =
     hitTest(event.clientX - rect.left, event.clientY - rect.top) !== null
@@ -828,18 +809,24 @@ async function fetchJson(url: string): Promise<any> {
 }
 
 async function boot(): Promise<void> {
-  const [rngRef, goldenDoc] = await Promise.all([
+  const [rngRef, c172, wavesFrozen] = await Promise.all([
     fetchJson("/reference/rng-ref.json"),
-    fetchJson("/reference/golden-baseline.json").catch(() => null),
+    fetchJson("/reference/c172-frozen.json").catch(() => null),
+    fetchJson("/reference/c172-waves-frozen.json").catch(() => null),
   ]);
   state.seeds = rngRef.seeds;
   els.seed.innerHTML = state.seeds
     .map((s: SeedEntry) => `<option value="${s.seed}"${s.seed === 42 ? " selected" : ""}>${s.seed}</option>`)
     .join("");
-  if (goldenDoc) {
-    state.golden = { perWave: goldenDoc.scenarios.waves.per_wave };
-  }
-  record(state.seeds[0]);
+  // The TS-frozen C172 references supersede the Python goldens for BOTH
+  // views: the flight school's report card (lessons) and the carpet's
+  // traced waves (the Python golden-baseline.json records the old 1.5 kg
+  // airframe, which the redesign invalidates).
+  state.golden = {
+    perWave: wavesFrozen?.traced?.per_wave ?? [],
+    lessons: c172?.lessons ?? [],
+  };
+  setMode("school");
   requestAnimationFrame((ts) => {
     lastTs = ts;
     requestAnimationFrame(frame);

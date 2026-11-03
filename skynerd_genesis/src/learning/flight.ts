@@ -13,16 +13,17 @@ import { World } from "../core/world.js";
 import { NumpyPcg64 } from "../core/rng.js";
 import { RigidBody } from "../physics/rigid-body.js";
 import { SurfacesState } from "../physics/surfaces.js";
+import { GRAVITY, RHO_SEA_LEVEL } from "../physics/aero.js";
 import { Quaternion } from "../core/quaternion.js";
 import {
   DenseReward, EpisodeOutcome, FlightInstruments, classifyOutcome,
 } from "./instruments.js";
 import { ServoPolicy } from "./servo-tensor.js";
 
-export const TRIM_SPEED = 10.5;
+export const TRIM_SPEED = 38.0;       // m/s — 85 mph, the C172 economy cruise
 export const HORIZON = 20.0;
 const STICK_SPRING_TAU = 1.5;    // s: hands off, the stick springs back toward neutral
-export const TRIM_COMMAND = [0.0, 0.0, 0.0, 0.15];
+export const TRIM_COMMAND = [0.0, 0.02485, 0.0, 0.8];   // trimmed for level cruise: 85 mph at 2300 RPM
 
 /**
  * The stick spring: a held command decays toward trim when not actively
@@ -101,7 +102,8 @@ export function flyEpisode(policy: ServoPolicy, instruments: FlightInstruments,
       }
     }
     servos.command(commands, dt);
-    body.step(servos, dt);
+    body.step(servos, dt, GRAVITY, RHO_SEA_LEVEL,
+              body.position.z - world.terrainHeight(body.position.x, body.position.y));
     commands = springTowardNeutral(commands, dt);
     pendingReward += dense.tick(body) + 0.0005;
     outcome = classifyOutcome(body, world, (tick + 1) * dt);

@@ -134,3 +134,26 @@ td .na { color: var(--dim); }
   display: block;
 }
 #cockpit-foot { margin-top: 6px; color: var(--dim); font-size: 10.5px; min-height: 14px; }
+
+/* --- flight school view --------------------------------------------------- */
+#narration {
+  font-size: 16px;
+  letter-spacing: 0.5px;
+  color: var(--ink);
+  min-height: 24px;
+  margin: 0 2px 10px;
+}
+#narration.stage-demo { color: var(--accent); }
+#narration.stage-exam,
+#narration.stage-repeat { color: #9fd8ff; }
+#narration.takeover { color: #ffb84a; }
+#narration.stage-drilling { color: var(--dim); font-style: italic; }
+#narration.stage-done { color: var(--good); }
+
+body[data-mode="school"] #chart,
+body[data-mode="school"] #waves,
+body[data-mode="school"] #foot-carpet { display: none; }
+body[data-mode="carpet"] #school,
+body[data-mode="carpet"] #foot-school { display: none; }
+#school { margin-bottom: 14px; }
+#school td:nth-child(2) { color: var(--dim); }

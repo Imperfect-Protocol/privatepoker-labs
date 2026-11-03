@@ -1,8 +1,9 @@
 /**
- * Reproduction harness for the restart-button report: loads the compiled web
- * app (build-web/src/app/main.js) under a minimal DOM stub, boots it, runs
- * the frame clock to the end of playback, clicks restart, and inspects the
- * resulting state. No browser needed.
+ * Headless harness for the interactive app: loads the compiled web build
+ * (build-web/src/app/main.js) under a minimal DOM stub, boots it, and drives
+ * the frame clock through the LIVE flight school — narration milestones,
+ * the golden report card, restart, and the mode switch to carpet playback.
+ * No browser needed.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -26,6 +27,10 @@ function makeCtx() {
   return new Proxy({}, {
     get(target, prop) {
       if (prop === "canvas") return {};
+      if (prop === "createImageData") {
+        return (w, h) => ({ width: w, height: h,
+                            data: new Uint8ClampedArray(w * h * 4) });
+      }
       return noop;
     },
     set() { return true; },
@@ -52,7 +57,10 @@ function makeElement(id) {
     id,
     textContent: "",
     innerHTML: "",
-    value: "42",               // seed select default; options injected below
+    value: "",
+    hidden: false,
+    disabled: false,
+    className: "",
     clientWidth: 100,
     clientHeight: 100,
     addEventListener(event, handler) {
@@ -77,16 +85,22 @@ const elements = {
   sky: Object.assign(makeElement("sky"), makeCanvas()),
   chart: Object.assign(makeElement("chart"), makeCanvas()),
   status: makeElement("status"),
+  narration: makeElement("narration"),
   play: makeElement("play"),
-  speed: Object.assign(makeElement("speed"), { value: "4" }),
-  seed: makeElement("seed"),
+  speed: Object.assign(makeElement("speed"), { value: "1" }),
+  mode: Object.assign(makeElement("mode"), { value: "school" }),
+  seed: Object.assign(makeElement("seed"), { value: "42" }),
   restart: makeElement("restart"),
   badge: makeElement("badge"),
   tbody: makeElement("tbody"),
+  schoolTbody: makeElement("schoolTbody"),
 };
 // register by HTML id so getElementById finds them
 elements["cockpit"] = makeElement("cockpit");
 elements["cockpit"].hidden = true;
+elements["zoomIn"] = makeElement("zoomIn");
+elements["zoomOut"] = makeElement("zoomOut");
+elements["zoomReset"] = makeElement("zoomReset");
 elements["cockpit-title"] = makeElement("cockpit-title");
 elements["cockpit-foot"] = makeElement("cockpit-foot");
 elements["cockpit-close"] = makeElement("cockpit-close");
@@ -99,7 +113,10 @@ elements["controlsCanvas"] = Object.assign(makeElement("controlsCanvas"), makeCa
 
 globalThis.document = {
   getElementById: (id) => elements[id] ?? null,
-  querySelector: () => elements.tbody,
+  querySelector: (selector) =>
+    String(selector).includes("#school") ? elements.schoolTbody : elements.tbody,
+  createElement: () => makeCanvas(),
+  body: { dataset: {} },
 };
 
 // --- rAF clock ----------------------------------------------------------------
@@ -110,10 +127,17 @@ globalThis.window = {
   addEventListener: () => {},
 };
 
+// --- checks -------------------------------------------------------------------
+let failures = 0;
+function check(name, ok, detail = "") {
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}${ok || detail === "" ? "" : ` — ${detail}`}`);
+  if (!ok) failures += 1;
+}
+
 // --- drive ---------------------------------------------------------------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let ts = 0;
-function stepFrames(count, dtMs = 100) {
+function stepFrames(count, dtMs = 60) {
   for (let i = 0; i < count; i++) {
     ts += dtMs;
     const handler = rafHandler;
@@ -123,61 +147,149 @@ function stepFrames(count, dtMs = 100) {
 }
 
 const app = await import("../build-web/src/app/main.js");
-
-// main.js only exposes state through the DOM; observe via the status line and
-// the waves table, and drive clicks through the element stubs.
 await sleep(50);   // let boot() resolve
-stepFrames(2, 60);
-console.log("after boot:");
-console.log("  status:", elements.status.textContent);
-console.log("  play label:", elements.play.textContent);
+stepFrames(3, 60);
 
-// run playback to completion: 5 waves * (20 s + 1.5 s) at 4x ≈ 27 s sim time
-stepFrames(2000, 60);
-console.log("after playback:");
-console.log("  status:", elements.status.textContent);
-console.log("  play label:", elements.play.textContent);
+console.log("== boot (flight school, live)");
+check("boots into the flight school",
+      elements.narration.textContent === "Instructor demonstrates takeoff",
+      elements.narration.textContent);
+check("cockpit is open", elements["cockpit"].hidden === false);
+check("cockpit title names the school",
+      elements["cockpit-title"].textContent.includes("FLIGHT SCHOOL"),
+      elements["cockpit-title"].textContent);
+check("status shows lesson 1/8",
+      elements.status.textContent.includes("lesson 1/8"),
+      elements.status.textContent);
+check("status says instructor at the controls",
+      elements.status.textContent.includes("instructor at the controls"),
+      elements.status.textContent);
+check("seed select disabled in school mode", elements.seed.disabled === true);
 
-// click restart
-console.log("clicking restart…");
+// run until the turn-left demo (lesson 3): 6 s takeoff + 3 s level at 1x
+console.log("== live stepping to the turn-left demonstration");
+let sawTurnLeft = false;
+for (let i = 0; i < 4000 && !sawTurnLeft; i++) {
+  stepFrames(1, 60);
+  if (elements.narration.textContent === "Instructor demonstrates turn left") {
+    sawTurnLeft = true;
+  }
+}
+check("narration reads \"Instructor demonstrates turn left\"",
+      sawTurnLeft, elements.narration.textContent);
+
+// run until the first exam: the student repeats
+console.log("== the student repeats (first exams)");
+let sawStudentRepeats = false;
+for (let i = 0; i < 6000 && !sawStudentRepeats; i++) {
+  stepFrames(1, 60);
+  if (elements.narration.textContent === "Student repeats") {
+    sawStudentRepeats = true;
+  }
+}
+check("narration reads \"Student repeats\"", sawStudentRepeats,
+      elements.narration.textContent);
+
+// run the classroom to completion (drills fast-forward headlessly)
+console.log("== running the classroom to the report card");
+// The C172 lessons are long; the app clamps wall to 0.05 s/frame, so chew
+// the remaining classroom at 10x (the accumulator still steps 1/50 s).
+elements.speed.value = "10";
+elements.speed.change();
+let sawTakeover = false;
+for (let i = 0; i < 30000; i++) {
+  stepFrames(1, 60);
+  if (elements.narration.textContent.includes("Instructor takes over")) {
+    sawTakeover = true;
+  }
+  if (elements.narration.className.includes("stage-done")) {
+    break;
+  }
+}
+check("classroom finishes", elements.narration.className.includes("stage-done"),
+      elements.narration.textContent);
+check("the instructor took over at least once during the drills", sawTakeover);
+check("badge reports the golden-exact classroom",
+      elements.badge.textContent === "golden: ✓ bit-exact classroom",
+      elements.badge.textContent);
+const reportRows = elements.schoolTbody.innerHTML;
+check("report card has all 8 lessons",
+      (reportRows.match(/<tr>/g) ?? []).length === 8,
+      String((reportRows.match(/<tr>/g) ?? []).length));
+check("report card rows all match golden exactly",
+      !reportRows.includes("mismatch") && !reportRows.includes("…"),
+      reportRows.slice(0, 160));
+check("clock stops itself at the end", elements.play.textContent.includes("play"),
+      elements.play.textContent);
+check("status tells the classroom's outcome",
+      elements.status.textContent.includes("round") && elements.status.textContent.includes("keys"),
+      elements.status.textContent);
+// back to 1x for the restart + speed checks
+elements.speed.value = "1";
+elements.speed.change();
+
+// restart: the classroom replays from the takeoff demonstration
+console.log("== restart");
 elements.restart.click();
-stepFrames(4, 60);
-console.log("after restart:");
-console.log("  status:", elements.status.textContent);
-console.log("  play label:", elements.play.textContent);
-stepFrames(200, 60);
-console.log("after 200 more frames:");
-console.log("  status:", elements.status.textContent);
+stepFrames(3, 60);
+check("restart replays the takeoff demonstration",
+      elements.narration.textContent === "Instructor demonstrates takeoff",
+      elements.narration.textContent);
+check("badge cleared on restart", elements.badge.textContent === "");
 
-// --- cockpit selection flow ---------------------------------------------------
-// fresh recording (restart), then click on drone 1 (slot 0): it spawns at
-// world (0, -160) heading +x; with scale ~0.7045 that is screen (620, 333).
-elements.restart.click();
-stepFrames(2, 60);
+// speed control: the select offers 1x default with slower speeds (HTML-side
+// contract; here we verify the clock honours the value)
+console.log("== speed control");
+elements.speed.value = "0.5";
+stepFrames(10, 60);   // 0.5 s wall (clamped to 0.05/frame) -> 0.25 s sim -> t 0.4s
+check("0.5x steps slower than real time",
+      elements.status.textContent.includes("t 0.4s"),
+      elements.status.textContent);
+elements.speed.value = "1";
+stepFrames(10, 60);
+check("1x steps in real time",
+      elements.status.textContent.includes("t 0.9s"),
+      elements.status.textContent);
+
+// 10x: the accumulator just steps ten ticks per wall tick
+elements.speed.value = "10";
+stepFrames(10, 60);   // 0.5 s wall (clamped) -> 5.0 s sim -> t 5.9s (takeoff is 6 s)
+check("10x steps ten times real time",
+      elements.status.textContent.includes("t 5.9s"),
+      elements.status.textContent);
+elements.speed.value = "1";
+
+// mode switch: carpet waves (playback of the bit-exact recording)
+console.log("== carpet mode (recording playback)");
+elements.mode.value = "carpet";
+elements.mode.change();
+stepFrames(3, 60);
+check("carpet mode boots the waves",
+      elements.status.textContent.includes("wave 1/5"),
+      elements.status.textContent);
+check("carpet mode hides the cockpit until a drone is clicked",
+      elements["cockpit"].hidden === true);
 function clickSky(x, y) {
   const map = listeners.get(elements.sky) ?? {};
   for (const handler of map.click ?? []) handler({ clientX: x, clientY: y });
 }
-clickSky(626, 333);
-stepFrames(2, 60);
-console.log("cockpit after drone click:", elements["cockpit"].hidden ? "hidden (BUG)" : "shown");
-console.log("  title:", elements["cockpit-title"].textContent);
-console.log("  foot:", elements["cockpit-foot"].textContent);
-clickSky(40, 40);
-stepFrames(2, 60);
-console.log("cockpit after empty-space click:", elements["cockpit"].hidden ? "hidden" : "shown (BUG)");
+clickSky(507, 220);   // drone 1 spawns at world (0, -160): screen (507, 220) from-sky
+stepFrames(3, 60);
+check("clicking a drone opens its cockpit",
+      elements["cockpit"].hidden === false
+      && elements["cockpit-title"].textContent.includes("DRONE 1"),
+      elements["cockpit-title"].textContent);
 
-// --- auto-select on crash ----------------------------------------------------
-// select drone 2 (slot 1, dies at 12.08 s in wave 1); the cockpit must move
-// to the next drone still flying (slot 2 survives 20 s) after the crash.
-elements.restart.click();
-stepFrames(2, 60);
-clickSky(620, 305);   // drone 2 spawns at world (0, -120): screen (620, ~305)
-stepFrames(2, 60);
-console.log("selected:", elements["cockpit-title"].textContent);
-const before = elements["cockpit-title"].textContent;
-stepFrames(60, 60);   // t ~ 0.9 + 60*0.24 = ~15.3 s: past drone 2's 12.08 s
-console.log("after its crash (12.08s), cockpit shows:",
-            elements["cockpit-title"].textContent,
-            before !== elements["cockpit-title"].textContent ? "(auto-advanced OK)" : "(BUG: no advance)");
-console.log("  foot:", elements["cockpit-foot"].textContent);
+// and back to the live school
+console.log("== back to the flight school");
+elements.mode.value = "school";
+elements.mode.change();
+stepFrames(3, 60);
+check("returning to school replays the classroom live",
+      elements.narration.textContent === "Instructor demonstrates takeoff",
+      elements.narration.textContent);
+check("cockpit reopens for the school aircraft",
+      elements["cockpit"].hidden === false);
+
+console.log(failures === 0 ? "\nALL CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
+process.exit(failures === 0 ? 0 : 1);

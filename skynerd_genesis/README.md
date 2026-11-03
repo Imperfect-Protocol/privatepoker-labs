@@ -70,6 +70,32 @@ Determinism proof: two captures of the same commit match exactly
    obituary screams, and shared-RNG draw ordering. Remaining M4 surface:
    the dormant wavelet denoise pipeline (`denoise()` has no callers in the
    Python today) and the school/will/tactics layers for later milestones.
+5. **Flight school — ported and live in the browser.** `src/learning/school.ts`
+   ports the classroom 1:1 from `skynerd/learning/school.py` (will-less
+   path): the 14-lesson curriculum with its intent (desire slots, instrument
+   targets), the instructor's honest feedback laws, the anti-poisoning stamp
+   gates (imprint_after, stamp bank, one-sided takeover corrections,
+   dive-signature block, near-trim hands-off), the memory-only exam graded
+   0-6 on mean panel drift, and the corrective show-and-repeat drills with
+   double-strength takeover stamps and the hold-all anti-stamp. The teach()
+   loop lives in a resumable `SchoolSession` so the browser runs the SAME
+   state machine live — one 50 Hz tick at a time — while `test/school.test.ts`
+   runs it headlessly against the Python golden report card: per-lesson
+   stamp counts BIT-EXACT through all 100 drill rounds (3135 stamps on
+   spin_recovery), exam scores to 5e-4 (V8 and CPython libm differ by ≤1 ulp
+   on asin/atan2; a 2.5 rad/s spin amplifies that over 7 s of feedback —
+   every discrete gate replays identically), graduate memory 127 keys, the
+   100-round cap, and the stubborn three below the bar.
+   The web app (`npm run dev`, view "flight school") shows the classroom
+   live: a single drone, its cockpit (ADI, ASI/VSI/RPM, ALT/HDG), its
+   controls square (yoke, rudder, throttle), and the narration
+   "Instructor demonstrates turn left" / "Student repeats" — with takeover
+   callouts during the drills — ending in the golden-graded report card.
+   Clock: 0.2x / 0.3x / 0.5x / 1x (default) / 2x / 3x / 5x / 10x,
+   fixed-dt accumulator (physics always steps at exactly 1/50 s).
+   The carpet waves view still plays back the bit-exact recording; the
+   live carpet rebuild (rows flying simultaneously behind each other,
+   nearest-neighbour p2p links) is the next step.
 5. SwarmEye LVM — 512×256×8 layered depth maps
 6. 3D viewport — third-person swarm camera, inspection overlays
 7. Swarm Commander — Nebius LLM intents, validator, command panel

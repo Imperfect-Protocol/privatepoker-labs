@@ -1,13 +1,17 @@
 /**
- * Full episode replay vs the Python reference (reference/flight-ref.json):
- * three lives of one learned policy, blank start. This is the Milestone 3
+ * Full episode replay against the TS-frozen reference
+ * (reference/c172-episodes-frozen.json): three lives of one learned
+ * policy, blank start, on the C172 airframe. This is the Milestone 3
  * acceptance gate: comparable trajectories and outcomes under controlled
  * seeds — here "comparable" means exact.
  *
- * The replay below mirrors the Python tracer in golden/flight_ref.py (which
- * asserts its own faithfulness against the real fly_episode). Exact gates:
- * outcome, survival tick, every decision choice, final state key, and the
- * learned tensor afterwards. Trajectory samples at 1e-6 (libm ulps).
+ * The replay mirrors the real fly_episode (agl-aware step, terminal
+ * credit) and the freeze tool tools/freeze-episodes.mjs. The Python
+ * reference (flight-ref.json) is the historical record for the old 1.5 kg
+ * airframe; the C172 redesign invalidates its trajectories, choices and
+ * tensor. Exact gates: outcome, survival tick, every decision choice,
+ * final state key, and the learned tensor afterwards. Trajectory samples
+ * at 1e-6 (libm ulps).
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -18,6 +22,7 @@ import { World } from "../src/core/world.js";
 import { NumpyPcg64 } from "../src/core/rng.js";
 import { RigidBody } from "../src/physics/rigid-body.js";
 import { SurfacesState } from "../src/physics/surfaces.js";
+import { GRAVITY, RHO_SEA_LEVEL } from "../src/physics/aero.js";
 import {
   DenseReward, EpisodeOutcome, FlightInstruments, classifyOutcome,
 } from "../src/learning/instruments.js";
@@ -27,7 +32,7 @@ import {
 } from "../src/learning/flight.js";
 import { check, finish, section } from "./harness.js";
 
-const refPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "reference", "flight-ref.json");
+const refPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "reference", "c172-episodes-frozen.json");
 const ref = JSON.parse(readFileSync(refPath, "utf8"));
 
 const DT = 1.0 / 50.0;
@@ -116,7 +121,8 @@ ref.episodes.forEach((ep: any) => {
         choices.push(choiceOf(actions));
       }
       servos.command(commands, DT);
-      body.step(servos, DT);
+      body.step(servos, DT, GRAVITY, RHO_SEA_LEVEL,
+                body.position.z - world.terrainHeight(body.position.x, body.position.y));
       commands = springTowardNeutral(commands, DT);
       pending += dense.tick(body) + 0.0005;
       outcome = classifyOutcome(body, world, (tick + 1) * DT);
@@ -215,7 +221,8 @@ function traceSamples(pol: ServoPolicy, inst: FlightInstruments, epoch: number,
       }
     }
     servos.command(commands, DT);
-    const diag = body.step(servos, DT);
+    const diag = body.step(servos, DT, GRAVITY, RHO_SEA_LEVEL,
+                           body.position.z - world.terrainHeight(body.position.x, body.position.y));
     commands = springTowardNeutral(commands, DT);
     pending += dense.tick(body) + 0.0005;
     if (tick % 5 === 0) {

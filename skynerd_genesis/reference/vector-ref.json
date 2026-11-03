@@ -381,10 +381,10 @@
    ],
    "dt": 0.02,
    "q": [
-    0.9493053040875199,
-    0.16932322906932545,
-    -0.059555683975603325,
-    0.25807402859458006
+    0.94930530408752,
+    0.16955754509988472,
+    -0.059107362850588284,
+    0.2580232512543217
    ]
   },
   {
@@ -396,9 +396,9 @@
    "dt": 0.02,
    "q": [
     0.9497845634694979,
-    0.16624501009678105,
-    -0.055930933594118194,
-    0.25912084107664335
+    0.1650370133746494,
+    -0.057983544137626464,
+    0.25944166169039096
    ]
   }
  ],
@@ -430,5 +430,6 @@
   "motion_hz": 10.0,
   "vision_hz": 2.0,
   "physics_dt": 0.02
- }
+ },
+ "note_integrate_body_rates": "Re-frozen from the corrected TS implementation: the Python reference carried the world-frame update (omega (x) q) where the body-rate propagation is q (x) omega; banked turns diverged under the old law. The TS quaternion is the corrected behavioural reference."
 }

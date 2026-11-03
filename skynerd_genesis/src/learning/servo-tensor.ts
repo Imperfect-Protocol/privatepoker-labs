@@ -88,6 +88,31 @@ export class SparseHebbianTensor {
     return this.values.size;
   }
 
+  /** Copy the sparse memory: the graduate the flock inherits from. */
+  snapshot(): { values: Map<number, Float32Array>; epochs: Map<number, Int32Array> } {
+    const values = new Map<number, Float32Array>();
+    for (const [key, slots] of this.values) {
+      values.set(key, Float32Array.from(slots));
+    }
+    const epochs = new Map<number, Int32Array>();
+    for (const [key, slotEpochs] of this.epochs) {
+      epochs.set(key, Int32Array.from(slotEpochs));
+    }
+    return { values, epochs };
+  }
+
+  /** Overwrite the memory with a snapshot (a newborn inheriting a graduate). */
+  restore(snapshot: { values: Map<number, Float32Array>; epochs: Map<number, Int32Array> }): void {
+    this.values.clear();
+    for (const [key, slots] of snapshot.values) {
+      this.values.set(key, Float32Array.from(slots));
+    }
+    this.epochs.clear();
+    for (const [key, slotEpochs] of snapshot.epochs) {
+      this.epochs.set(key, Int32Array.from(slotEpochs));
+    }
+  }
+
   /**
    * Hebbian (amount > 0) or anti-Hebbian (amount < 0) update at a time slot.
    * The amount applies to the deviation from baseline, clamped into
@@ -201,6 +226,30 @@ export class ServoPolicy {
       targets[surface] = Math.max(low, Math.min(high, targets[surface] + delta));
     }
     return targets;
+  }
+
+  /**
+   * Flight school: stamp a demonstrated decision straight into memory.
+   *
+   * The instructor chose the actions, not the drone — this is the
+   * watch-and-remember channel, reward-free and immediate. Every moved
+   * surface is a fact about this state and gets its own stamp; still
+   * hands stamp the hold-all option.
+   */
+  imprint(stateKey: readonly number[], actions: ArrayLike<number>,
+          amount = 1.0, timeEpoch = 0): void {
+    const changed: Array<[number, number]> = [];
+    for (let surface = 0; surface < 4; surface++) {
+      if (actions[surface] !== HOLD) {
+        changed.push([surface, actions[surface]]);
+      }
+    }
+    if (changed.length === 0) {
+      changed.push([HOLD_ALL_SURFACE, HOLD]);
+    }
+    for (const [surface, level] of changed) {
+      this.tensor.reward([...stateKey, surface, level], timeEpoch, amount);
+    }
   }
 
   /**

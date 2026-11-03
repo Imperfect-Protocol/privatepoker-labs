@@ -71,13 +71,16 @@ export class Quaternion {
 
   /** Advance attitude by body angular rates (rad/s) over dt; renormalizes. */
   integrateBodyRates(p: number, q: number, r: number, dt: number): Quaternion {
-    // q_dot = 0.5 * q ⊗ (0, omega_body); explicit Euler is fine at small dt.
+    // q_dot = 0.5 * q ⊗ (0, omega_BODY) — the body-rate propagation. (The
+    // multiply order matters: ω ⊗ q is the WORLD-frame update and rotates
+    // banked inputs about the earth axes, which turns a nose-up pull into
+    // a deck-pitch drop once the heading passes 90°.)
     const half = 0.5 * dt;
     const dq = new Quaternion(
       -half * (p * this.x + q * this.y + r * this.z),
-      half * (p * this.w + q * this.z - r * this.y),
-      half * (q * this.w + r * this.x - p * this.z),
-      half * (r * this.w + p * this.y - q * this.x),
+      half * (p * this.w + r * this.y - q * this.z),
+      half * (q * this.w + p * this.z - r * this.x),
+      half * (r * this.w + q * this.x - p * this.y),
     );
     return new Quaternion(this.w + dq.w, this.x + dq.x, this.y + dq.y, this.z + dq.z)
       .normalized();

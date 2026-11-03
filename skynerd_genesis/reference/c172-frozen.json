@@ -1,0 +1,53 @@
+{
+  "schema": "c172-frozen/1",
+  "note": "TS-frozen flight-school reference: 1111 kg battle-C172 airframe, 8-lesson phase curriculum. Double-run bit-exact (tools/freeze-c172.mjs).",
+  "rounds": 100,
+  "failed": [
+    "steep_turn_left_180",
+    "stall_recovery",
+    "spin_recovery"
+  ],
+  "graduate_keys": 74,
+  "lessons": [
+    {
+      "lesson": "takeoff",
+      "stamps": 364,
+      "score": 4.033029117148453
+    },
+    {
+      "lesson": "level_cruise",
+      "stamps": 100,
+      "score": 5.198267072104819
+    },
+    {
+      "lesson": "turn_left_180",
+      "stamps": 127,
+      "score": 3.738564551476331
+    },
+    {
+      "lesson": "turn_right_180",
+      "stamps": 127,
+      "score": 3.2054825548785346
+    },
+    {
+      "lesson": "steep_turn_left_180",
+      "stamps": 10098,
+      "score": 3.643881506227819
+    },
+    {
+      "lesson": "steep_turn_right_180",
+      "stamps": 231,
+      "score": 3.370076286263922
+    },
+    {
+      "lesson": "stall_recovery",
+      "stamps": 17871,
+      "score": 0
+    },
+    {
+      "lesson": "spin_recovery",
+      "stamps": 25767,
+      "score": 0
+    }
+  ]
+}
