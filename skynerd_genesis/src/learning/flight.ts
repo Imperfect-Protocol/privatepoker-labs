@@ -19,7 +19,7 @@ import {
   DenseReward, EpisodeOutcome, FlightInstruments, classifyOutcome,
 } from "./instruments.js";
 import { ServoPolicy, TensorNetwork, GOAL_FREE_FLIGHT,
-         ELEMENT_FREE_FLIGHT } from "./servo-tensor.js";
+         ELEMENT_FREE_FLIGHT, type TensorStateView } from "./servo-tensor.js";
 
 export const TRIM_SPEED = 38.0;       // m/s — 85 mph, the C172 economy cruise
 export const HORIZON = 20.0;
@@ -169,6 +169,12 @@ export class LiveEpisode {
       choices: this.lastChoices,
       fresh: this.tick % this.decisionEvery < this.decisionEvery / 2,
     };
+  }
+
+  /** THE UI's STATE VIEW — the AI state log's snapshot of this
+   *  drone's tensor network. */
+  stateView(): TensorStateView {
+    return this.network.stateView();
   }
 
   /**

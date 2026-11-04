@@ -26,10 +26,12 @@ import {
 } from "../learning/school.js";
 import { FlightInstruments } from "../learning/instruments.js";
 import { ServoPolicy } from "../learning/servo-tensor.js";
+import type { TensorStateView } from "../learning/servo-tensor.js";
 import { TRIM_SPEED } from "../learning/flight.js";
 import { NumpyPcg64 } from "../core/rng.js";
 import { Aircraft } from "../physics/aircraft.js";
 import { Scene, type SceneAircraft } from "./scene.js";
+import { hudDelta, readoutOf, type HudDelta } from "./hud-delta.js";
 
 const TRAIL_CAP = 1200;
 
@@ -52,7 +54,7 @@ export const LESSON_PHRASES: Record<string, string> = {
   steep_descending_turn_left_180: "steep descending turn left",
   steep_descending_turn_right_180: "steep descending turn right",
   stall_recovery: "stall recovery",
-  spin_recovery: "spin recovery",
+  spin_recovery_left: "spin recovery left",
   spin_recovery_right: "spin recovery right",
   comprehensive: "the comprehensive flight",
 };
@@ -79,7 +81,7 @@ export const GOAL_PHRASES: Record<string, string> = {
   steep_descending_turn_left_180: "steep turn left 180\u00b0 while descending",
   steep_descending_turn_right_180: "steep turn right 180\u00b0 while descending",
   stall_recovery: "recover from the stall",
-  spin_recovery: "recover from the spin",
+  spin_recovery_left: "recover from the spin",
   spin_recovery_right: "recover from the right spin",
   comprehensive: "fly the whole flight: takeoff, climb, turns, steeps, stall, and both spins",
 };
@@ -227,6 +229,36 @@ export class FlightSchoolShow {
     return this.student;
   }
 
+  /** THE AI STATE LOG's subject: the student's tensor network view (the
+   *  classroom's ONE AI — null before it launches). */
+  get studentStateView(): TensorStateView | null {
+    return this.studentFlight === null ? null : this.studentFlight.stateView();
+  }
+
+  /** The AI log's delta column: the student against the instructor,
+   *  in pilot's units (empty before the student launches). */
+  get instructorDelta(): HudDelta | null {
+    if (this.studentFlight === null) {
+      return null;
+    }
+    return hudDelta(readoutOf(this.studentEntry.aircraft),
+                    readoutOf(this.instructorEntry.aircraft));
+  }
+
+  /** The wiki tab's scenario description: the current lesson's title,
+   *  its higher-level goal, its element chain, and its known goals. */
+  get wiki(): {
+    title: string; goal: string;
+    elements: readonly string[]; goals: readonly string[];
+  } {
+    const spec = this.school.goalSpec(this.lesson);
+    return {
+      title: LESSON_PHRASES[this.lesson.name] ?? this.lesson.name,
+      goal: GOAL_PHRASES[this.lesson.name] ?? this.lesson.name,
+      elements: this.lesson.phases.map((phase) => phase.name),
+      goals: spec.goals.map((goal) => goal.label),
+    };
+  }
   /** The entry to follow: the student once it is in the air (the one
    *  learning), the instructor before it launches. */
   get flyingEntry(): SceneAircraft {

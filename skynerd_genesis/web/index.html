@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Skynerd Genesis — flight school</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%E2%9C%88%3C/text%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Michroma&family=Rajdhani:wght@500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -58,12 +61,12 @@
     </aside>
 
     <div id="results">
-      <table id="school">
-        <thead>
-          <tr><th>maneuver</th><th>attempts</th><th>goal score</th><th>goals</th><th>match</th></tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+      <div class="tab-head">
+        <button class="tab active" data-tab="wiki">scenario</button>
+        <button class="tab" data-tab="ai">AI state</button>
+      </div>
+      <div class="tab-body" id="tabWiki"></div>
+      <div class="tab-body" id="tabAi" hidden></div>
     </div>
   </div>
 

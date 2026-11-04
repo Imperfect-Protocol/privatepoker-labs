@@ -403,10 +403,10 @@ function pushTower(objects: WorldObject[], cam: Camera): void {
       const p = (ox: number, oz: number): [number, number] | null =>
         projectPoint(cam2, TW.x + ox, TW.y, oz);
       quad([p(-TW.base, 0.0), p(TW.base, 0.0), p(TW.base * 0.6, TW.h),
-            p(-TW.base * 0.6, TW.h)], "#8b96ab");
+            p(-TW.base * 0.6, TW.h)], "#35586b");
       quad([p(-TW.base * 0.9, TW.h), p(TW.base * 0.9, TW.h),
             p(TW.base * 0.9, TW.h + 4.0), p(-TW.base * 0.9, TW.h + 4.0)], "#9fd8ff");
-      ctx.strokeStyle = "#e8ecf4";
+      ctx.strokeStyle = "#dff2fc";
       ctx.lineWidth = 0.7;
       ctx.stroke();
     },
@@ -723,10 +723,10 @@ function drawHeadingTape(ctx: CanvasRenderingContext2D, W: number,
                          heading: number): void {
   const h = 18;
   const pxPerDeg = 2.2;
-  ctx.fillStyle = "rgba(10,14,22,0.55)";
+  ctx.fillStyle = "rgba(2,6,12,0.62)";
   ctx.fillRect(0, 0, W, h);
   const hdg = (((heading * 180 / Math.PI) % 360) + 360) % 360;
-  ctx.font = "8px ui-monospace, monospace";
+  ctx.font = "10px Rajdhani, 'SF Mono', monospace";
   ctx.textAlign = "center";
   for (let d = 0; d < 360; d += 10) {
     let rel = d - hdg;
@@ -737,7 +737,7 @@ function drawHeadingTape(ctx: CanvasRenderingContext2D, W: number,
       continue;
     }
     const major = d % 30 === 0;
-    ctx.strokeStyle = "rgba(201,212,227,0.8)";
+    ctx.strokeStyle = "rgba(160,220,245,0.8)";
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(x, h);
@@ -745,16 +745,16 @@ function drawHeadingTape(ctx: CanvasRenderingContext2D, W: number,
     ctx.stroke();
     if (major) {
       const cardinals: Record<number, string> = { 0: "N", 90: "E", 180: "S", 270: "W" };
-      ctx.fillStyle = "rgba(201,212,227,0.9)";
+      ctx.fillStyle = "rgba(160,220,245,0.9)";
       ctx.fillText(cardinals[d] ?? String(d / 10), x, h - 10);
     }
   }
-  ctx.fillStyle = "#0b0e14";
+  ctx.fillStyle = "#040a12";
   ctx.fillRect(W / 2 - 17, h - 1, 34, 13);
-  ctx.strokeStyle = "#7dff8e";
+  ctx.strokeStyle = "#35d0ff";
   ctx.strokeRect(W / 2 - 16.5, h - 0.5, 33, 12);
-  ctx.fillStyle = "#7dff8e";
-  ctx.font = "bold 10px ui-monospace, monospace";
+  ctx.fillStyle = "#35d0ff";
+  ctx.font = "bold 12px Rajdhani, 'SF Mono', monospace";
   ctx.fillText(`${String(Math.round(hdg) % 360).padStart(3, "0")}\u00b0`, W / 2, h + 9);
   ctx.textAlign = "left";
 }
@@ -766,11 +766,11 @@ function drawSpeedTape(ctx: CanvasRenderingContext2D, W: number, H: number,
   const w = 34;
   const top = 30;
   const bot = H - 6;
-  ctx.fillStyle = "rgba(10,14,22,0.55)";
+  ctx.fillStyle = "rgba(2,6,12,0.62)";
   ctx.fillRect(0, top, w, bot - top);
   const midY = (top + bot) / 2;
   const pxPerMph = 1.6;
-  ctx.font = "8px ui-monospace, monospace";
+  ctx.font = "10px Rajdhani, 'SF Mono', monospace";
   ctx.textAlign = "right";
   for (let v = 0; v <= 170; v += 10) {
     const y = midY - (v - mph) * pxPerMph;
@@ -778,23 +778,23 @@ function drawSpeedTape(ctx: CanvasRenderingContext2D, W: number, H: number,
       continue;
     }
     const major = v % 20 === 0;
-    ctx.strokeStyle = "rgba(201,212,227,0.8)";
+    ctx.strokeStyle = "rgba(160,220,245,0.8)";
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(w, y);
     ctx.lineTo(w - (major ? 9 : 4), y);
     ctx.stroke();
     if (major) {
-      ctx.fillStyle = "rgba(201,212,227,0.9)";
+      ctx.fillStyle = "rgba(160,220,245,0.9)";
       ctx.fillText(String(v), w - 11, y + 3);
     }
   }
-  ctx.fillStyle = "#0b0e14";
+  ctx.fillStyle = "#040a12";
   ctx.fillRect(0, midY - 9, w + 16, 18);
-  ctx.strokeStyle = "#7dff8e";
+  ctx.strokeStyle = "#35d0ff";
   ctx.strokeRect(0.5, midY - 8.5, w + 15, 17);
-  ctx.fillStyle = "#7dff8e";
-  ctx.font = "bold 12px ui-monospace, monospace";
+  ctx.fillStyle = "#35d0ff";
+  ctx.font = "bold 14px Rajdhani, 'SF Mono', monospace";
   ctx.fillText(mph.toFixed(0), w + 12, midY + 4);
   ctx.textAlign = "left";
 }
@@ -807,11 +807,11 @@ function drawAltTape(ctx: CanvasRenderingContext2D, W: number, H: number,
   const x0 = W - w;
   const top = 30;
   const bot = H - 6;
-  ctx.fillStyle = "rgba(10,14,22,0.55)";
+  ctx.fillStyle = "rgba(2,6,12,0.62)";
   ctx.fillRect(x0, top, w, bot - top);
   const midY = (top + bot) / 2;
   const pxPerFt = 0.16;
-  ctx.font = "8px ui-monospace, monospace";
+  ctx.font = "10px Rajdhani, 'SF Mono', monospace";
   ctx.textAlign = "left";
   const base = Math.round(altFt / 100) * 100;
   for (let v = base - 1200; v <= base + 1200; v += 100) {
@@ -820,24 +820,24 @@ function drawAltTape(ctx: CanvasRenderingContext2D, W: number, H: number,
       continue;
     }
     const major = v % 200 === 0;
-    ctx.strokeStyle = "rgba(201,212,227,0.8)";
+    ctx.strokeStyle = "rgba(160,220,245,0.8)";
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(x0, y);
     ctx.lineTo(x0 + (major ? 9 : 4), y);
     ctx.stroke();
     if (major) {
-      ctx.fillStyle = "rgba(201,212,227,0.9)";
+      ctx.fillStyle = "rgba(160,220,245,0.9)";
       ctx.fillText(String(v), x0 + 11, y + 3);
     }
   }
   // current altitude box (opens inward)
-  ctx.fillStyle = "#0b0e14";
+  ctx.fillStyle = "#040a12";
   ctx.fillRect(x0 - 16, midY - 9, w + 16, 18);
-  ctx.strokeStyle = "#7dff8e";
+  ctx.strokeStyle = "#35d0ff";
   ctx.strokeRect(x0 - 15.5, midY - 8.5, w + 15, 17);
-  ctx.fillStyle = "#7dff8e";
-  ctx.font = "bold 11px ui-monospace, monospace";
+  ctx.fillStyle = "#35d0ff";
+  ctx.font = "bold 13px Rajdhani, 'SF Mono', monospace";
   ctx.textAlign = "right";
   ctx.fillText(altFt.toFixed(0), x0 + w - 2, midY + 4);
   ctx.textAlign = "left";
@@ -848,7 +848,7 @@ function drawAltTape(ctx: CanvasRenderingContext2D, W: number, H: number,
   const vBot = midY + 66;
   const clampV = Math.max(-16.0, Math.min(16.0, vsHundreds));
   const dy = clampV * (66.0 / 16.0);        // px, positive = climb
-  ctx.strokeStyle = "rgba(139,150,171,0.5)";
+  ctx.strokeStyle = "rgba(70,115,140,0.5)";
   ctx.lineWidth = 1;
   ctx.setLineDash([3, 3]);
   ctx.beginPath();
@@ -858,18 +858,18 @@ function drawAltTape(ctx: CanvasRenderingContext2D, W: number, H: number,
   ctx.setLineDash([]);
   const y0 = Math.min(midY, midY - dy);
   const y1 = Math.max(midY, midY - dy);
-  ctx.fillStyle = Math.abs(vsHundreds) < 0.05 ? "rgba(125,223,142,0.35)" : "#7dff8e";
+  ctx.fillStyle = Math.abs(vsHundreds) < 0.05 ? "rgba(53,208,255,0.35)" : "#35d0ff";
   ctx.fillRect(vx - 4, y0, 8, Math.max(1.0, y1 - y0));
   // the zero notch: a solid bright tick across the segment at zero climb,
   // drawn over the bar so level flight reads at a glance
-  ctx.strokeStyle = "#c9d4e3";
+  ctx.strokeStyle = "#d0ecff";
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.moveTo(vx - 7, midY);
   ctx.lineTo(vx + 7, midY);
   ctx.stroke();
-  ctx.fillStyle = "rgba(201,212,227,0.75)";
-  ctx.font = "7px ui-monospace, monospace";
+  ctx.fillStyle = "rgba(160,220,245,0.75)";
+  ctx.font = "9px Rajdhani, 'SF Mono', monospace";
   ctx.textAlign = "center";
   ctx.fillText("VSI", vx, vBot + 9);
   ctx.fillText(`${vsHundreds >= 0 ? "+" : ""}${vsHundreds.toFixed(1)}`, vx, vTop - 3);
@@ -899,7 +899,7 @@ function drawFlightPathMarker(ctx: CanvasRenderingContext2D, s: DroneView,
   }
   const r = 4.5;
   ctx.lineCap = "round";
-  for (const [colour, width] of [["#0b0e14", 4.0], ["#7dff8e", 2.0]] as const) {
+  for (const [colour, width] of [["#040a12", 4.0], ["#35d0ff", 2.0]] as const) {
     ctx.strokeStyle = colour;
     ctx.lineWidth = width;
     ctx.beginPath();
@@ -959,12 +959,17 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
   // no horizon line is drawn: the ground's far haze and the sky's fog
   // band are the SAME pale colour, so the world melts at the horizon —
   // the pitch ladder below is the attitude reference
-  // pitch ladder: the world's elevation rungs, at ±10° and ±20°
-  ctx.strokeStyle = "rgba(226,232,244,0.55)";
-  ctx.fillStyle = "rgba(226,232,244,0.75)";
-  ctx.font = "8px ui-monospace, monospace";
+  // pitch ladder: the world's elevation rungs, every 10° from −90° up to
+  // +90° — the full range. Zero is the horizon itself: the world melts
+  // into haze there, so the ladder is the only attitude reference.
+  ctx.strokeStyle = "rgba(170,232,255,0.55)";
+  ctx.fillStyle = "rgba(170,232,255,0.75)";
+  ctx.font = "10px Rajdhani, 'SF Mono', monospace";
   ctx.lineWidth = 1;
-  for (const d of [-20, -10, 10, 20]) {
+  for (let d = -90; d <= 90; d += 10) {
+    if (d === 0) {
+      continue;                               // the haze line is the 0° rung
+    }
     const rung = horizon((d * Math.PI) / 180, 0.6);
     if (rung === null) {
       continue;                               // this rung is behind us
@@ -993,7 +998,7 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
   // the sun's glare: a soft veil over the whole scene when facing it
   drawSunGlare(ctx, cam);
   // traffic: other drones in the forward view
-  ctx.font = "8px ui-monospace, monospace";
+  ctx.font = "10px Rajdhani, 'SF Mono', monospace";
   for (const other of others) {
     if (!other.alive) {
       continue;
@@ -1012,14 +1017,14 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
     }
     const size = Math.max(3.0, Math.min(9.0, 260.0 / range));
     const dz = other.z - s.z;
-    ctx.fillStyle = dz > 2 ? "#9fd8ff" : dz < -2 ? "#ffb066" : "#e8ecf4";
+    ctx.fillStyle = dz > 2 ? "#9fd8ff" : dz < -2 ? "#ffb066" : "#dff2fc";
     ctx.beginPath();
     ctx.moveTo(tx, ty - size);
     ctx.lineTo(tx + size * 0.7, ty + size * 0.6);
     ctx.lineTo(tx - size * 0.7, ty + size * 0.6);
     ctx.closePath();
     ctx.fill();
-    ctx.fillStyle = "rgba(200,210,228,0.7)";
+    ctx.fillStyle = "rgba(170,225,250,0.7)";
     ctx.fillText(`${Math.round(range)}m`, tx + size + 2, ty + 3);
   }
   // flight path marker: rides the world, not the frame
@@ -1055,7 +1060,40 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
   ctx.lineJoin = "miter";
   ctx.lineCap = "butt";
 
-  // bank pointer (rides the card) + fixed reference tick
+  // the ADI: a bright reference circle carrying the BANK SCALE — a notch
+  // every 5°, longer notches at 15/30/60°, and the CARDINAL marks 0/45/90°
+  // BIGGER and THICKER — all 65% transparent, drawn in the HUD's ink (the
+  // same pale blue as the rest of its text); the amber bank pointer rides
+  // the card against it
+  ctx.strokeStyle = "rgba(170,232,255,0.35)";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, 2 * Math.PI);
+  ctx.stroke();
+  const BANK_MAJOR = new Set([15, 30, 60]);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let a = -90; a <= 90; a += 5) {
+    const aa = Math.abs(a);
+    if (aa === 0 || aa === 45 || aa === 90) {
+      continue;                        // the cardinals get their own pass
+    }
+    const len = BANK_MAJOR.has(aa) ? 10 : 5;
+    const th = (a * Math.PI) / 180 - Math.PI / 2;   // angles from the top
+    ctx.moveTo(cx + Math.cos(th) * R, cy + Math.sin(th) * R);
+    ctx.lineTo(cx + Math.cos(th) * (R - len), cy + Math.sin(th) * (R - len));
+  }
+  ctx.stroke();
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  for (const a of [-90, -45, 0, 45, 90]) {
+    const th = (a * Math.PI) / 180 - Math.PI / 2;
+    ctx.moveTo(cx + Math.cos(th) * R, cy + Math.sin(th) * R);
+    ctx.lineTo(cx + Math.cos(th) * (R - 15), cy + Math.sin(th) * (R - 15));
+  }
+  ctx.stroke();
+
+  // bank pointer (rides the card): the amber triangle against the scale
   ctx.save();
   ctx.translate(cx, cy);
   ctx.rotate(-s.bank);
@@ -1067,26 +1105,6 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
   ctx.closePath();
   ctx.fill();
   ctx.restore();
-  ctx.strokeStyle = "#8b96ab";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(cx, cy - R);
-  ctx.lineTo(cx, cy - R + 7);
-  ctx.stroke();
-  ctx.restore();                             // un-clip
-
-  // the ADI rim: a thin ring marking the instrument's reference circle
-  ctx.strokeStyle = "rgba(139,150,171,0.35)";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.arc(cx, cy, R, 0, 2 * Math.PI);
-  ctx.stroke();
-
-  ctx.strokeStyle = "#3a4258";               // bezel
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(cx, cy, R, 0, 2 * Math.PI);
-  ctx.stroke();
 
   // --- MFD-style HUD: tapes over the world --------------------------------
   // ASI ladder on the left edge, ALT ladder on the right edge with the
@@ -1100,7 +1118,7 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
     ctx.fillStyle = "rgba(255,58,48,0.18)";
     ctx.fillRect(0, cy - 15, W, 30);
     ctx.fillStyle = "#ff4a3a";
-    ctx.font = "bold 13px ui-monospace, monospace";
+    ctx.font = "bold 15px Rajdhani, 'SF Mono', monospace";
     ctx.textAlign = "center";
     ctx.fillText("CRASHED", cx, cy + 5);
     ctx.textAlign = "left";
@@ -1146,7 +1164,7 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   const tyBot = H * 0.62;
 
   ctx.textAlign = "left";
-  ctx.font = "9px ui-monospace, monospace";
+  ctx.font = "11px Rajdhani, 'SF Mono', monospace";
 
   // --- AERT decisions (directly above the yoke) -----------------------------
   // The four control channels and the pilot's decision on each, at every
@@ -1155,28 +1173,28 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   // pulses when a decision window just opened. While the instructor
   // demonstrates there are no discrete decisions — its hand eases
   // smoothly — the strip rests.
-  ctx.fillStyle = "#5b6878";
+  ctx.fillStyle = "#3d5a70";
   ctx.fillText("AERT DECISIONS", yx - 52, 18);
-  ctx.fillStyle = s.handFresh ? "#ff8c3a" : "#2a3242";
+  ctx.fillStyle = s.handFresh ? "#ff8c3a" : "#0c1a26";
   ctx.beginPath();
   ctx.arc(yx + 58, 15, 2.5, 0, 2 * Math.PI);
   ctx.fill();
   const CHANNEL_LABELS = ["A", "E", "R", "T"];
   for (let i = 0; i < 4; i++) {
     const bx = yx - 52 + i * 26;
-    ctx.strokeStyle = "#3a4258";
+    ctx.strokeStyle = "#14283a";
     ctx.strokeRect(bx + 0.5, 24.5, 22, 22);
-    ctx.fillStyle = "#5b6878";
+    ctx.fillStyle = "#3d5a70";
     ctx.fillText(CHANNEL_LABELS[i], bx + 8, 57);
     const choice = s.handChoices;
     if (choice === null) {
-      ctx.fillStyle = "#3a4258";            // the instructor eases: no decisions
+      ctx.fillStyle = "#14283a";            // the instructor eases: no decisions
       ctx.fillText("\u2014", bx + 8, 40);
       continue;
     }
     const level = choice[i];
     if (level < 0) {                        // hold: the hand rests
-      ctx.fillStyle = "#5b6878";
+      ctx.fillStyle = "#3d5a70";
       ctx.fillText("\u00b7", bx + 10, 39);
     } else {                                // a commanded level (a stop)
       const now = [inAil, inElev, inRud, inThr][i];
@@ -1188,7 +1206,7 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
         ctx.fillStyle = "#9fd8ff";
         ctx.fillText("\u25bc", bx + 7, 41);
       } else {                               // already at the level
-        ctx.fillStyle = "#5b6878";
+        ctx.fillStyle = "#3d5a70";
         ctx.fillText("\u00b7", bx + 10, 39);
       }
     }
@@ -1216,7 +1234,7 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   ctx.translate(yx, yy + pull);
   ctx.rotate(wheelAngle);
   // the W: wheel bar with two horns
-  ctx.strokeStyle = s.alive ? "#c9d4e3" : "#5b6878";
+  ctx.strokeStyle = s.alive ? "#d0ecff" : "#3d5a70";
   ctx.lineWidth = 5;
   ctx.lineCap = "round";
   ctx.beginPath();
@@ -1229,7 +1247,7 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   ctx.moveTo(46, 0);
   ctx.lineTo(46, -26);
   ctx.stroke();
-  ctx.fillStyle = s.alive ? "#8b96ab" : "#3d4658";
+  ctx.fillStyle = s.alive ? "#35586b" : "#3d4658";
   for (const hx of [-46, 46]) {
     ctx.beginPath();
     ctx.arc(hx, -28, 5, 0, 2 * Math.PI);
@@ -1242,7 +1260,7 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   ctx.fill();
   ctx.restore();
   ctx.lineCap = "butt";
-  ctx.fillStyle = "#5b6878";
+  ctx.fillStyle = "#3d5a70";
   ctx.fillText("YOKE", yx - 14, yy + 58);
   ctx.fillText(inElev >= 0 ? "PULL" : "PUSH", yx + 26, yy + pull - 4);
 
@@ -1252,7 +1270,7 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
     const forward = (inRud > 0 && side > 0) || (inRud < 0 && side < 0);
     const disp = forward ? -press : (inRud !== 0 ? press * 0.35 : 0);
     const engaged = (inRud > 0 && side > 0) || (inRud < 0 && side < 0);
-    ctx.fillStyle = engaged ? "#ff8c3a" : "#3a4258";
+    ctx.fillStyle = engaged ? "#ff8c3a" : "#14283a";
     ctx.fillRect(rx + side * 34 - 9, ry + disp - 16, 18, 30);
   }
   ctx.strokeStyle = "#232b3d";
@@ -1261,7 +1279,7 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   ctx.moveTo(rx - 62, ry); ctx.lineTo(rx + 62, ry);
   ctx.stroke();
   ctx.setLineDash([]);
-  ctx.fillStyle = "#5b6878";
+  ctx.fillStyle = "#3d5a70";
   ctx.fillText("L", rx - 66, ry + 3);
   ctx.fillText("R", rx + 62, ry + 3);
   ctx.fillText("RUDDER", rx - 21, ry + 28);
@@ -1280,29 +1298,29 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
     const r = Math.round(70 + (255 - 70) * t);
     const g = Math.round(210 + (70 - 210) * t);
     const b = Math.round(90 + (60 - 90) * t);
-    ctx.fillStyle = lit ? `rgb(${r},${g},${b})` : "#2a3242";
+    ctx.fillStyle = lit ? `rgb(${r},${g},${b})` : "#0c1a26";
     ctx.fillRect(tx - canW / 2 + 2, tyTop + canH - 2 - (i + 1) * barH + 1,
                  canW - 4, Math.max(1.0, barH - 1.5));
   }
-  ctx.strokeStyle = "#3a4258";
+  ctx.strokeStyle = "#14283a";
   ctx.strokeRect(tx - canW / 2 + 0.5, tyTop + 0.5, canW - 1, canH - 1);
-  ctx.fillStyle = "#5b6878";
+  ctx.fillStyle = "#3d5a70";
   ctx.fillText("THROTTLE", tx - 27, tyBot + 16);
-  ctx.fillStyle = "#c9d4e3";
+  ctx.fillStyle = "#d0ecff";
   ctx.fillText(`${Math.round(th * 100)}%`, tx - 10, tyBot + 28);
 
   // --- engine: the RPM lives here, beside the throttle can ---------------
-  ctx.fillStyle = "#8b96ab";
+  ctx.fillStyle = "#35586b";
   ctx.fillText("RPM", tx + 20, tyTop + 6);
-  ctx.fillStyle = rpmOf(inThr) > 2450 ? "#ff6a5a" : "#7dff8e";
-  ctx.font = "bold 13px ui-monospace, monospace";
+  ctx.fillStyle = rpmOf(inThr) > 2450 ? "#ff6a5a" : "#35d0ff";
+  ctx.font = "bold 15px Rajdhani, 'SF Mono', monospace";
   ctx.fillText(rpmOf(inThr).toFixed(0), tx + 20, tyTop + 20);
 
   // the control state readout, bottom right — what the selected
   // aircraft is actually holding (the machine's own truth)
   ctx.textAlign = "right";
-  ctx.fillStyle = "#8b96ab";
-  ctx.font = "9px ui-monospace, monospace";
+  ctx.fillStyle = "#35586b";
+  ctx.font = "11px Rajdhani, 'SF Mono', monospace";
   ctx.fillText(`CTL A ${inAil >= 0 ? "+" : ""}${inAil.toFixed(2)}` +
               ` E ${inElev >= 0 ? "+" : ""}${inElev.toFixed(2)}` +
               ` R ${inRud >= 0 ? "+" : ""}${inRud.toFixed(2)}` +
@@ -1313,7 +1331,7 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
     ctx.fillStyle = "rgba(255,58,48,0.16)";
     ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = "#ff4a3a";
-    ctx.font = "bold 11px ui-monospace, monospace";
+    ctx.font = "bold 13px Rajdhani, 'SF Mono', monospace";
     ctx.textAlign = "center";
     ctx.fillText("CONTROLS FROZEN", W / 2, H - 10);
     ctx.textAlign = "left";

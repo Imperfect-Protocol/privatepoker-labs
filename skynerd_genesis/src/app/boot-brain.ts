@@ -260,7 +260,7 @@ export function drawBrainView(canvas: HTMLCanvasElement, time: number,
     const [from, to] = SYNAPSES[s];
     const a = centres[from];
     const b = centres[to];
-    ctx.strokeStyle = "rgba(90, 110, 150, 0.35)";
+    ctx.strokeStyle = "rgba(40, 90, 120, 0.4)";
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(a.x, a.y);
@@ -281,14 +281,14 @@ export function drawBrainView(canvas: HTMLCanvasElement, time: number,
   }
 
   // the cubes + their labels (the name, then the dimensions below it)
-  ctx.font = "10px ui-monospace, monospace";
+  ctx.font = "12px Rajdhani, 'SF Mono', monospace";
   ctx.textAlign = "center";
   for (const centre of centres) {
     drawCube(ctx, centre.x, centre.y, size, rotY, tilt,
              centre.spot.rgb, fillOf(counts[centre.spot.key]));
-    ctx.fillStyle = "rgba(210, 220, 236, 0.95)";
+    ctx.fillStyle = "rgba(200, 235, 255, 0.95)";
     ctx.fillText(centre.spot.name, centre.x, centre.y + size + 18.0);
-    ctx.fillStyle = "rgba(139, 150, 171, 0.85)";
+    ctx.fillStyle = "rgba(70, 115, 140, 0.9)";
     ctx.fillText(centre.spot.dims, centre.x, centre.y + size + 32.0);
   }
 }

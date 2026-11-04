@@ -289,11 +289,6 @@ export function classifyFlight(vsi: number, _asi: number, pitch: number,
  *  right) x rudder (left / neutral / right) x throttle (idle / low /
  *  cruise / high / full). */
 export const CONTROLS_CLASS_AXIS = 4 * 3 * 3 * 5;
-export const CONTROLS_CLASSES_SAMPLE: readonly string[] = [
-  "pushing down, ailerons neutral, throttle cruise",
-  "pulling up high, ailerons left, throttle full",
-  "near trim, ailerons neutral, throttle cruise",
-];
 /** The controls teacher: [ail, elev, rud, thr] stop levels -> the
  *  packed class. */
 export function classifyControls(ail: number, elev: number, rud: number,
@@ -304,6 +299,59 @@ export function classifyControls(ail: number, elev: number, rud: number,
   const thrCoarse = thr <= 1 ? 0 : thr <= 3 ? 1 : thr === 4 ? 2
                   : thr === 5 ? 3 : 4;
   return elevCoarse * 45 + ailCoarse * 15 + rudCoarse * 5 + thrCoarse;
+}
+
+// --- THE CLASS LABELS — each class vocabulary, in pilot's words (the
+// AI state log's columns read these) ---------------------------------------
+
+/** The altitude bands' names, bin -> band text. */
+const ALT_BANDS: readonly string[] = [
+  "under 500 ft", "500-1000 ft", "1000-2000 ft", "2000-3000 ft",
+  "3000-4000 ft", "4000-5000 ft", "5000-6000 ft", "above 6000 ft",
+];
+
+/** A location class, decoded: "3000-4000 ft · heading 15°L". The
+ *  heading is the SIGNED 15-degree circle (bin 12 = on course). */
+export function labelLocationClass(cls: number): string {
+  const altBin = Math.floor(cls / 24);
+  const hsiBin = cls % 24;
+  const off = (hsiBin - 12) * 15;   // signed degrees off course
+  const heading = off === 0 ? "on course"
+    : `${Math.abs(off)}\u00b0${off < 0 ? "L" : "R"}`;
+  return `${ALT_BANDS[Math.min(altBin, 7)]} \u00b7 ${heading}`;
+}
+
+/** An energy class, by name (the 16-class vocabulary). */
+export function labelEnergyClass(cls: number): string {
+  return ENERGY_CLASSES[Math.min(Math.max(cls, 0), 15)];
+}
+
+/** A flight class, by name (the 16-class vocabulary). */
+export function labelFlightClass(cls: number): string {
+  return FLIGHT_CLASSES[Math.min(Math.max(cls, 0), 15)];
+}
+
+const ELEV_COARSE_NAMES: readonly string[] =
+  ["pushing down", "near trim", "pulling up", "pulling up high"];
+const AIL_COARSE_NAMES: readonly string[] =
+  ["ailerons left low", "ailerons neutral", "ailerons right low"];
+const RUD_COARSE_NAMES: readonly string[] =
+  ["rudder left", "rudder neutral", "rudder right"];
+const THR_COARSE_NAMES: readonly string[] =
+  ["throttle idle", "throttle low", "throttle cruise", "throttle high",
+   "throttle full"];
+
+/** A controls class, decoded: "pulling up high · ailerons left low ·
+ *  rudder neutral · throttle cruise". */
+export function labelControlsClass(cls: number): string {
+  const elevCoarse = Math.floor(cls / 45);
+  const ailCoarse = Math.floor(cls / 15) % 3;
+  const rudCoarse = Math.floor(cls / 5) % 3;
+  const thrCoarse = cls % 5;
+  return `${ELEV_COARSE_NAMES[Math.min(elevCoarse, 3)]}` +
+    ` \u00b7 ${AIL_COARSE_NAMES[ailCoarse]}` +
+    ` \u00b7 ${RUD_COARSE_NAMES[rudCoarse]}` +
+    ` \u00b7 ${THR_COARSE_NAMES[thrCoarse]}`;
 }
 
 /**

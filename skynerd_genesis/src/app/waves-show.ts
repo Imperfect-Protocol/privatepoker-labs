@@ -21,8 +21,11 @@ import { Vec3 } from "../core/vec.js";
 import { Flock } from "../learning/flock.js";
 import { FlightInstruments, EpisodeOutcome } from "../learning/instruments.js";
 import { TRIM_SPEED, LiveEpisode } from "../learning/flight.js";
-import { ServoPolicy, type BrainSnapshot } from "../learning/servo-tensor.js";
+import { ServoPolicy, type BrainSnapshot, type TensorStateView } from "../learning/servo-tensor.js";
 import { Scene, type SceneAircraft } from "./scene.js";
+import {
+  hudDelta, readoutOf, meanReadoutOf, type HudDelta,
+} from "./hud-delta.js";
 
 /** The carpet's shape: 8 drones per line, 5 % exploration, no hazard. */
 export const WAVE_SIZE = 8;
@@ -104,6 +107,57 @@ export class WavesShow {
   }
   get obituaries(): number {
     return this.flock.obituariesHeard;
+  }
+
+  /** THE AI STATE LOG's subject: the selected drone's tensor network
+   *  view (whichever aircraft the panel shows; null while none fly). */
+  get selectedStateView(): TensorStateView | null {
+    const current = this.scene.current;
+    if (current === null) {
+      return null;
+    }
+    const drone = this.drones.find((d) => d.entry === current
+                                    && d.flight.episodeOutcome === null);
+    return drone === undefined ? null : drone.flight.stateView();
+  }
+
+  /** The AI log's delta column: the selected drone against the MEAN of
+   *  the drone carpet (the swarm's centre of mass, in pilot's units;
+   *  empty when the selected aircraft is not a flying drone). */
+  get carpetDelta(): HudDelta | null {
+    const current = this.scene.current;
+    if (current === null) {
+      return null;
+    }
+    const drone = this.drones.find((d) => d.entry === current
+                                    && d.flight.episodeOutcome === null);
+    if (drone === undefined || this.aliveCount < 2) {
+      return null;
+    }
+    const carpet = meanReadoutOf(this.drones
+      .filter((d) => d.flight.episodeOutcome === null)
+      .map((d) => d.entry.aircraft));
+    if (carpet === null) {
+      return null;
+    }
+    return hudDelta(readoutOf(drone.entry.aircraft), carpet);
+  }
+
+  /** The wiki tab's scenario description (the waves). */
+  get wiki(): {
+    title: string; goal: string;
+    elements: readonly string[]; goals: readonly string[];
+  } {
+    return {
+      title: "drone attack waves",
+      goal: "the swarm keeps flying: every drone that dies screams its " +
+            "memory to the flock, and every newborn inherits the boot-" +
+            "trained brain plus the living mosaic",
+      elements: ["free flight"],
+      goals: ["survive (never expire: a drone flies until it crashes)",
+              "stay inside the world's bounds",
+              "keep the swarm's memory alive (the obituaries heard)"],
+    };
   }
 
   /** The swarm's mesh: every live pair within LINK_RANGE. */

@@ -87,6 +87,8 @@ import {
   SITUATION_AXIS,
   LOC_CLASS_AXIS, ENERGY_CLASS_AXIS, FLIGHT_CLASS_AXIS, CONTROLS_CLASS_AXIS,
   classifyLocation, classifyEnergy, classifyFlight, classifyControls,
+  labelLocationClass, labelEnergyClass, labelFlightClass, labelControlsClass,
+  levelValue,
   stopCount,
   type SenseReading,
 } from "./instruments.js";
@@ -734,7 +736,7 @@ export class ServoPolicy {
     ServoPolicy.OPTION_BASE[4];
 
   /** The option index of a (channel, level) decision. */
-  private static optionOf(channel: number, level: number): number {
+  static optionOf(channel: number, level: number): number {
     return ServoPolicy.OPTION_BASE[channel] + level;
   }
 
@@ -761,7 +763,7 @@ export class ServoPolicy {
   }
 
   /** Which levers a decision moved (or the hold-all slot). */
-  private static changedChannels(actions: ArrayLike<number>):
+  static changedChannels(actions: ArrayLike<number>):
       Array<[number, number]> {
     const changed: Array<[number, number]> = [];
     for (let channel = 0; channel < 4; channel++) {
@@ -999,7 +1001,8 @@ export class ServoPolicy {
         const key = tensor.keyOf(index);
         const prefix = key.slice(0, key.length - tailLen);
         const tail = toOption
-          ? ServoPolicy.optionOf(key[key.length - 2], key[key.length - 1])
+          ? (key[key.length - 2] === HOLD_ALL_CHANNEL ? 0
+             : ServoPolicy.optionOf(key[key.length - 2], key[key.length - 1]))
           : key[key.length - 1];
         const gid = prefix.join(",");
         let g = groups.get(gid);
@@ -1265,6 +1268,88 @@ function firedWeight(node: TensorNode): number {
   return node.reward;
 }
 
+// --- THE UI's STATE VIEW (the AI state log's columns) ----------------------
+
+/** One dominant classification: its label and its % belonging (the
+ *  share of the top-5 recall mass; 0 when nothing is learned yet). */
+export interface TensorDominant {
+  readonly label: string;
+  readonly share: number;
+}
+
+/** One sensor tensor's current column: the class it fired, its
+ *  confidence share, and its 5 dominant classifications. */
+export interface TensorSensorView {
+  readonly name: string;
+  /** The class the tensor fired last (its situation signal). */
+  readonly className: string;
+  /** The fired class's share of the top-5 recall mass (0 = the
+   *  tensor has learned nothing here: no % shown). */
+  readonly share: number;
+  /** The 5 most dominant classifications with their % belonging. */
+  readonly dominant: readonly TensorDominant[];
+}
+
+/** The servo tensor's current column: the fired command, the analogue
+ *  lever values, and its 5 dominant options with their %. */
+export interface TensorServoView {
+  /** The fired command, in pilot's words ("elevator +12.5%"). */
+  readonly command: string;
+  /** The servo's 5 dominant options with their % belonging. */
+  readonly dominant: readonly TensorDominant[];
+}
+
+/** The whole network's state, as the UI's AI state log reads it — one
+ *  decision window's snapshot, cheap to compute, never the tensors
+ *  themselves. */
+export interface TensorStateView {
+  /** How many decision windows the flight has flown (the log's tick). */
+  readonly decisionCount: number;
+  readonly goalId: number;
+  readonly elementId: number;
+  /** The situation bus state (the goal tensor's merged input). */
+  readonly situation: number;
+  /** Whether the servo fired this window. */
+  readonly acted: boolean;
+  /** The four sensors' columns: location, energy, flight, controls. */
+  readonly sensors: readonly TensorSensorView[];
+  /** The servo's column. */
+  readonly servo: TensorServoView;
+}
+
+/** The lever names, channel order (aileron, elevator, rudder, throttle). */
+const CHANNEL_NAMES: readonly string[] =
+  ["aileron", "elevator", "rudder", "throttle"];
+
+/** A servo option, in pilot's words: "hold-all" or "elevator +12.5%". */
+function labelServoOption(option: number): string {
+  if (option === 0) {
+    return "hold-all";
+  }
+  const [channel, level] = ServoPolicy.channelLevelOf(option);
+  const [low, high] = SURFACE_LIMITS[channel];
+  const value = levelValue(channel, level);
+  const percent = Math.round(100.0 * (value - low) / (high - low));
+  return `${CHANNEL_NAMES[channel]} ${percent > 50 ? "+" : ""}${percent}%`;
+}
+
+/** The top-5 cells of an axis by recall mass (baseline-subtracted), with
+ *  their % belonging. Empty when nothing is learned. */
+function dominantOf(masses: Array<{ label: string; mass: number }>):
+    readonly TensorDominant[] {
+  const known = masses.filter((m) => m.mass > 1e-6);
+  if (known.length === 0) {
+    return [];
+  }
+  known.sort((a, b) => b.mass - a.mass);
+  const top = known.slice(0, 5);
+  const total = top.reduce((sum, m) => sum + m.mass, 0.0);
+  return top.map((m) => ({
+    label: m.label,
+    share: total > 0.0 ? m.mass / total : 0.0,
+  }));
+}
+
 /**
  * THE TENSOR NETWORK — one per flight, its own clock. The flight
  * steps it once per decision window: the panel pulse goes in, then
@@ -1305,6 +1390,9 @@ export class TensorNetwork {
       Array<readonly number[]> = [[], [], [], []];
   /** The epoch the current teach() pumps fire at. */
   private teachEpoch = 0;
+  /** How many decision windows this flight has flown (the UI log's
+   *  tick: a new row lands when it advances). */
+  private decisionCount = 0;
   /** The cascade's settle horizon, in decision units. The servo sits
    *  TWO stuns downstream (the skill must relax and forward before
    *  the servo can even be stunned), so the horizon must cover the
@@ -1861,6 +1949,7 @@ export class TensorNetwork {
                             sense.controls];   // the panel pulse
     this.firedActions = null;   // a hold is a hold: no stale command
     this.now += 1.0;   // one decision window of network time
+    this.decisionCount += 1;
     const panels: readonly number[][] = [sense.location, sense.energy,
                                           sense.flight, sense.controls];
     for (let s = 0; s < 4; s++) {
@@ -1893,6 +1982,86 @@ export class TensorNetwork {
   /** The intention the network holds now (for narration + grading). */
   get currentElementId(): number {
     return this.elementId;
+  }
+
+  /**
+   * THE UI's STATE VIEW — one decision window's snapshot for the AI
+   *  state log: the goal/element/situation, each sensor's fired class
+   *  with its 5 dominant classifications and their % belonging, and the
+   *  servo's fired command with its 5 dominant options. Never the
+   *  tensors themselves — analogue of what fired, not the memory.
+   */
+  stateView(): TensorStateView {
+    const context = this.context;
+    const widths = [LOC_CLASS_AXIS, ENERGY_CLASS_AXIS, FLIGHT_CLASS_AXIS,
+                    CONTROLS_CLASS_AXIS];
+    const labels = [labelLocationClass, labelEnergyClass, labelFlightClass,
+                    labelControlsClass];
+    const names = ["LocationTensor", "EnergyTensor", "FlightTensor",
+                   "ControlsTensor"];
+    const sensors: TensorSensorView[] = [];
+    for (let i = 0; i < 4; i++) {
+      const tensor = this.policy.sensorTensorOf(i);
+      const key = this.lastSensorKeys[i];
+      const masses: Array<{ label: string; mass: number }> = [];
+      if (key.length > 0) {
+        const buf = [...key, 0];
+        for (let cls = 0; cls < widths[i]; cls++) {
+          buf[buf.length - 1] = cls;
+          masses.push({
+            label: labels[i](cls),
+            mass: Math.max(0.0, tensor.recall(buf) - tensor.baseline),
+          });
+        }
+      }
+      const dominant = dominantOf(masses);
+      const fired = context.signalOf(i);
+      const firedShare = dominant.find((d) =>
+        d.label === labels[i](fired))?.share ?? 0.0;
+      sensors.push({
+        name: names[i],
+        className: labels[i](fired),
+        share: firedShare,
+        dominant,
+      });
+    }
+    // THE SERVO: the fired command and its 5 dominant options.
+    const servoMasses: Array<{ label: string; mass: number }> = [];
+    if (this.firedKey.length > 0) {
+      const key = this.firedKey;
+      servoMasses.push({
+        label: "hold-all",
+        mass: Math.max(0.0, this.policy.servoTensor.recall(
+          [...key, HOLD_ALL_CHANNEL, 0]) - this.policy.servoTensor.baseline),
+      });
+      const buf = [...key, 0, 0];
+      for (let channel = 0; channel < 4; channel++) {
+        buf[buf.length - 2] = channel;
+        for (let level = 0; level < stopCount(channel); level++) {
+          buf[buf.length - 1] = level;
+          servoMasses.push({
+            label: labelServoOption(
+              ServoPolicy.optionOf(channel, level)),
+            mass: Math.max(0.0, this.policy.servoTensor.recall(buf)
+                           - this.policy.servoTensor.baseline),
+          });
+        }
+      }
+    }
+    const actions = this.firedActions;
+    let command = "hold";
+    if (actions !== null) {
+      command = labelServoOption(ServoPolicy.optionOfActions(actions));
+    }
+    return {
+      decisionCount: this.decisionCount,
+      goalId: this.goalId,
+      elementId: this.elementId,
+      situation: this.busOf(context.signals),
+      acted: actions !== null,
+      sensors,
+      servo: { command, dominant: dominantOf(servoMasses) },
+    };
   }
 
   /** The situation bus state: the four sensors' codes, merged. */
