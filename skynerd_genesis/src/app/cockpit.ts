@@ -29,7 +29,8 @@
  */
 import { mphOf, vsHundredsOf, altFtOf, rpmOf } from "./units.js";
 import { Ground } from "./ground.js";
-import { Flora, hash01, type TreeSpot, type HouseSpot, type CloudSpot } from "./land.js";
+import { Flora, hash01, SUN_DIR,
+         type TreeSpot, type HouseSpot, type CloudSpot } from "./land.js";
 import type { SceneAircraft } from "./scene.js";
 import { levelOf } from "../learning/instruments.js";
 
@@ -102,13 +103,8 @@ const FOV_H = (90 * Math.PI) / 180; // the windshield's horizontal field of view
 const SKY_ZENITH: readonly [number, number, number] = [30, 46, 84];
 const SKY_FOG: readonly [number, number, number] = [184, 200, 214];
 const SKY_GRAD_SIN = 0.35;         // sin(elevation) where the sky is fully zenith
-/** The sun's fixed world direction — the same light the shadows obey
- *  (they fall toward +x/+y): azimuth ~200°, elevation ~20°. */
-const SUN_DIR: readonly [number, number, number] = (() => {
-  const v = [-0.88, -0.32, 0.35];
-  const l = Math.hypot(v[0], v[1], v[2]);
-  return [v[0] / l, v[1] / l, v[2] / l];
-})();
+/** The sun's screen constants — its world direction (SUN_DIR) is the
+ *  land's own light, shared with the terrain's relief shading. */
 const SUN_ANG = 0.035;             // the disc's angular radius, rad (~2°)
 const SUN_GLOW = 9.0;              // the glow's radius, in discs
 const GLARE_STRENGTH = 0.42;       // the veil's peak alpha, facing the sun
@@ -368,15 +364,18 @@ const flora = new Flora(ground.land);
  *  cruise. */
 function pushTower(objects: WorldObject[], cam: Camera): void {
   const TW = { x: 260.0, y: -95.0, base: 6.0, h: 26.0 };   // world metres
+  const TWz = ground.heightAt(TW.x, TW.y);  // planted on the terrain
   const centreDepth = (TW.x - cam.px) * cam.fx + (TW.y - cam.py) * cam.fy
-    + (0.0 - cam.pz) * cam.fz;
+    + (TWz - cam.pz) * cam.fz;
   if (centreDepth < 30.0) {
     return;                                  // behind or beside us
   }
   objects.push({
     depth: centreDepth,
     shadow: (ctx, cam2) => {
-      const pS = projectPoint(cam2, TW.x + TW.h * 0.7, TW.y + TW.base, 0.0);
+      const sx = TW.x + TW.h * 0.7;
+      const sy = TW.y + TW.base;
+      const pS = projectPoint(cam2, sx, sy, ground.heightAt(sx, sy));
       if (pS === null) {
         return;
       }
@@ -401,7 +400,7 @@ function pushTower(objects: WorldObject[], cam: Camera): void {
         ctx.fill();
       };
       const p = (ox: number, oz: number): [number, number] | null =>
-        projectPoint(cam2, TW.x + ox, TW.y, oz);
+        projectPoint(cam2, TW.x + ox, TW.y, TWz + oz);
       quad([p(-TW.base, 0.0), p(TW.base, 0.0), p(TW.base * 0.6, TW.h),
             p(-TW.base * 0.6, TW.h)], "#35586b");
       quad([p(-TW.base * 0.9, TW.h), p(TW.base * 0.9, TW.h),
@@ -418,12 +417,13 @@ function pushTower(objects: WorldObject[], cam: Camera): void {
  *  the ground. Sub-pixel trees are skipped: the forest tiles' mottled
  *  texture carries them from altitude. */
 function pushTree(objects: WorldObject[], cam: Camera, t: TreeSpot): void {
-  const pB = projectPoint(cam, t.x, t.y, 0.0);
+  const bz = ground.heightAt(t.x, t.y);     // planted on the terrain
+  const pB = projectPoint(cam, t.x, t.y, bz);
   if (pB === null) {
     return;
   }
   const depth = (t.x - cam.px) * cam.fx + (t.y - cam.py) * cam.fy
-              + (0.0 - cam.pz) * cam.fz;
+              + (bz - cam.pz) * cam.fz;
   if (depth < 3.0) {
     return;
   }
@@ -434,7 +434,7 @@ function pushTree(objects: WorldObject[], cam: Camera, t: TreeSpot): void {
   // The top can clip behind the near plane while the base does not when
   // the camera is pitched hard (the stall-recovery dive): the projection
   // returns null and the tree is simply not drawn.
-  const pT = projectPoint(cam, t.x, t.y, t.h);
+  const pT = projectPoint(cam, t.x, t.y, bz + t.h);
   if (pT === null) {
     return;
   }
@@ -452,7 +452,9 @@ function pushTree(objects: WorldObject[], cam: Camera, t: TreeSpot): void {
   objects.push({
     depth,
     shadow: (ctx, cam2) => {
-      const pS = projectPoint(cam2, t.x + t.h * 0.6, t.y + t.h * 0.15, 0.0);
+      const sx = t.x + t.h * 0.6;
+      const sy = t.y + t.h * 0.15;
+      const pS = projectPoint(cam2, sx, sy, ground.heightAt(sx, sy));
       if (pS === null) {
         return;
       }
@@ -492,12 +494,19 @@ const shadeOf = (base: readonly [number, number, number], f: number): string =>
  *  and shaded by its orientation, drawn far face first (painter's
  *  algorithm within the object). */
 function pushHouse(objects: WorldObject[], cam: Camera, h: HouseSpot): void {
+  const x0 = h.x - h.w / 2, x1 = h.x + h.w / 2;
+  const y0 = h.y - h.d / 2, y1 = h.y + h.d / 2;
+  // the foundation conforms: each corner planted at its own terrain
+  // height, the walls rising from the ground it stands on
+  const gz = [ground.heightAt(x0, y0), ground.heightAt(x1, y0),
+              ground.heightAt(x1, y1), ground.heightAt(x0, y1)];
+  const bz = ground.heightAt(h.x, h.y);
   const depth = (h.x - cam.px) * cam.fx + (h.y - cam.py) * cam.fy
-              + (0.0 - cam.pz) * cam.fz;
+              + (bz - cam.pz) * cam.fz;
   if (depth < 8.0) {
     return;
   }
-  const pC = projectPoint(cam, h.x, h.y, 0.0);
+  const pC = projectPoint(cam, h.x, h.y, bz);
   if (pC === null) {
     return;
   }
@@ -506,14 +515,14 @@ function pushHouse(objects: WorldObject[], cam: Camera, h: HouseSpot): void {
       || pC[1] < -extent || pC[1] > cam.H + extent) {
     return;                                  // off the windshield
   }
-  const x0 = h.x - h.w / 2, x1 = h.x + h.w / 2;
-  const y0 = h.y - h.d / 2, y1 = h.y + h.d / 2;
   const p = (x: number, y: number, z: number): [number, number] =>
     projectPoint(cam, x, y, z) ?? [0.0, 0.0];
-  const g: [number, number][] = [p(x0, y0, 0.0), p(x1, y0, 0.0),
-                                p(x1, y1, 0.0), p(x0, y1, 0.0)];
-  const e: [number, number][] = [p(x0, y0, h.wallH), p(x1, y0, h.wallH),
-                                 p(x1, y1, h.wallH), p(x0, y1, h.wallH)];
+  const g: [number, number][] = [p(x0, y0, gz[0]), p(x1, y0, gz[1]),
+                                p(x1, y1, gz[2]), p(x0, y1, gz[3])];
+  const e: [number, number][] = [p(x0, y0, gz[0] + h.wallH),
+                                 p(x1, y0, gz[1] + h.wallH),
+                                 p(x1, y1, gz[2] + h.wallH),
+                                 p(x0, y1, gz[3] + h.wallH)];
   const faceDepth = (x: number, y: number, z: number): number =>
     (x - cam.px) * cam.fx + (y - cam.py) * cam.fy + (z - cam.pz) * cam.fz;
   interface Face { depth: number; pts: [number, number][]; colour: string; }
@@ -527,28 +536,28 @@ function pushHouse(objects: WorldObject[], cam: Camera, h: HouseSpot): void {
                pts: [g[0], g[1], e[1], e[0]], colour: shadeOf(WALL, 0.9) });
   faces.push({ depth: faceDepth(h.x, y1, h.wallH / 2),
                pts: [g[3], g[2], e[2], e[3]], colour: shadeOf(WALL, 0.8) });
-  const top = h.wallH + h.roofH;
+  const ridgeZ = bz + h.wallH + h.roofH;   // the ridge axis, for sorting
   if (h.along === "x") {
-    const r0 = p(x0, h.y, top);
-    const r1 = p(x1, h.y, top);
-    faces.push({ depth: faceDepth(h.x, y0, top),
+    const r0 = p(x0, h.y, ground.heightAt(x0, h.y) + h.wallH + h.roofH);
+    const r1 = p(x1, h.y, ground.heightAt(x1, h.y) + h.wallH + h.roofH);
+    faces.push({ depth: faceDepth(h.x, y0, ridgeZ),
                  pts: [e[0], e[1], r1, r0], colour: shadeOf(ROOF, 1.0) });
-    faces.push({ depth: faceDepth(h.x, y1, top),
+    faces.push({ depth: faceDepth(h.x, y1, ridgeZ),
                  pts: [e[3], e[2], r1, r0], colour: shadeOf(ROOF, 0.72) });
-    faces.push({ depth: faceDepth(x0, h.y, top),
+    faces.push({ depth: faceDepth(x0, h.y, ridgeZ),
                  pts: [e[0], e[3], r0], colour: shadeOf(WALL, 1.0) });
-    faces.push({ depth: faceDepth(x1, h.y, top),
+    faces.push({ depth: faceDepth(x1, h.y, ridgeZ),
                  pts: [e[1], e[2], r1], colour: shadeOf(WALL, 0.72) });
   } else {
-    const r0 = p(h.x, y0, top);
-    const r1 = p(h.x, y1, top);
-    faces.push({ depth: faceDepth(x0, h.y, top),
+    const r0 = p(h.x, y0, ground.heightAt(h.x, y0) + h.wallH + h.roofH);
+    const r1 = p(h.x, y1, ground.heightAt(h.x, y1) + h.wallH + h.roofH);
+    faces.push({ depth: faceDepth(x0, h.y, ridgeZ),
                  pts: [e[0], e[3], r1, r0], colour: shadeOf(ROOF, 1.0) });
-    faces.push({ depth: faceDepth(x1, h.y, top),
+    faces.push({ depth: faceDepth(x1, h.y, ridgeZ),
                  pts: [e[1], e[2], r1, r0], colour: shadeOf(ROOF, 0.72) });
-    faces.push({ depth: faceDepth(h.x, y0, top),
+    faces.push({ depth: faceDepth(h.x, y0, ridgeZ),
                  pts: [e[0], e[1], r0], colour: shadeOf(WALL, 0.9) });
-    faces.push({ depth: faceDepth(h.x, y1, top),
+    faces.push({ depth: faceDepth(h.x, y1, ridgeZ),
                  pts: [e[3], e[2], r1], colour: shadeOf(WALL, 0.8) });
   }
   faces.sort((a, b) => b.depth - a.depth);

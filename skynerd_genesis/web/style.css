@@ -37,14 +37,15 @@ body {
 #app {
   height: 100%;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  /* the main view and the bottom panel hold a fixed 70:30 split of the
-   * space below the toolbar, whatever the window's height */
-  grid-template-rows: auto minmax(0, 70fr) minmax(0, 30fr);
+  /* the two grips are their own thin tracks, so they stay grabbable
+   * even when the panel they resize is hidden (its track collapses) */
+  grid-template-columns: minmax(0, 1fr) 7px auto;
+  grid-template-rows: auto minmax(0, 1fr) 7px auto;
   grid-template-areas:
-    "toolbar toolbar"
-    "main sidebar"
-    "bottom bottom";
+    "toolbar toolbar toolbar"
+    "main sidegrip sidebar"
+    "bottomgrip bottomgrip bottomgrip"
+    "bottom bottom bottom";
 }
 
 /* --- toolbar (top edge, full width) --------------------------------------- */
@@ -112,7 +113,8 @@ label select { text-transform: none; }
 #narration.stage-demo { color: var(--accent); }
 #narration.stage-repeat { color: #7fdcff; }
 #narration.stage-waves { color: var(--amber); }
-#sky {
+#narration.stage-flight { color: #7fdcff; }
+#narration.stage-hold { color: var(--dim); }#sky {
   flex: 1;
   min-height: 0;
   width: 100%;
@@ -140,9 +142,10 @@ label select { text-transform: none; }
   gap: 8px;
   padding: 10px;
   background: var(--panel);
-  border-left: 1px solid var(--line);
   overflow: hidden;         /* the panels size themselves; nothing spills */
 }
+/* dragged shut by the grip: a zero-width column with no padding sliver */
+#cockpit.collapsed { padding-left: 0; padding-right: 0; }
 .cockpit-head {
   display: flex;
   justify-content: space-between;
@@ -156,6 +159,7 @@ label select { text-transform: none; }
 #cockpitCanvas,
 #controlsCanvas {
   display: block;
+  margin-inline: auto;      /* centered when the grip made the column wide */
   background: #03060b;
   border: 1px solid var(--line);
   border-radius: 0;
@@ -171,9 +175,30 @@ label select { text-transform: none; }
   overflow: auto;          /* the row's height IS the panel's height */
   padding: 8px 12px;
   background: var(--panel);
-  border-top: 1px solid var(--line);
 }
 #results[hidden] { display: none; }
+
+/* --- the resize grips ---------------------------------------------------
+ * Thin always-present tracks between the regions: grab and drag to
+ * resize the bottom panel's height and the sidebar's width. The line
+ * brightens on hover and while dragging (the accent). */
+.grip {
+  position: relative;
+  background: transparent;
+  touch-action: none;       /* a drag resizes; it never scrolls */
+  user-select: none;
+}
+.grip::after {
+  content: "";
+  position: absolute;
+  background: var(--line);
+}
+.grip:hover::after, .grip.dragging::after { background: var(--accent); }
+.grip.dragging { background: rgba(255,140,58,0.08); }
+#bottomGrip { grid-area: bottomgrip; cursor: row-resize; }
+#bottomGrip::after { left: 25%; right: 25%; top: 3px; height: 1px; }
+#sideGrip { grid-area: sidegrip; cursor: col-resize; }
+#sideGrip::after { top: 25%; bottom: 25%; left: 3px; width: 1px; }
 
 /* --- the tab group (the bottom panel's two faces) --------------------------- */
 .tab-head {

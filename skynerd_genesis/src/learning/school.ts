@@ -1,10 +1,11 @@
 /**
- * One tick of the shared machine: the physics, the runway pin, the
- * cursor's advance, the ground check. Returns whether this
- * aircraft is still flying (false = grounded, or its plan
+ * One tick of the shared machine: the physics, the gear's wheels, the
+ * runway pin, the cursor's advance, the ground check. Returns whether
+ * this aircraft is still flying (false = grounded, or its plan
  * complete). Used for the flight's own aircraft AND the shadow
  * instructor's twin.
  */
+const GEAR = new GearContact();
 function stepMachine(school: FlightSchool, aircraft: Aircraft,
                      cursor: PhaseCursor, commands: Float64Array): boolean {
   aircraft.command(commands, school.dt);
@@ -13,9 +14,10 @@ function stepMachine(school: FlightSchool, aircraft: Aircraft,
     - school.world.terrainHeight(aircraft.body.position.x,
                                   aircraft.body.position.y);
   aircraft.step(school.dt, agl);
+  GEAR.apply(aircraft.body, agl, school.dt);
   const phase = cursor.current;
   if (phase.pin === true) {
-    // The runway: hold the aircraft at 10 ft while it cannot fly (vz
+    // The runway: hold the aircraft at 100 ft while it cannot fly (vz
     // would go negative) — the takeoff roll, and the sag after rotation
     // until the wing carries it. It unpins itself the moment it flies.
     if (aircraft.body.position.z < SYLLABUS.runwayM + 0.001) {
@@ -143,12 +145,19 @@ import { RigidBody } from "../physics/rigid-body.js";
 import { SurfacesState, SURFACE_LIMITS } from "../physics/surfaces.js";
 import { AeroTables, RHO_SEA_LEVEL } from "../physics/aero.js";
 import { Aircraft } from "../physics/aircraft.js";
+import { GearContact } from "../physics/gear.js";
 import { FlightInstruments, type SenseReading } from "./instruments.js";
 import {
   ServoPolicy, TensorNetwork, TensorContext, PULSE_EVERY,
   ACTION_HOLD, ACTION_DELTA, type TensorStateView,
 } from "./servo-tensor.js";
 import { levelOf } from "./instruments.js";
+import { ControlMode } from "./guardian.js";
+import {
+  AIPilot, AIGuidedInstructorPilot, AIPilotWithInstructor,
+  InstructorHand, InstructorPilot,
+  type Pilot, type PilotSighting,
+} from "./pilot.js";
 import { TRIM_SPEED, TRIM_COMMAND, springStickTowardNeutral } from "./flight.js";
 
 // Desire slots the school names in the will. After a lesson, waking that
@@ -230,7 +239,10 @@ export const SYLLABUS = {
   stallEntryMps: 51.0 / 2.23694,    // decelerate through 51 mph
   diveOutMps: 65.0 / 2.23694,       // 65 mph
   spinPullUpMps: 60.0 / 2.23694,    // 60 mph
-  runwayM: 10.0 / 3.28084,          // 10 ft
+  runwayM: 100.0 / 3.28084,         // 100 ft — the takeoff datum: the wheels
+                                   // on the 95 ft runway (the physics world's
+                                   // AIRFIELD plateau) + 5 ft of landing gear;
+                                   // standing, the instruments read 100 ft
   liftOffToM: 100.0 / 3.28084,      // 100 ft AGL — hold the pull through ground effect
   climbToM: 1000.0 / 3.28084,       // 1000 ft
   stallAltM: 3000.0 / 3.28084,      // 3000 ft
@@ -597,43 +609,6 @@ export abstract class FlightElement {
   }
 }
 
-/**
- * The instructor's hand: eases commanded deflections toward the raw phase
- * targets at bounded rates. All inputs on the flight controls are smooth —
- * the yoke never jumps, even when a phase changes the law underneath.
- */
-export class InstructorHand {
-  readonly commands: Float64Array;
-  /**
-   * Per-channel easing rates: the instructor demonstrates at the
-   * STUDENT'S hand speed — one ACTION_DELTA per decision tick window
-   * (0.05 rad per 0.2 s = 0.25/s). A faster hand carves a pull the
-   * student's ±0.05/decision vocabulary cannot track: the demo's
-   * stamps land on a path through (reading, yoke) space the student
-   * physically cannot follow, and every replay diverges from the
-   * lesson it was shown. The instructor shows the maneuver the way a
-   * student's hands can fly it.
-   */
-  private static readonly RATES = [
-    ACTION_DELTA * 5.0, ACTION_DELTA * 5.0, ACTION_DELTA * 5.0,
-    ACTION_DELTA * 5.0,
-  ];
-
-  constructor(commands: ArrayLike<number> = TRIM_COMMAND) {
-    this.commands = Float64Array.from(commands);
-  }
-
-  /** One tick of easing toward the raw targets. */
-  easeToward(targets: ArrayLike<number>, dt: number): Float64Array {
-    for (let channel = 0; channel < 4; channel++) {
-      const rate = InstructorHand.RATES[channel] * dt;
-      const delta = clamp(targets[channel] - this.commands[channel], rate);
-      this.commands[channel] += delta;
-    }
-    return this.commands;
-  }
-}
-
 /** Tracks which phase a flight is in and what it has accumulated there. */
 export class PhaseCursor {
   index = 0;
@@ -909,6 +884,7 @@ abstract class ClassroomFlight implements Stepper {
     }
     return true;
   }
+
 }
 
 /** The instructor demonstrates the lesson once; stamps land per phase. */
@@ -1801,7 +1777,168 @@ export class ShadowFlight extends ExamFlight {
   }
 }
 
-/** The lesson's known goals: judges in curriculum order, with weights. */
+/**
+ * THE SOLO FLIGHT — the classroom's ONE aircraft, with the controls
+ * dropdown deciding whose hands are on its levers (the sticky per-
+ * aircraft choice, switchable any tick):
+ *
+ *   ai            — the AI flies (the exam's own path);
+ *   instructor    — the instructor's hand flies the AI's current
+ *                   intent: the element the AI chose, continued to its
+ *                   completion, then the AI's next intent (the
+ *                   machine's cursor follows the AI's decisions —
+ *                   adoptIntent jumps it forward);
+ *   both-suggest  — the AI suggests (it still decides every window,
+ *                   for its own learning and the state log), the
+ *                   instructor's hand applies the correct controls,
+ *                   and the error wave teaches the AI continuously;
+ *   both-guarded  — the AI flies; the guardian watches; a dangerous
+ *                   state takes the levers (suggest mode while the
+ *                   instructor recovers the machine), a sustained safe
+ *                   stretch hands them back.
+ *
+ * The instructor's TWIN aircraft flies invisibly beside in every mode:
+ * the ideal-path reference (the delta column) and the error wave's
+ * teaching source (exactly the shadow flight's proven pattern). The
+ * network ALWAYS decides — the AI state log stays live whatever is
+ * at the controls.
+ */
+export class SoloFlight extends ExamFlight {
+  private readonly twin: InstructorTwin;
+  private readonly timeEpoch: number;
+  /** THE PILOT AT THE CONTROLS — the polymorphic hand (all mode logic
+   *  lives in the Pilot classes, never here). Swapped whole when the
+   *  controls dropdown changes. */
+  private pilot: Pilot;
+  /** The AI's own hands — also the suggestion engine and the state
+   *  log's subject in every mode. */
+  private readonly ai: AIPilot;
+  private mode: ControlMode;
+
+  constructor(school: FlightSchool, lesson: Lesson, policy: ServoPolicy,
+              rng: NumpyPcg64, timeEpoch: number, mode: ControlMode,
+              twin?: InstructorTwin) {
+    // THE ATTEMPT CAP — the show's safety: an attempt that never
+    // completes (an AI stuck on the runway, a cursor that cannot
+    // advance) ends after 2.2x the demonstration's length, graded
+    // for whatever it earned. The endless classroom never hangs.
+    super(school, lesson, policy, rng,
+          school.demoSeconds(lesson) * 2.2 + 5.0);
+    this.timeEpoch = timeEpoch;
+    this.mode = mode;
+    this.twin = twin ?? new InstructorTwin(lesson);
+    this.ai = new AIPilot(this.network, this.policy, this.rng,
+                          DECISION_EVERY, springStickTowardNeutral);
+    this.pilot = this.pilotFor(mode);
+  }
+
+  /** The pilot for a controls mode — the ONLY place the modes exist.
+   *  A mid-air swap re-seats the instructor's hand from the machine's
+   *  CURRENT lever targets. */
+  private pilotFor(mode: ControlMode, reseat?: {
+    commands: Float64Array; body: RigidBody }): Pilot {
+    const instructor = new InstructorPilot(
+      startCommandsFor(this.lesson.startKind), false);
+    if (reseat !== undefined) {
+      instructor.reseat(reseat.commands, reseat.body);
+    }
+    switch (mode) {
+      case "ai": return this.ai;
+      case "instructor": return instructor;
+      case "both-suggest":
+        return new AIGuidedInstructorPilot(this.ai, instructor);
+      case "both-guarded":
+        return new AIPilotWithInstructor(this.ai, instructor);
+    }
+  }
+
+  /** The controls dropdown: swap the whole pilot — the machine, its
+   *  cursor, and the brain keep running seamlessly through the swap. */
+  set controlsMode(mode: ControlMode) {
+    if (mode === this.mode) {
+      return;
+    }
+    this.mode = mode;
+    this.pilot = this.pilotFor(mode,
+      { commands: this.commandsNow, body: this.body });
+  }
+
+  get controlsMode(): ControlMode {
+    return this.mode;
+  }
+
+  /** The instructor's hand is physically on the levers right now. */
+  get instructorHolds(): boolean {
+    return this.pilot.heldByInstructor;
+  }
+
+  /** The ideal-path reference beside the machine (the delta column). */
+  get twinAircraft(): Aircraft {
+    return this.twin.aircraft;
+  }
+
+  get twinFlying(): boolean {
+    return this.twin.flying;
+  }
+
+  /** The hand at the controls: the AI's decisions while it flies; the
+   *  instructor eases (no discrete decisions) while it holds. */
+  override get handInputs(): HandInputs {
+    return this.pilot.heldByInstructor
+      ? { choices: null, fresh: false }
+      : { choices: this.ai.lastChoices,
+          fresh: this.tick % DECISION_EVERY < DECISION_EVERY / 2 };
+  }
+
+  /** One tick: the pilot produces the control inputs, the machine
+   *  consumes them through its own input method, the twin flies
+   *  beside. No mode branches — the pilot IS the mode. */
+  override step(): boolean {
+    if (this.ended) {
+      return false;
+    }
+    const dt = this.school.dt;
+    const sighting: PilotSighting = {
+      dt,
+      tick: this.tick,
+      body: this.body,
+      groundM: this.school.world.terrainHeight(this.body.position.x,
+                                               this.body.position.y),
+      cursor: this.cursor,
+      sense: this.school.instruments.senseReading(this.body,
+        this.aircraft.surfacePositions, this.lesson.targetBearing),
+      teaching: this.twin.observe(),
+      epoch: this.timeEpoch,
+      goalId: this.lesson.goalId,
+      candidates: this.candidates,
+    };
+    this.commandsNow = this.pilot.step(sighting, this.commandsNow);
+    // The AI's claim drives the grading only — never the machine's
+    // cursor (the instructor flies the TRUE element; the early-yoke
+    // bug was exactly a speculative cursor adoption).
+    const decision = this.ai.lastDecision;
+    if (decision !== null && this.tick % DECISION_EVERY === 0) {
+      if (decision.elementId !== this.chosenElement.elementId) {
+        let index = this.chosenIndex;
+        while (index < this.lesson.phases.length - 1
+               && this.lesson.phases[index].elementId !== decision.elementId) {
+          index += 1;
+        }
+        this.chosenIndex = index;
+      }
+      this.trace.record(this.chosenIndex, this.cursor.readings(this.body));
+    }
+    const twinFlying = this.twin.step(this.school);
+    const machineFlying = this.tickPhysics(this.commandsNow);
+    this.commandsNow = this.pilot.relax(this.commandsNow, dt);
+    if (!machineFlying || !twinFlying) {
+      this.release();
+      return false;
+    }
+    return true;
+  }
+}
+
 export interface LessonGoalSpec {
   readonly goals: readonly ManeuverGoal[];
   /** The phase each goal grades (the judge receives it). */

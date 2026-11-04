@@ -70,6 +70,8 @@ function makeElement(id) {
     dataset: {},
     onclick: null,
     scrollTop: 0,
+    offsetWidth: 100,
+    offsetHeight: 30,
     clientWidth: 100,
     clientHeight: 100,
     classList: {
@@ -89,6 +91,14 @@ function makeElement(id) {
       if (!map[event]) map[event] = [];
       map[event].push(handler);
     },
+    removeEventListener(event, handler) {
+      const list = listeners.get(el)?.[event];
+      if (list) {
+        const i = list.indexOf(handler);
+        if (i >= 0) list.splice(i, 1);
+      }
+    },
+    setPointerCapture() {},
     click() {
       const map = listeners.get(el);
       for (const handler of map?.click ?? []) handler();
@@ -111,6 +121,7 @@ const elements = {
   speed: Object.assign(makeElement("speed"), { value: "1" }),
   scenario: Object.assign(makeElement("scenario"), { value: "takeoff" }),
   aircraft: Object.assign(makeElement("aircraft"), { dataset: {} }),
+  controls: Object.assign(makeElement("controls"), { value: "ai" }),
   next: makeElement("next"),
   results: makeElement("results"),
   restart: makeElement("restart"),
@@ -127,11 +138,14 @@ elements["zoomReset"] = makeElement("zoomReset");
 elements["cockpit-title"] = makeElement("cockpit-title");
 elements["cockpit-foot"] = makeElement("cockpit-foot");
 elements["cockpit-close"] = makeElement("cockpit-close");
+// small canvases headlessly: the world buffer is per-pixel work (and
+// the terrain march is per-pixel too) — the visual gates live in
+// fpm-debug at full size; here the wiring is what is under test
 elements["cockpitCanvas"] = Object.assign(makeElement("cockpitCanvas"), makeCanvas(), {
-  clientWidth: 322, clientHeight: 238,
+  clientWidth: 160, clientHeight: 90,
 });
 elements["controlsCanvas"] = Object.assign(makeElement("controlsCanvas"), makeCanvas(), {
-  clientWidth: 322, clientHeight: 238,
+  clientWidth: 160, clientHeight: 40,
 });
 elements["boot"] = makeElement("boot");
 elements["bootFill"] = makeElement("bootFill");
@@ -141,6 +155,10 @@ elements["bootBrain"] = Object.assign(makeElement("bootBrain"), makeCanvas());
 elements["bootDone"] = makeElement("bootDone");
 elements["tabWiki"] = makeElement("tabWiki");
 elements["tabAi"] = makeElement("tabAi");
+elements["app"] = Object.assign(makeElement("app"), { clientHeight: 900 });
+elements["bar"] = makeElement("bar");
+elements["sideGrip"] = makeElement("sideGrip");
+elements["bottomGrip"] = makeElement("bottomGrip");
 
 globalThis.document = {
   getElementById: (id) => elements[id] ?? null,
@@ -156,6 +174,8 @@ let rafHandler = null;
 globalThis.requestAnimationFrame = (fn) => { rafHandler = fn; return 1; };
 globalThis.window = {
   devicePixelRatio: 1,
+  innerWidth: 1440,
+  innerHeight: 900,
   addEventListener: () => {},
 };
 globalThis.HTMLCanvasElement = class HTMLCanvasElement {};   // instanceof checks
@@ -194,29 +214,40 @@ const lessonCount =
   (elements.scenario.innerHTML.match(/<option/g) ?? []).length - 1;
 const goldenCount = lessonCount;   // the status checks read the curriculum count
 check("boots into the flight school",
-      elements.narration.textContent.startsWith("Instructor demonstrates takeoff"),
+      elements.narration.textContent.startsWith("takeoff") &&
+      elements.narration.textContent.includes("the instructor has the controls"),
       elements.narration.textContent);
 check("the cockpit panel follows the school's aircraft",
-      elements["cockpit-title"].textContent.includes("INSTRUCTOR'S AIRCRAFT"),
+      elements["cockpit-title"].textContent.includes("AIRCRAFT") &&
+      elements["cockpit-title"].textContent.includes("AIRBORNE"),
       elements["cockpit-title"].textContent);
 check("status shows maneuver 1 of the curriculum",
       elements.status.textContent.includes(`maneuver 1/${lessonCount}`),
       elements.status.textContent);
-check("status counts down to the student's launch",
-      elements.status.textContent.includes("student launches in 10 s"),
+check("status names the classroom's default hands (instructor-first)",
+      elements.status.textContent.includes("INSTRUCTOR AT THE CONTROLS"),
       elements.status.textContent);
 
-// the chase: the instructor demonstrates, then the student launches
-// 10 s behind it and flies the same maneuver
-console.log("== the student launches behind the instructor");
-let sawStudentFly = false;
-for (let i = 0; i < 4000 && !sawStudentFly; i++) {
+// the controls dropdown: whose hands are on the ONE aircraft's levers
+elements.controls.value = "ai";
+elements.controls.change();
+stepFrames(3, 60);
+check("the controls dropdown hands the levers to the AI",
+      elements.status.textContent.includes("AI at the controls"),
+      elements.status.textContent);
+elements.controls.value = "instructor";
+elements.controls.change();
+stepFrames(3, 60);
+
+// the endless classroom: the attempt flies until the machine lands or
+// its plan completes, the result holds a moment, the next one begins
+console.log("== the endless classroom (one aircraft, attempt after attempt)");
+let sawFinish = false;
+for (let i = 0; i < 4000 && !sawFinish; i++) {
   stepFrames(1, 60);
-  if (elements.narration.textContent.startsWith("Student flies takeoff")) {
-    sawStudentFly = true;
-  }
+  if (elements.narration.textContent.includes("finished")) sawFinish = true;
 }
-check("the student launches and flies the maneuver", sawStudentFly,
+check("the attempt finishes and the result holds", sawFinish,
       elements.narration.textContent);
 
 // the results panel: the scenario wiki + the golden badge (the
@@ -237,7 +268,8 @@ console.log("== restart");
 elements.restart.click();
 stepFrames(3, 60);
 check("restart replays the takeoff demonstration",
-      elements.narration.textContent.startsWith("Instructor demonstrates takeoff"),
+      elements.narration.textContent.startsWith("takeoff") &&
+      elements.narration.textContent.includes("the instructor has the controls"),
       elements.narration.textContent);
 check("badge cleared on restart", elements.badge.textContent === "");
 
@@ -288,10 +320,11 @@ elements.scenario.value = "takeoff";
 elements.scenario.change();
 stepFrames(3, 60);
 check("returning to school resumes the classroom",
-      elements.narration.textContent.startsWith("Instructor demonstrates takeoff"),
+      elements.narration.textContent.startsWith("takeoff") &&
+      elements.narration.textContent.includes("the instructor has the controls"),
       elements.narration.textContent);
 check("the panel follows the school's aircraft again",
-      elements["cockpit-title"].textContent.includes("INSTRUCTOR'S AIRCRAFT"),
+      elements["cockpit-title"].textContent.includes("AIRCRAFT"),
       elements["cockpit-title"].textContent);
 
 // the next-maneuver button: skip forward through the endless curriculum
@@ -301,6 +334,51 @@ stepFrames(3, 60);
 check("the next button advances the curriculum",
       elements.status.textContent.includes(`maneuver 2/${lessonCount}`),
       elements.status.textContent);
+
+// the resize grips: pointer drags resize the bottom panel (law: under
+// 10% of the stage it hides; a 10%+ pull up from hidden reopens it) and
+// the sidebar (under 30% of the window it hides; a 10%+ pull left from
+// hidden reopens it at its last width)
+console.log("== the resize grips");
+function dragGrip(grip, growX, growY) {
+  const map = listeners.get(grip) ?? {};
+  const pt = { pointerId: 1, clientX: 500, clientY: 500,
+               preventDefault() {} };
+  for (const h of map.pointerdown ?? []) h(pt);
+  for (const h of map.pointermove ?? []) h({ ...pt,
+    clientX: pt.clientX - growX, clientY: pt.clientY - growY });
+  for (const h of map.pointerup ?? []) h(pt);
+}
+const heightOf = (el) => parseInt(el.style.height, 10) || 0;
+// stage = 900 - 30 (bar) - 7 (grip) = 863; initial height = 30% = 259
+check("the bottom panel opens at 30% of the stage",
+      Math.abs(heightOf(elements.results) - 259) <= 1,
+      `${heightOf(elements.results)}px`);
+dragGrip(elements.bottomGrip, 0, 200);         // pull up 200px
+check("dragging the bottom grip up grows the panel",
+      Math.abs(heightOf(elements.results) - 459) <= 1,
+      `${heightOf(elements.results)}px`);
+dragGrip(elements.bottomGrip, 0, -1000);       // slam it down
+check("below 10% of the stage the panel hides",
+      heightOf(elements.results) === 0, `${heightOf(elements.results)}px`);
+dragGrip(elements.bottomGrip, 0, 100);         // from hidden, pull up 100px
+check("a 10%+ pull up from hidden reopens the panel",
+      Math.abs(heightOf(elements.results) - 100) <= 1,
+      `${heightOf(elements.results)}px`);
+// the sidebar: 30% of 1440 = 432 hides it; 10% = 144 reopens it
+dragGrip(elements.sideGrip, 600, 0);           // pull left 600px
+check("dragging the side grip left sets the sidebar's width",
+      elements.cockpit.style.width === "700px",
+      elements.cockpit.style.width);
+dragGrip(elements.sideGrip, -600, 0);           // slam it right: hidden
+check("below 30% of the window the sidebar hides",
+      elements.cockpit.style.width === "0px"
+      && elements.cockpit.classList.contains("collapsed"),
+      elements.cockpit.style.width);
+dragGrip(elements.sideGrip, 200, 0);            // from hidden, pull left
+check("a 10%+ pull left reopens the sidebar (past its last width)",
+      parseInt(elements.cockpit.style.width, 10) >= 700,
+      elements.cockpit.style.width);
 
 console.log(failures === 0 ? "\nALL CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

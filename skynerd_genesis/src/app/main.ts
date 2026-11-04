@@ -38,6 +38,8 @@ import { BootTrainer } from "./boot-train.js";
 import { FlightSchool, elementNameOf } from "../learning/school.js";
 import type { TensorStateView } from "../learning/servo-tensor.js";
 import type { HudDelta } from "./hud-delta.js";
+import type { ControlMode } from "../learning/guardian.js";
+import { controlModeLabel } from "../learning/guardian.js";
 import { FlightInstruments } from "../learning/instruments.js";
 import { TRIM_SPEED } from "../learning/flight.js";
 import { drawBrainView, tensorCounts } from "./boot-brain.js";
@@ -54,6 +56,10 @@ interface GoldenLesson {
 const DT = 0.02;
 
 const els = {
+  app: document.getElementById("app")!,
+  bar: document.getElementById("bar")!,
+  sideGrip: document.getElementById("sideGrip")!,
+  bottomGrip: document.getElementById("bottomGrip")!,
   sky: document.getElementById("sky") as HTMLCanvasElement,
   status: document.getElementById("status")!,
   narration: document.getElementById("narration")!,
@@ -61,6 +67,7 @@ const els = {
   speed: document.getElementById("speed") as HTMLSelectElement,
   scenario: document.getElementById("scenario") as HTMLSelectElement,
   aircraft: document.getElementById("aircraft") as HTMLSelectElement,
+  controls: document.getElementById("controls") as HTMLSelectElement,
   next: document.getElementById("next") as HTMLButtonElement,
   restart: document.getElementById("restart") as HTMLButtonElement,
   zoomIn: document.getElementById("zoomIn") as HTMLButtonElement,
@@ -139,13 +146,10 @@ function followTarget(): SceneAircraft | null {
   if (school === null) {
     return null;
   }
-  // NO MID-DEMO SWITCH TO THE STUDENT: the view stays on the
-  // instructor while it demonstrates — the demo is the action to
-  // watch. The student becomes the subject only once the instructor
-  // is done (the only one left flying), and a manual dropdown pick
-  // pins whichever aircraft the person chose.
-  return school.instructorEntry.flying ? school.instructorEntry
-                                       : school.studentEntry;
+  // ONE aircraft: it is the classroom's whole sky — on the ground or
+  // in the air, whoever holds the levers. A manual dropdown pick pins
+  // whichever aircraft the person chose (here, always this one).
+  return school.flyingEntry;
 }/** Keep the scene's selection honest: follow the action unless pinned. */
 function autoSelect(): void {
   const world = scene();
@@ -167,10 +171,15 @@ function autoSelect(): void {
  *  exactly 3:2, both the same size, the two of them filling the whole
  *  vertical area — so the sidebar (an auto grid column) is exactly as
  *  wide as the panels need and no space is left under the controls. */
+/** The sidebar's explicit width once the grip has dragged it (null: the
+ *  column sizes itself to its panels). */
+let sideWidth: number | null = null;
+
 function layoutSidebar(): void {
   const aside = els.cockpit;
   const style = getComputedStyle(aside);
   const padY = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+  const padX = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
   const gap = parseFloat(style.rowGap) || 8.0;
   // Everything in the column that is not a panel: its measured height
   // comes off the panels' budget, whatever the markup grows into.
@@ -180,13 +189,19 @@ function layoutSidebar(): void {
   const used = others.reduce((sum, child) => sum + child.offsetHeight, 0.0);
   const gaps = gap * (others.length + panels.length - 1);
   const avail = aside.clientHeight - padY;
-  // The controls square is a NARROW horizontal strip (a fifth of the
-  // column, capped); the view takes the rest and holds 16:9. Both
-  // panels share the view's width, so the sidebar stays one column.
-  const stripH = Math.max(60.0,
+  // The controls square is a NARROW horizontal strip; the view takes the
+  // rest and holds 16:9. The grip may have pinned the column narrower or
+  // wider than that: the view fits INSIDE the column (16:9 preserved),
+  // the strip stays proportional to the view.
+  let stripH = Math.max(60.0,
     Math.min(140.0, (avail - used - gaps) * 0.22));
-  const viewH = Math.max(120.0, avail - used - gaps - stripH);
-  const viewW = Math.round(viewH * 16 / 9);
+  let viewH = Math.max(120.0, avail - used - gaps - stripH);
+  let viewW = Math.round(viewH * 16 / 9);
+  if (sideWidth !== null && viewW > sideWidth - padX) {
+    viewW = Math.max(120.0, Math.round(sideWidth - padX));
+    viewH = Math.round(viewW * 9 / 16);
+    stripH = Math.max(48.0, Math.min(140.0, Math.round(viewH * 0.30)));
+  }
   els.cockpitCanvas.style.width = `${viewW}px`;
   els.cockpitCanvas.style.height = `${Math.round(viewH)}px`;
   els.controlsCanvas.style.width = `${viewW}px`;
@@ -283,32 +298,14 @@ function drawSky(): void {
   drawSchoolSky(ctx, sx, sy);
 }
 
-/** The classroom's sky: the instructor's demonstration ghosted behind
- *  the student's repeat, both machines drawn. */
+/** The classroom's sky: the ONE aircraft's flight path. */
 function drawSchoolSky(ctx: CanvasRenderingContext2D,
                        sx: (y: number) => number,
                        sy: (x: number) => number): void {
   const school = state.school!;
-  const instructor = school.instructorEntry;
-  const student = school.studentEntry;
-  // the demonstration path, ghosted behind the repeat
-  const ghost = instructor.trail;
-  if (school.moment.stage === "repeat" && ghost.length > 1) {
-    ctx.strokeStyle = "rgba(70,115,140,0.40)";
-    ctx.lineWidth = 1.2;
-    ctx.setLineDash([5, 6]);
-    ctx.beginPath();
-    ctx.moveTo(sx(ghost[0].y), sy(ghost[0].x));
-    for (const p of ghost) {
-      ctx.lineTo(sx(p.y), sy(p.x));
-    }
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
-  for (const entry of [instructor, student]) {
-    drawTrail(ctx, entry, sx, sy);
-    drawAircraftTop(ctx, entry, sx, sy, 10);
-  }
+  const entry = school.aircraftEntry;
+  drawTrail(ctx, entry, sx, sy);
+  drawAircraftTop(ctx, entry, sx, sy, 10);
 }
 
 /** The waves' sky: every drone's trail, the swarm's connections, and
@@ -433,16 +430,16 @@ function renderNarration(): void {
   const attempt = moment.attempt > 1 ? ` \u00b7 attempt ${moment.attempt}` : "";
   const score = school.scores.get(moment.lessonName);
   const scoreText = score === undefined ? "" : ` \u00b7 last flight ${score.toFixed(2)}/6`;
-  const intent = ` \u00b7 goal: ${moment.goalName} \u00b7 element: ${moment.elementName}`;
+  const intent = moment.flying
+    ? ` \u00b7 goal: ${moment.goalName} \u00b7 element: ${moment.elementName}` : "";
   const finishedText = moment.finished ? " \u00b7 flight finished" : "";
-  const whoText = moment.bothFlying
-    ? "both flying \u2014 student 10 s behind"
-    : moment.stage === "demo"
-      ? `student launches in ${moment.countdown.toFixed(0)} s`
-      : "student at the controls";
+  const byText = moment.scoreByInstructor ? " (the instructor's hands)" : "";
+  const whoText = moment.instructorAtControls
+    ? `\u2691 INSTRUCTOR AT THE CONTROLS (${controlModeLabel(moment.controlsMode)})`
+    : `${controlModeLabel(moment.controlsMode)} at the controls`;
   els.status.textContent =
     `maneuver ${moment.lessonIndex}/${moment.lessonCount} \u00b7 ${moment.lessonName}` +
-    `${attempt}${scoreText}${intent}${finishedText} \u00b7 t ${moment.seconds.toFixed(1)}s \u00b7 ` +
+    `${attempt}${scoreText}${byText}${intent}${finishedText} \u00b7 t ${moment.seconds.toFixed(1)}s \u00b7 ` +
     whoText;
   els.results.hidden = false;
   updateBadge();
@@ -517,11 +514,13 @@ function aiSubject(): {
   }
   const moment = school.moment;
   return {
-    view: school.studentStateView,
+    view: school.aircraftStateView,
     goalName: moment.goalName,
     delta: school.instructorDelta,
     key: `school|${moment.lessonName}|${moment.attempt}`,
-    note: `the student launches in ${moment.countdown.toFixed(0)} s`,
+    note: moment.finished
+      ? `the result holds \u2014 the next attempt begins in a moment`
+      : "the aircraft is waiting to fly",
   };
 }
 
@@ -741,11 +740,13 @@ function frame(ts: number): void {
   }
   autoSelect();
   layoutSidebar();
+  layoutBottom();
   drawSky();
   drawPanel();
   renderNarration();
   renderTabs();
   refreshAircraftDropdown();
+  refreshControlsDropdown();
   requestAnimationFrame(frame);
 }
 
@@ -845,6 +846,37 @@ els.aircraft.addEventListener("change", () => {
     state.pinned = true;
   }
 });
+
+// --- the controls dropdown ----------------------------------------------------------
+
+/** Whose hands fly the CURRENT aircraft — the sticky per-aircraft
+ *  choice (AI, instructor, or a both-mode). Switching the aircraft
+ *  dropdown leaves every other machine flying under whoever was
+ *  chosen for it; the dropdown shows the current one's own mode. */
+els.controls.addEventListener("change", () => {
+  const mode = els.controls.value as ControlMode;
+  if (state.scenario === WAVES_SCENARIO && state.waves !== null) {
+    state.waves.setControlsMode(mode);
+    return;
+  }
+  state.school?.setControlsMode(mode);
+});
+
+/** Keep the controls dropdown honest: it always shows the CURRENT
+ *  aircraft's own sticky mode. */
+function refreshControlsDropdown(): void {
+  if (state.scenario === WAVES_SCENARIO && state.waves !== null) {
+    const mode = state.waves.selectedControlsMode;
+    if (mode !== null && els.controls.value !== mode) {
+      els.controls.value = mode;
+    }
+    return;
+  }
+  const school = state.school;
+  if (school !== null && els.controls.value !== school.controlsMode) {
+    els.controls.value = school.controlsMode;
+  }
+}
 els.sky.addEventListener("click", (event) => {
   // Clicking an aircraft on the sky selects it: it becomes the current
   // aircraft (the panel follows it) and the dropdown follows.
@@ -901,13 +933,128 @@ els.zoomIn.addEventListener("click", () => {
 });els.zoomOut.addEventListener("click", () => {
   state.span = Math.min(4000.0, state.span * 1.3);
 });
+
+// --- the resize grips --------------------------------------------------------
+// The bottom panel's height and the sidebar's width are the user's, by
+// drag. The LAWS (fractions of the stage height / the window width):
+//   BOTTOM: visible while >= 10%; drag it lower and it HIDES; from
+//     hidden, a pull upwards of more than 10% opens it (it then tracks
+//     the pointer, so it opens exactly as tall as you pulled).
+//   SIDEBAR: visible while >= 30%; drag it narrower and it HIDES; from
+//     hidden, a pull leftwards of more than 10% opens it back at its
+//     LAST width (then it tracks the pointer from there).
+const BOTTOM_HIDE = 0.10;
+const BOTTOM_MAX = 0.85;
+const SIDE_HIDE = 0.30;
+const SIDE_MAX = 0.80;
+const REOPEN = 0.10;
+
+let bottomFrac = 0.30;       // the bottom panel's height, of the stage
+let bottomHidden = false;
+let sideHidden = false;
+let sideLastW = 0;           // the last width the sidebar showed
+
+/** The stage's height: the app below the toolbar (the grips' tracks
+ *  themselves are excluded — they sit between the regions). */
+function stageHeight(): number {
+  return els.app.clientHeight - els.bar.offsetHeight - 7.0;
+}
+
+/** Apply the bottom panel's height law to the DOM (guarded: writing
+ *  the same height twice is free). */
+let bottomPx = -1;
+function layoutBottom(): void {
+  const avail = stageHeight();
+  const px = bottomHidden ? 0 : Math.round(bottomFrac * avail);
+  if (px !== bottomPx) {
+    bottomPx = px;
+    els.results.style.height = `${px}px`;
+  }
+}
+
+/** Apply the sidebar's width law to the DOM. */
+function applySide(): void {
+  els.cockpit.classList.toggle("collapsed", sideHidden);
+  if (sideWidth !== null) {
+    els.cockpit.style.width = sideHidden ? "0px" : `${Math.round(sideWidth)}px`;
+  }
+  layoutSidebar();
+}
+
+/** Wire one grip: pointer-captured drags call back with (delta, start),
+ *  where delta is the drag distance in the grip's GROW direction
+ *  (up for the bottom panel, left for the sidebar). */
+function gripDrag<T>(grip: HTMLElement, axis: "x" | "y",
+                     startState: () => T,
+                     onMove: (delta: number, start: T) => void): void {
+  grip.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    grip.setPointerCapture(event.pointerId);
+    grip.classList.add("dragging");
+    const startPt = axis === "y" ? event.clientY : event.clientX;
+    const start = startState();
+    const move = (ev: PointerEvent): void => {
+      const delta = axis === "y" ? startPt - ev.clientY : startPt - ev.clientX;
+      onMove(delta, start);
+    };
+    const up = (): void => {
+      grip.classList.remove("dragging");
+      grip.removeEventListener("pointermove", move);
+      grip.removeEventListener("pointerup", up);
+      grip.removeEventListener("pointercancel", up);
+    };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", up);
+    grip.addEventListener("pointercancel", up);
+  });
+}
+
+gripDrag(els.bottomGrip, "y",
+  () => ({ px: bottomHidden ? 0.0 : bottomFrac * stageHeight() }),
+  (dy, start): void => {
+    const avail = stageHeight();
+    const cand = Math.max(0.0, Math.min(avail * BOTTOM_MAX, start.px + dy));
+    bottomFrac = cand / avail;
+    bottomHidden = cand < avail * BOTTOM_HIDE;   // under 10%: it hides
+    layoutBottom();
+  });
+
+gripDrag(els.sideGrip, "x",
+  () => ({
+    hidden: sideHidden,
+    w: sideWidth ?? els.cockpit.offsetWidth,
+    last: sideLastW > 0 ? sideLastW : els.cockpit.offsetWidth,
+  }),
+  (dx, start): void => {
+    const sw = window.innerWidth;
+    // from hidden the pull must cross REOPEN first; from visible the
+    // width just follows the pointer
+    const cand = start.hidden
+      ? dx <= sw * REOPEN ? 0.0 : start.last + (dx - sw * REOPEN)
+      : start.w + dx;
+    if (cand >= sw * SIDE_HIDE) {
+      sideHidden = false;
+      sideWidth = Math.min(cand, sw * SIDE_MAX);
+      sideLastW = sideWidth;
+    } else {
+      sideHidden = true;                        // under 30%: it hides
+    }
+    applySide();
+  });
+
+layoutBottom();   // the initial 30%
 els.zoomReset.addEventListener("click", () => {
   state.span = 260.0;
   state.camera.tracking = true;   // the view returns to the action
 });
 window.addEventListener("resize", () => {
-  // the window changed: the sidebar's panels re-fit their 3:2 sizes
+  // the window changed: the panels re-fit, the grips' fractions re-apply
   layoutSidebar();
+  layoutBottom();
+  if (sideWidth !== null) {
+    sideWidth = Math.min(sideWidth, window.innerWidth * SIDE_MAX);
+    applySide();
+  }
 });
 window.addEventListener("keydown", (event) => {
   if (event.code === "Space") {

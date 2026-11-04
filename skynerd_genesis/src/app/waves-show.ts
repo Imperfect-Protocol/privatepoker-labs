@@ -26,6 +26,7 @@ import { Scene, type SceneAircraft } from "./scene.js";
 import {
   hudDelta, readoutOf, meanReadoutOf, type HudDelta,
 } from "./hud-delta.js";
+import type { ControlMode } from "../learning/guardian.js";
 
 /** The carpet's shape: 8 drones per line, 5 % exploration, no hazard. */
 export const WAVE_SIZE = 8;
@@ -119,6 +120,46 @@ export class WavesShow {
     const drone = this.drones.find((d) => d.entry === current
                                     && d.flight.episodeOutcome === null);
     return drone === undefined ? null : drone.flight.stateView();
+  }
+
+  /** THE CONTROLS DROPDOWN — whose hands fly the SELECTED drone. The
+   *  choice is STICKY per drone: switching the aircraft dropdown to
+   *  another drone leaves this one flying under whoever was chosen
+   *  for it (and its own mode shows when it is selected again). */
+  setControlsMode(mode: ControlMode): void {
+    const current = this.scene.current;
+    if (current === null) {
+      return;
+    }
+    const drone = this.drones.find((d) => d.entry === current
+                                    && d.flight.episodeOutcome === null);
+    if (drone !== undefined) {
+      drone.flight.setControlsMode(mode);
+    }
+  }
+
+  /** The selected drone's controls mode (null when it is not a flying
+   *  drone — the dropdown shows nothing to change). */
+  get selectedControlsMode(): ControlMode | null {
+    const current = this.scene.current;
+    if (current === null) {
+      return null;
+    }
+    const drone = this.drones.find((d) => d.entry === current
+                                    && d.flight.episodeOutcome === null);
+    return drone === undefined ? null : drone.flight.controlsMode;
+  }
+
+  /** Whether the instructor's hand is on the selected drone's levers
+   *  right now (a guarded takeover included) — the status line. */
+  get selectedInstructorAtControls(): boolean {
+    const current = this.scene.current;
+    if (current === null) {
+      return false;
+    }
+    const drone = this.drones.find((d) => d.entry === current
+                                    && d.flight.episodeOutcome === null);
+    return drone !== undefined && drone.flight.instructorAtControls;
   }
 
   /** The AI log's delta column: the selected drone against the MEAN of
