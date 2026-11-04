@@ -726,3 +726,48 @@ the rule's gold pixels r > b+35.
 
 The lifecycle re-verified after the concurrent session's edits
 settled: fade-on-clock and ?boot=skip both hold.
+
+## §21 the boot dialog's bottom edge
+
+**THE BRIEFING'S GAUGES BELOW** (the user's redesign of the SKYNERD
+FLIGHT SCHOOL dialog): the top edge is now the TITLE ALONE — the
+progress bar and DONE moved down; the bottom edge's text area +
+expand icon is REPLACED by one controls row: THE PROGRESS BAR FROM
+THE LEFT, then SHOW DETAILS, then DONE. index.html: boot-head keeps
+only the h1; a new #bootDetails drawer holds #bootLog (closed by
+default); .boot-foot now carries .boot-bar + #bootExpand + #bootDone.
+#bootExpand is a text button in DONE's family (one step dimmer);
+its label flips SHOW DETAILS ↔ HIDE DETAILS (main.ts). Expanded:
+#bootContent (the cubes) steps aside, #bootDetails flexes open and
+the log fills it — the old 51-px three-line terminal is gone, the
+collapsed dialog is clean. All element ids kept (restart-check's
+stubs address them; its closest() returns null and the log streamer
+is null-safe). Verified live: the head band reads the title only
+(max lum 238 at y=88, 36 just below); the controls row sits on the
+bottom edge (bar track x 185..789 filling from the left, SHOW
+DETAILS 799..916, DONE 926..995, all y 672..698, dialog bottom
+717); the click opens the drawer (details flex, log 542 px, label
+HIDE DETAILS, cubes display none). Both tsconfigs clean; npm test
+9 suites green; restart-check unchanged (the 2 waves FAILs remain
+the concurrent session's).
+
+## §22 the details drawer's briefing sheet
+
+**THE PRO TABLE** (the user: the details panel is ugly text — same
+font, but a table). renderBootTable (main.ts) now builds a real
+table: #bootLog's <pre> became a <div>, and the rows stream in as
+`<tr class=training|done>` with the lesson's title (lessonTitleOf —
+the same law as the dropdown), the reps, and the EMA out of 6 —
+THE "DONE" WORD ITSELF IS GONE (the row's own tint says it: rows
+wearing .done read lit, the training rows dim; the only DONE left
+is the control button on the bottom edge, where the user asked it).
+The sheet (.boot-table in style.css): a sticky uppercase header
+band (lesson | reps | ema on #071320), ruled rows with 1px
+separators, tabular-nums numerics right-aligned, tabular whitespace
+— the briefing-sheet look against the drawer's #03070d. Verified
+live: 20 rows render under the header, the geometry probe reads
+lesson names left (x 202..312) and numerics right (x 802..976), the
+expanded screenshot shows the clean dark header band + thin rules;
+no status word anywhere. Both tsconfigs clean; npm test 9 suites
+green; restart-check unchanged (the 2 waves FAILs are the
+concurrent session's).

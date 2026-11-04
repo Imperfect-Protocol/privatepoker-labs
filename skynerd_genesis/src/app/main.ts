@@ -1397,36 +1397,39 @@ async function fetchJson(url: string): Promise<any> {
   return response.json();
 }
 
-/** The boot terminal's lesson table — one row per lesson, live:
- *  attempts, the EMA score, and the pass mark. Rendered after each chunk. */
+/** The boot details' lesson table — one row per lesson, live: the
+ *  lesson's title, its attempts, and the EMA score out of 6. Rendered
+ *  as a real table (the dialog's own briefing sheet). */
 function renderBootTable(rows: ReadonlyArray<{
   lesson: string; attempts: number; score: number | null;
   status: "training" | "done";
 }>): void {
-  const width = 26;
-  const lines = rows.map((row) => {
-    const name = row.lesson.padEnd(width).slice(0, width - 1);
-    const score = row.score === null ? "     \u2013"
-      : `${row.score.toFixed(2)}`.padStart(5) + "/6";
-    const mark = row.status === "done" ? " done" : " \u00b7\u00b7\u00b7";
-    return `${name}${String(row.attempts).padStart(2)}  ${score} ${mark}`;
-  });
-  els.bootLog.textContent =
-    ["lesson".padEnd(width) + "demo   ema",
-     "-".repeat(width + 17), ...lines].join("\n");
-  // shrunk mode: keep the LAST line in view — the table scrolls to the
-  // bottom (where the classroom currently is)
+  const body = rows.map((row) => {
+    const score = row.score === null ? "\u2013"
+      : `${row.score.toFixed(2)} / 6`;
+    return `<tr class="${row.status}">` +
+      `<td>${lessonTitleOf(row.lesson)}</td>` +
+      `<td>${row.attempts}</td>` +
+      `<td>${score}</td>` +
+      `</tr>`;
+  }).join("");
+  els.bootLog.innerHTML =
+    `<table class="boot-table">` +
+    `<thead><tr><th>lesson</th><th>reps</th><th>ema</th></tr></thead>` +
+    `<tbody>${body}</tbody>` +
+    `</table>`;
+  // shrunk mode: keep the LAST row in view — the classroom is there
   if (!els.bootExpand.closest(".boot-dialog")?.classList.contains("expanded")) {
     els.bootLog.scrollTop = els.bootLog.scrollHeight;
   }
 }
 
-/** The boot dialog's expand button: the terminal grows to the full
- *  dialog, replacing the cubes; pressing it again brings them back. */
+/** The boot dialog's details button: the log drawer opens over the
+ *  cubes' panel; pressing it again brings them back. */
 els.bootExpand.addEventListener("click", () => {
   const dialog = els.bootExpand.closest(".boot-dialog")!;
   const expanded = dialog.classList.toggle("expanded");
-  els.bootExpand.textContent = expanded ? "\u29c9" : "\u29ca";
+  els.bootExpand.textContent = expanded ? "HIDE DETAILS" : "SHOW DETAILS";
 });
 
 let frameRunning = false;
