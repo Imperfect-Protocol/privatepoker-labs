@@ -5,7 +5,7 @@
  * error wave actually teaches.
  */
 import {
-  FlightSchool, ShadowFlight, DECISION_EVERY,
+  FlightSchool, ShadowFlight, InstructorTwin, DECISION_EVERY,
 } from "../build/src/learning/school.js";
 import { FlightInstruments } from "../build/src/learning/instruments.js";
 import { ServoPolicy } from "../build/src/learning/servo-tensor.js";
@@ -28,6 +28,7 @@ const startKeys = policy.servoTensor.storedCombinations;
 const startPumps = policy.errorNeurons.reduce((s, n) => s + n.pumps, 0);
 const flight = new ShadowFlight(school, lesson, policy,
   new NumpyPcg64(RNG0_STATE, RNG0_INC), 0,
+  new InstructorTwin(lesson),
   school.demoSeconds(lesson) * 2.2 + 5.0);
 // Runtime trace: which tensors fire per decision window.
 const net = flight["network"];

@@ -1,4 +1,101 @@
 /**
+ * One tick of the shared machine: the physics, the runway pin, the
+ * cursor's advance, the ground check. Returns whether this
+ * aircraft is still flying (false = grounded, or its plan
+ * complete). Used for the flight's own aircraft AND the shadow
+ * instructor's twin.
+ */
+function stepMachine(school: FlightSchool, aircraft: Aircraft,
+                     cursor: PhaseCursor, commands: Float64Array): boolean {
+  aircraft.command(commands, school.dt);
+  // Height above the terrain: ground effect lives in the physics.
+  const agl = aircraft.body.position.z
+    - school.world.terrainHeight(aircraft.body.position.x,
+                                  aircraft.body.position.y);
+  aircraft.step(school.dt, agl);
+  const phase = cursor.current;
+  if (phase.pin === true) {
+    // The runway: hold the aircraft at 10 ft while it cannot fly (vz
+    // would go negative) — the takeoff roll, and the sag after rotation
+    // until the wing carries it. It unpins itself the moment it flies.
+    if (aircraft.body.position.z < SYLLABUS.runwayM + 0.001) {
+      aircraft.body.position = new Vec3(aircraft.body.position.x,
+                                        aircraft.body.position.y,
+                                        SYLLABUS.runwayM);
+      aircraft.body.velocity = new Vec3(aircraft.body.velocity.x,
+                                        aircraft.body.velocity.y,
+                                        Math.max(0.0, aircraft.body.velocity.z));
+      // The gear: wings level, deck at the ground attitude until an
+      // element commands rotation — a pitch target or a held elevator
+      // pull. The roll shows pitch 0, yoke neutral.
+      holdGroundDeck(aircraft.body, !phase.rotates);
+    }
+  }
+  cursor.advance(aircraft.body);
+  if (school.grounded(aircraft.body) && phase.pin !== true) {
+    return false;
+  }
+  if (cursor.finished) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * THE INSTRUCTOR'S TWIN — the shadow flight's instructor aircraft.
+ * ONE twin serves the WHOLE FLOCK of a round: the instructor's flight
+ * is deterministic and identical beside every student, so it flies
+ * once, not once per student. Per tick: observe() (the raw targets
+ * and the stampable actions, computed pre-ease), then step().
+ */
+export class InstructorTwin {
+  readonly aircraft: Aircraft;
+  readonly cursor: PhaseCursor;
+  readonly hand: InstructorHand;
+  private ended = false;
+  private lastRaw: Float64Array | null = null;
+
+  constructor(readonly lesson: Lesson) {
+    this.aircraft = new Aircraft(lesson.spawn());
+    this.cursor = new PhaseCursor(lesson.phases, this.aircraft.body);
+    this.hand = new InstructorHand(startCommandsFor(lesson.startKind));
+  }
+
+  get flying(): boolean {
+    return !this.ended;
+  }
+
+  /** The instructor's decision data for THIS tick: the element it is
+   *  in and the actions its hands are stamping (computed from the raw
+   *  targets BEFORE the easing moves the levers). */
+  observe(): { elementId: number; actions: Int32Array } {
+    const raw = this.cursor.phaseTargets(this.aircraft.body);
+    this.lastRaw = raw;
+    let actions = FlightSchool.movingLevels(
+      raw, this.aircraft.surfacePositions);
+    if (!actions.some((a) => a !== ACTION_HOLD)) {
+      actions = FlightSchool.heldLevels(this.aircraft.surfacePositions);
+    }
+    return { elementId: this.cursor.current.elementId, actions };
+  }
+
+  /** One tick of the instructor's own flight. */
+  step(school: FlightSchool): boolean {
+    if (this.ended) {
+      return false;
+    }
+    const raw = this.lastRaw ?? this.cursor.phaseTargets(this.aircraft.body);
+    const smooth = this.hand.easeToward(raw, school.dt);
+    if (!stepMachine(school, this.aircraft, this.cursor,
+                     Float64Array.from(smooth))) {
+      this.ended = true;
+      return false;
+    }
+    return true;
+  }
+}
+
+/**
  * The flight school: the instructor demonstrates, the student repeats.
  * Redesigned for the C172 airframe (1111 kg, stall ~50 mph, cruise 85 mph
  * at 2300 RPM): each lesson is a PHASE-BASED PROCEDURE — a real
@@ -794,39 +891,7 @@ abstract class ClassroomFlight implements Stepper {
    *  instructor's twin. */
   protected stepAircraft(aircraft: Aircraft, cursor: PhaseCursor,
                          commands: Float64Array): boolean {
-    const dt = this.school.dt;
-    aircraft.command(commands, dt);
-    // Height above the terrain: ground effect lives in the physics.
-    const agl = aircraft.body.position.z
-      - this.school.world.terrainHeight(aircraft.body.position.x,
-                                        aircraft.body.position.y);
-    aircraft.step(dt, agl);
-    const phase = cursor.current;
-    if (phase.pin === true) {
-      // The runway: hold the aircraft at 10 ft while it cannot fly (vz
-      // would go negative) — the takeoff roll, and the sag after rotation
-      // until the wing carries it. It unpins itself the moment it flies.
-      if (aircraft.body.position.z < SYLLABUS.runwayM + 0.001) {
-        aircraft.body.position = new Vec3(aircraft.body.position.x,
-                                         aircraft.body.position.y,
-                                         SYLLABUS.runwayM);
-        aircraft.body.velocity = new Vec3(aircraft.body.velocity.x,
-                                          aircraft.body.velocity.y,
-                                          Math.max(0.0, aircraft.body.velocity.z));
-        // The gear: wings level, deck at the ground attitude until an
-        // element commands rotation — a pitch target or a held elevator
-        // pull. The roll shows pitch 0, yoke neutral.
-        holdGroundDeck(aircraft.body, !phase.rotates);
-      }
-    }
-    cursor.advance(aircraft.body);
-    if (this.school.grounded(aircraft.body) && phase.pin !== true) {
-      return false;
-    }
-    if (cursor.finished) {
-      return false;
-    }
-    return true;
+    return stepMachine(this.school, aircraft, cursor, commands);
   }
 
   protected tickPhysics(commands: Float64Array): boolean {
@@ -1662,22 +1727,19 @@ export class ExamFlight extends ClassroomFlight {
  * grade is the trace it earned.
  */
 export class ShadowFlight extends ExamFlight {
-  /** The instructor's twin aircraft — its own sealed machine. */
-  private readonly instructorAircraft: Aircraft;
-  private readonly instructorCursor: PhaseCursor;
-  private readonly instructorHand = new InstructorHand(
-    startCommandsFor(this.lesson.startKind));
+  /** THE INSTRUCTOR'S TWIN — SHARED across the flock (one instructor
+   *  flies once beside every student of the round; the flight only
+   *  reads it). Owns its own when constructed without one. */
+  private readonly twin: InstructorTwin;
   /** The classroom epoch the teach pulses fire at. */
   private readonly timeEpoch: number;
 
   constructor(school: FlightSchool, lesson: Lesson, policy: ServoPolicy,
               rng: NumpyPcg64, timeEpoch: number,
-              examCapSeconds?: number) {
+              twin?: InstructorTwin, examCapSeconds?: number) {
     super(school, lesson, policy, rng, examCapSeconds);
     this.timeEpoch = timeEpoch;
-    this.instructorAircraft = new Aircraft(lesson.spawn());
-    this.instructorCursor = new PhaseCursor(lesson.phases,
-                                            this.instructorAircraft.body);
+    this.twin = twin ?? new InstructorTwin(lesson);
   }
 
   step(): boolean {
@@ -1685,9 +1747,9 @@ export class ShadowFlight extends ExamFlight {
       return false;
     }
     const dt = this.school.dt;
-    // The instructor flies its twin at the student's side.
-    const rawI = this.instructorCursor.phaseTargets(
-      this.instructorAircraft.body);
+    // The instructor's tick: the raw targets and the stampable actions
+    // (computed pre-ease), then its own flight.
+    const teaching = this.twin.observe();
     if (this.tick % DECISION_EVERY === 0) {
       // The student's decision, exactly the exam's.
       const sense = this.school.instruments.senseReading(
@@ -1712,20 +1774,11 @@ export class ShadowFlight extends ExamFlight {
       // student's, the teacher's classes against the student's fired
       // ones, the instructor's element against the student's — the
       // error wave's fuel, computed at the same decision tick.
-      let actionsI = FlightSchool.movingLevels(
-        rawI, this.instructorAircraft.surfacePositions);
-      if (!actionsI.some((a) => a !== ACTION_HOLD)) {
-        actionsI = FlightSchool.heldLevels(
-          this.instructorAircraft.surfacePositions);
-      }
-      this.network.teach(this.instructorCursor.current.elementId, actionsI,
+      this.network.teach(teaching.elementId, teaching.actions,
                          this.timeEpoch);
       this.trace.record(this.chosenIndex, this.cursor.readings(this.body));
     }
-    const smoothI = this.instructorHand.easeToward(rawI, dt);
-    const instructorFlying = this.stepAircraft(this.instructorAircraft,
-                                               this.instructorCursor,
-                                               Float64Array.from(smoothI));
+    const instructorFlying = this.twin.step(this.school);
     const studentFlying = this.tickPhysics(this.commandsNow);
     this.commandsNow = springStickTowardNeutral(this.commandsNow, dt);
     if (!instructorFlying || !studentFlying) {

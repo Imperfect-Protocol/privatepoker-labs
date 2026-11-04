@@ -28,7 +28,7 @@
  * physics.
  */
 import {
-  FlightSchool, ExamFlight, ShadowFlight, type Lesson,
+  FlightSchool, ExamFlight, ShadowFlight, InstructorTwin, type Lesson,
 } from "../learning/school.js";
 import { FlightInstruments } from "../learning/instruments.js";
 import { ServoPolicy } from "../learning/servo-tensor.js";
@@ -278,9 +278,10 @@ export class BootTrainer {
     }
     const flights: ShadowFlight[] = [];
     const live: boolean[] = [];
+    const twin = new InstructorTwin(lesson);
     for (let s = 0; s < this.flock.length; s++) {
       flights.push(new ShadowFlight(this.school, lesson, this.flock[s],
-        this.childRng(), this.demoEpoch, this.examCapFor(lesson)));
+        this.childRng(), this.demoEpoch, twin, this.examCapFor(lesson)));
       live.push(true);
     }
     this.demoEpoch += 1;
@@ -352,6 +353,13 @@ export class BootTrainer {
       round.flights[best].goalVerdicts().map((verdict) => ({
         label: verdict.label, fraction: verdict.fraction,
       })));
+    // (B) THE POST-REPETITION CONSOLIDATION: every student runs the
+    // signal processing over what the repetition taught — noise ->
+    // Gaussian -> Haar -> threshold -> de-Haar, spreading the fresh
+    // weights over their neighbor areas, once per repetition.
+    for (const student of this.flock) {
+      student.consolidate(this.demoEpoch, this.priorRng);
+    }
   }
 
   /**
