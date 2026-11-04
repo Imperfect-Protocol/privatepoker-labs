@@ -112,6 +112,7 @@ const els = {
   bootBrain: document.getElementById("bootBrain") as HTMLCanvasElement,
   bootExpand: document.getElementById("bootExpand") as HTMLButtonElement,
   bootDone: document.getElementById("bootDone") as HTMLButtonElement,
+  splash: document.getElementById("splash") as HTMLElement,
 };
 
 /** The scenario ids: every lesson name, then the drone attack waves. */
@@ -1023,6 +1024,28 @@ function setScenario(id: string): void {
 const BOOT_SKIP =
   new URLSearchParams(location.search).get("boot") === "skip";
 
+/** THE SPLASH SCREEN: the poster's own moment — the page loads behind
+ *  the full-bleed splash.png, it holds a beat, then fades out (the
+ *  vite app's law). A click dismisses it at once; the developer's
+ *  ?boot=skip fast path (and every probe that rides it) never sees
+ *  it at all. */
+(function mountSplash(): void {
+  const splash = els.splash;
+  if (splash === null) { return; }
+  let clock: ReturnType<typeof setTimeout> | null = null;
+  let dismissed = false;
+  const dismiss = (): void => {
+    if (dismissed) { return; }
+    dismissed = true;
+    if (clock !== null) { clearTimeout(clock); }
+    splash.classList.add("fading");
+    setTimeout(() => { splash.classList.add("gone"); }, 900);
+  };
+  if (BOOT_SKIP) { splash.classList.add("gone"); return; }
+  clock = setTimeout(dismiss, 2600);
+  splash.addEventListener("click", dismiss);
+})();
+
 /** Skip mode's world: a new classroom around a beginner's brain — the
  *  same world shape bootTraining lands, minus the training. */
 function startUntrainedWorld(): void {
@@ -1061,10 +1084,21 @@ function restart(): void {
   }
 }
 
+/** The scenario dropdown's lesson title: underscores to spaces,
+ *  every word capitalised except the small connective words. */
+function lessonTitleOf(name: string): string {
+  const small = new Set(["to", "for", "and", "of", "in"]);
+  return name.replace(/_/g, " ").split(" ")
+    .map((word, i) => i > 0 && small.has(word)
+      ? word
+      : word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
 function populateScenarioDropdown(lessons: readonly string[]): void {
-  const options = lessons.map((name) =>
-    `<option value="${name}">lesson: ${name.replace(/_/g, " ")}</option>`);
-  options.push(`<option value="${WAVES_SCENARIO}">drone attack waves</option>`);
+  const options = lessons.map((name, i) =>
+    `<option value="${name}">Lesson ${i + 1}: ${lessonTitleOf(name)}</option>`);
+  options.push(`<option value="${WAVES_SCENARIO}">Scenario 1: Drone Attack</option>`);
   els.scenario.innerHTML = options.join("");
 }
 

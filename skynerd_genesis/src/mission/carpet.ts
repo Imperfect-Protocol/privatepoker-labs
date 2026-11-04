@@ -21,8 +21,8 @@ import { RigidBody } from "../physics/rigid-body.js";
 import { Aircraft } from "../physics/aircraft.js";
 import { Flock } from "../learning/flock.js";
 import { FlightInstruments, EpisodeOutcome } from "../learning/instruments.js";
-import { ServoPolicy } from "../learning/servo-tensor.js";
-import { LiveEpisode, TRIM_SPEED } from "../learning/flight.js";
+import { AiPilot } from "../learning/pilot.js";
+import { LiveEpisode, TRIM_SPEED, springTowardNeutral } from "../learning/flight.js";
 
 export interface WaveMetrics {
   wave: number;
@@ -44,7 +44,7 @@ export interface WaveRunnerOptions {
 
 /** One drone of a wave: its brain and its ONE machine (physics/aircraft.ts). */
 export interface WaveDrone {
-  readonly policy: ServoPolicy;
+  readonly pilot: AiPilot;
   readonly aircraft: Aircraft;
   /** The drone's life — null until its slot launches. */
   flight: LiveEpisode | null;
@@ -79,21 +79,26 @@ export class LiveWave {
     // newborn a mosaic of what the PREVIOUS waves' survivors remember,
     // then joins the living. Within the wave, knowledge moves only by
     // screams.
-    const newborns: ServoPolicy[] = [];
+    const newborns: AiPilot[] = [];
     for (let i = 0; i < this.options.waveSize; i++) {
-      newborns.push(new ServoPolicy());
+      // Each newborn's own brain dice, drawn from the wave's stream.
+      newborns.push(new AiPilot({
+        seedRng: new NumpyPcg64(rng.draw64(), rng.draw64()),
+        decisionEvery: 10,
+        spring: springTowardNeutral,
+      }));
     }
-    for (const policy of newborns) {
-      this.flock.seedNewborn(policy, rng);
+    for (const pilot of newborns) {
+      this.flock.seedNewborn(pilot, rng);
     }
-    for (const policy of newborns) {
-      this.flock.enroll(policy);
+    for (const pilot of newborns) {
+      this.flock.enroll(pilot);
     }
     for (let slot = 0; slot < newborns.length; slot++) {
       const position = new Vec3(0.0,
         (slot - this.options.waveSize / 2.0) * this.options.rowSpacing, 50.0);
       this.drones.push({
-        policy: newborns[slot],
+        pilot: newborns[slot],
         aircraft: new Aircraft(new RigidBody(position,
                                              new Vec3(TRIM_SPEED, 0.0, 0.0))),
         flight: null,
@@ -142,8 +147,8 @@ export class LiveWave {
       // The dying drone's shard leaves the brain, then it screams its
       // tensor to whoever is still in the sky to hear it.
       this.deaths += 1;
-      this.flock.reap(drone.policy);
-      this.flock.broadcastObituary(drone.policy, this.rng);
+      this.flock.reap(drone.pilot);
+      this.flock.broadcastObituary(drone.pilot, this.rng);
     }
     // A survivor keeps its shard; it stays enrolled.
     this.slot += 1;
@@ -158,8 +163,9 @@ export class LiveWave {
   private launch(slot: number): void {
     const drone = this.drones[slot];
     drone.hazard = this.rng.uniform() < this.options.hazardRate;
-    drone.flight = new LiveEpisode(drone.policy, this.instruments,
+    drone.flight = new LiveEpisode(null, this.instruments,
                                    this.waveIndex, this.rng, {
+      pilot: drone.pilot,
       aircraft: drone.aircraft,
       epsilonOverride: this.options.epsilon,
       startSpiral: drone.hazard,

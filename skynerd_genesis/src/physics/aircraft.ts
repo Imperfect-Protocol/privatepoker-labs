@@ -30,6 +30,7 @@ import {
   SurfacesState, AILERON, ELEVATOR, RUDDER, THROTTLE,
 } from "./surfaces.js";
 import { GRAVITY, RHO_SEA_LEVEL } from "./aero.js";
+import type { AircraftController } from "../learning/aircraft-controller.js";
 
 /**
  * The controlling hand's decisions, for the panel: the last per-channel
@@ -55,6 +56,22 @@ export class Aircraft {
 
   constructor(body: RigidBody) {
     this.body = body;
+  }
+
+  /** THE MACHINE'S CONTROLLER — whoever is at the controls (the
+   *  flights attach it; a mode swap replaces it). The machine knows
+   *  who flies it; the controller drives it through the single input
+   *  path below, never any other way. */
+  private controller: AircraftController | null = null;
+
+  /** The machine's current controller (null = nobody attached). */
+  get aircraftController(): AircraftController | null {
+    return this.controller;
+  }
+
+  /** Attach (or swap) the machine's controller. */
+  attachController(controller: AircraftController): void {
+    this.controller = controller;
   }
 
   /**

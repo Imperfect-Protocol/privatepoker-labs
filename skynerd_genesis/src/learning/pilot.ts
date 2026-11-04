@@ -5,35 +5,55 @@
  * its components. The only path to its levers is the machine's
  * control-input method (Aircraft.command, fed once per tick by the
  * flight that owns the machine); a pilot only READS the machine —
- * through the sighting the flight hands it — and produces the next
- * tick's control inputs. All mode logic lives HERE, outside the
- * aircraft:
+ * through the sighting the flight hands it (the instruments' sensed
+ * panels and the controls' own state) — and produces the next tick's
+ * control inputs. All mode logic lives in the AIRCRAFT CONTROLLERS
+ * (learning/aircraft-controller.ts), never in the flights:
  *
- *   InstructorPilot          — the demonstration hand: the phase
- *                              law's targets of the machine's TRUE
- *                              element, eased (the classroom), or the
- *                              stabilizer (the swarm's free flight);
- *   AIPilot                  — the tensor brain: sense, decide,
- *                              apply, relax — the AI's own hands;
- *   AIGuidedInstructorPilot  — (both a) the AI suggests and learns
- *                              continuously, the instructor flies;
- *   AIPilotWithInstructor    — (both b) the AI flies, the guardian
- *                              watches; danger takes the levers (a
- *                              guided flight while recovering), a
- *                              sustained safe stretch hands them back.
+ *   InstructorPilot   — the demonstration hand: the phase law's
+ *                       targets of the machine's TRUE element, eased
+ *                       (the classroom), or the stabilizer (free
+ *                       flight);
+ *   AiPilot           — THE TENSOR BRAIN, FULLY ENCAPSULATED: every
+ *                       tensor lives inside it (the memory, the
+ *                       pulsating network, the error neurons), and
+ *                       NOTHING outside ever sees a tensor. It reads
+ *                       the machine's signals (the sighting's sensed
+ *                       panels), decides on its own cadence, and
+ *                       operates the controls through the single
+ *                       method call — whatever tensors it holds
+ *                       inside can change without anything outside
+ *                       changing with them.
+ *
+ * The controllers compose the pilots: a SoloController flies one
+ * pilot; a PairController flies the AI beside the instructor (the
+ * AI suggesting and learning while the instructor flies, or the AI
+ * flying under the guardian). The flights hold a controller, the
+ * controller holds the pilots, and the machine knows its controller
+ * (Aircraft.attachController).
  */
 import { RigidBody } from "../physics/rigid-body.js";
 import {
   stabilizeTargets, isDangerous, RECOVERY_HOLD_S,
 } from "./guardian.js";
 import { levelOf } from "./instruments.js";
-import { ELEMENT_FREE_FLIGHT } from "./servo-tensor.js";
-import type {
-  NetworkDecision, ServoPolicy, TensorNetwork, TensorStateView,
+import {
+  ServoPolicy, TensorNetwork, TensorContext, ELEMENT_FREE_FLIGHT,
+  type NetworkDecision, type TensorStateView, type BrainSnapshot,
 } from "./servo-tensor.js";
+import type { PulseNeuron } from "./neurons.js";
 import type { NumpyPcg64 } from "../core/rng.js";
 import type { PhaseCursor } from "./school.js";
 import type { SenseReading } from "./instruments.js";
+
+/** The recovery window: decision windows to stay safe before the
+ *  guarded pair hands the levers back (both hosts decide at 5 Hz). */
+const RECOVERY_WINDOWS = Math.round(RECOVERY_HOLD_S * 5.0);
+
+/** The AI's own cadence when a caller does not say: 5 Hz, the frozen
+ *  protocol's decision clock (school.ts's DECISION_EVERY is 10 ticks
+ *  at 50 Hz — the same number; pilot.ts cannot import the school). */
+const DEFAULT_DECISION_EVERY = 10;
 
 /**
  * The instructor's hand: eases commanded deflections toward the raw
@@ -95,7 +115,8 @@ export interface PilotSighting {
   /** The machine's TRUE element cursor — the classroom's phase chain.
    *  Null in free flight: the swarm has no lesson. */
   readonly cursor: PhaseCursor | null;
-  /** The AI's sensed panels this tick (the tensor network's input). */
+  /** The AI's sensed panels this tick (the instruments' and the
+   *  controls' own state, binned — the brain's only input). */
   readonly sense: SenseReading;
   /** The instructor's observation beside the machine — the error
    *  wave's teaching source; null when nobody teaches. */
@@ -200,46 +221,152 @@ export class InstructorPilot implements Pilot {
   }
 }
 
+// ===========================================================================
+// THE AI PILOT — THE ENCAPSULATED TENSOR BRAIN
+// ===========================================================================
+
 /**
- * THE AI — the tensor brain at the controls. One decision window at
- * a time: sense, decide, apply — then the hands-off reflex between
- * windows. In the guided modes the same object is the SUGGESTION
- * engine (it always decides; the instructor's hands may fly) and
- * the error wave's student (learnFromInstructor).
+ * THE BRAIN'S TOKEN — an opaque snapshot of everything the AI has
+ * learned. Outside code passes it around (the boot trainer's
+ * transplant, the classroom's graduate, the swarm's newborn) but never
+ * looks inside: whatever tensors the brain holds, the token is what
+ * travels. When the tensors inside change, this alias changes with
+ * them — silently.
  */
-export class AIPilot implements Pilot {
-  /** The last decision window's decision (null before the first). */
-  lastDecision: NetworkDecision | null = null;
-  /** The AI's last per-channel choices (the panel's AERT strip). */
-  lastChoices: Int32Array | null = null;
+export type AiBrainState = BrainSnapshot;
 
-  constructor(private readonly network: TensorNetwork,
-              private readonly policy: ServoPolicy,
-              private readonly rng: NumpyPcg64,
-              private readonly decisionEvery: number,
-              private readonly spring: (commands: Float64Array,
-                                        dt: number) => Float64Array) {}
+/** What an AiPilot is constructed from: its dice, its decision
+ *  cadence, its hands-off reflex, and its starting intention. */
+export interface AiPilotOptions {
+  /** The AI's own dice — the network's per-tensor streams and the
+   *  exploration draw all come from here, deterministically. */
+  readonly seedRng: NumpyPcg64;
+  /** Decision windows per decision (10 ticks at 50 Hz = the frozen
+   *  5 Hz protocol). */
+  readonly decisionEvery?: number;
+  /** The hands-off reflex between windows (the stick springs toward
+   *  neutral). */
+  readonly spring: (commands: Float64Array, dt: number) => Float64Array;
+  /** The intention the brain starts holding. */
+  readonly startElementId?: number;
+  /** The exploration rate (defaults to the policy's own). */
+  readonly epsilon?: number;
+}
 
-  /** THE AI STATE LOG's subject: the brain's live snapshot. */
-  get stateView(): TensorStateView {
-    return this.network.stateView();
+/** The AI's per-tensor live key counts — the boot dialog's cube fills.
+ *  A DIAGNOSTIC view, not the tensors: names follow the brain's
+ *  layout and change with it, inside this file. */
+export interface AiBrainCounts {
+  readonly location: number;
+  readonly energy: number;
+  readonly flight: number;
+  readonly controls: number;
+  readonly skill: number;
+  readonly goal: number;
+  readonly servo: number;
+}
+
+/** The last decision's summary — what the outside world may know of
+ *  what the AI decided: the element it claims, and whether it acted.
+ *  Never the observation key, never the cells. */
+export interface AiIntent {
+  readonly elementId: number;
+  readonly acted: boolean;
+}
+
+/**
+ * THE AI — THE TENSOR BRAIN AT THE CONTROLS, FULLY ENCAPSULATED.
+ *
+ * Every tensor lives INSIDE: the memory (the policy), the pulsating
+ * network, the error neurons — nothing outside ever sees one. The
+ * pilot reads the machine's signals (the sighting's sensed panels —
+ * the instruments' and the controls' own state), decides one window
+ * at a time, and operates the controls through the single method
+ * call (the commands it returns reach the machine's own input
+ * method). The outside world knows four things about it:
+ *
+ *  - IT FLIES: step / relax (the Pilot contract), decide / applyTo
+ *    (the pair controllers' suggestion path);
+ *  - IT LEARNS: learnFromInstructor (the error wave), observeDemo /
+ *    observeTransition (the classroom's demonstration stamps),
+ *    credit / settle (its own decisions' reinforcement);
+ *  - ITS BRAIN TRAVELS AS A TOKEN: inherit / extract / weaveWith /
+ *    blendFrom (and the lifecycle: installPriors, consolidate,
+ *    prune, setExploration);
+ *  - IT REPORTS: stateView (the AI state log), choices (the panel's
+ *    AERT strip), lastIntent (the claimed element), counts (the boot
+ *    dialog's cubes).
+ *
+ * Because the tensors are inside, WHATEVER tensors the brain should
+ * hold can be swapped in — one file changes, nothing outside does.
+ */
+export class AiPilot implements Pilot {
+  /** THE MEMORY AND THE NETWORK — private: the tensors are this
+   *  class's own business, and nobody else's. */
+  private readonly policy = new ServoPolicy();
+  private readonly network: TensorNetwork;
+  /** The demonstration's own recurrent context — the demo stamps
+   *  observe with (its previous codes, its skill bins), separate
+   *  from the flight runtime below. */
+  private readonly demoContext = new TensorContext(ELEMENT_FREE_FLIGHT);
+  private readonly rng: NumpyPcg64;
+  private readonly decisionEvery: number;
+  private readonly spring: (commands: Float64Array,
+                             dt: number) => Float64Array;
+  private lastDecision: NetworkDecision | null = null;
+  private lastChoices: Int32Array | null = null;
+  /** Whether the AI's own hands are on the levers — the pair
+   *  controllers tell it (the instructor's hands mean the AI's
+   *  suggestion earns no flight credit). */
+  private handsOn = true;
+  /** The AI's own recent decisions, awaiting their flight's reward. */
+  private readonly recent: Array<[readonly number[], Int32Array]> = [];
+
+  constructor(options: AiPilotOptions) {
+    this.rng = options.seedRng;
+    this.decisionEvery = options.decisionEvery ?? DEFAULT_DECISION_EVERY;
+    this.spring = options.spring;
+    this.network = new TensorNetwork(this.policy,
+      options.startElementId ?? ELEMENT_FREE_FLIGHT, this.rng);
+    if (options.epsilon !== undefined) {
+      this.policy.epsilon = options.epsilon;
+    }
   }
 
-  /** Whether the decision window is open this tick. */
+  /** A fresh brain jar — the boot graduate, the classroom's
+   *  beginner, the singularity's vessel: constructed, never flown by
+   *  its own step, inherited from and blended into. */
+  static fresh(seedRng: NumpyPcg64): AiPilot {
+    return new AiPilot({ seedRng, spring: (commands) => commands });
+  }
+
+  // --- FLYING (the Pilot contract) ---------------------------------------
+
+  /** Whether the decision window opens this tick. */
   windowOpen(tick: number): boolean {
     return tick % this.decisionEvery === 0;
   }
 
-  /** One decision window: sense, decide (the suggestion; the state
-   *  log's subject; the element the AI claims). Between windows this
-   *  is a no-op. */
-  decideAt(sighting: PilotSighting): void {
+  /**
+   * ONE DECISION WINDOW: sense, decide — the suggestion. The AI
+   * always decides when the window opens (its own learning and the
+   * state log live on it, whoever's hands fly); when its own hands
+   * are on the levers the decision joins its reinforcement's recent
+   * window. Between windows a no-op.
+   */
+  decide(sighting: PilotSighting): void {
     if (!this.windowOpen(sighting.tick)) {
       return;
     }
     this.lastDecision = this.network.decide(sighting.goalId,
       sighting.sense, sighting.candidates, this.rng);
     this.lastChoices = this.lastDecision.actions;
+    if (this.lastDecision.acted && this.handsOn) {
+      this.recent.push([this.lastDecision.key, this.lastDecision.actions]);
+      if (this.recent.length > 10) {
+        this.recent.shift();
+      }
+    }
   }
 
   /** The AI's hands: drive the levers toward the decision's stops. */
@@ -251,22 +378,12 @@ export class AIPilot implements Pilot {
     return commands;
   }
 
-  /** The guided mode's learning: the instructor's element and levers
-   *  against the AI's own decision — the error wave, every window. */
-  learnFromInstructor(sighting: PilotSighting): void {
-    if (!this.windowOpen(sighting.tick) || sighting.teaching === null) {
-      return;
-    }
-    this.network.teach(sighting.teaching.elementId,
-                       sighting.teaching.actions, sighting.epoch);
-  }
-
   step(sighting: PilotSighting, commands: Float64Array): Float64Array {
     // One decision, one lever step per window — never per tick.
     if (!this.windowOpen(sighting.tick)) {
       return commands;
     }
-    this.decideAt(sighting);
+    this.decide(sighting);
     return this.applyTo(commands);
   }
 
@@ -277,87 +394,250 @@ export class AIPilot implements Pilot {
   get heldByInstructor(): boolean {
     return false;
   }
-}
 
-/**
- * (BOTH a) THE GUIDED FLIGHT — the AI suggests, the instructor flies.
- * The AI decides every window (its suggestion; its state log), the
- * instructor's hand flies the machine's true element, and the error
- * wave teaches the AI continuously: its suggestion against the
- * instructor's levers, its fired classes against the teacher's.
- */
-export class AIGuidedInstructorPilot implements Pilot {
-  constructor(private readonly ai: AIPilot,
-              private readonly instructor: InstructorPilot) {}
+  // --- LEARNING ------------------------------------------------------------
 
-  step(sighting: PilotSighting, commands: Float64Array): Float64Array {
-    this.ai.decideAt(sighting);             // the suggestion + the log
-    this.ai.learnFromInstructor(sighting); // the error wave, every window
-    return this.instructor.step(sighting, commands);
-  }
-
-  relax(commands: Float64Array, dt: number): Float64Array {
-    return this.instructor.relax(commands, dt);   // the hand holds
-  }
-
-  get heldByInstructor(): boolean {
-    return true;
-  }
-}
-
-/** The recovery window: decision windows to stay safe before the
- *  guarded flight hands the levers back (both hosts decide at 5 Hz). */
-const RECOVERY_WINDOWS = Math.round(RECOVERY_HOLD_S * 5.0);
-
-/**
- * (BOTH b) THE GUARDED FLIGHT — the AI flies, the instructor watches.
- * A dangerous state takes the levers (a guided flight while the
- * instructor recovers the machine — the AI suggesting and learning
- * through the recovery), and a sustained safe stretch hands them
- * back.
- */
-export class AIPilotWithInstructor implements Pilot {
-  private takeover = false;
-  private safeWindows = 0;
-
-  constructor(private readonly ai: AIPilot,
-              private readonly instructor: InstructorPilot) {}
-
-  step(sighting: PilotSighting, commands: Float64Array): Float64Array {
-    this.ai.decideAt(sighting);   // the AI always decides (log + suggestion)
-    if (!this.takeover) {
-      const applied = this.ai.windowOpen(sighting.tick)
-        ? this.ai.applyTo(commands) : commands;
-      if (this.ai.windowOpen(sighting.tick)
-          && isDangerous(sighting.body)) {
-        this.takeover = true;               // the guardian takes the levers
-        this.safeWindows = 0;
-        this.instructor.reseat(applied, sighting.body);
-      }
-      return applied;
+  /** The guided modes' learning: the instructor's element and levers
+   *  against the AI's own decision — the error wave, every window. */
+  learnFromInstructor(sighting: PilotSighting): void {
+    if (!this.windowOpen(sighting.tick) || sighting.teaching === null) {
+      return;
     }
-    // Taken over: the instructor flies, the AI suggests and learns
-    // through the recovery.
-    this.ai.learnFromInstructor(sighting);
-    const held = this.instructor.step(sighting, commands);
-    if (this.ai.windowOpen(sighting.tick)) {
-      this.safeWindows = isDangerous(sighting.body)
-        ? 0 : this.safeWindows + 1;
-      if (this.safeWindows >= RECOVERY_WINDOWS) {
-        this.takeover = false;              // handed back to the AI
-        this.safeWindows = 0;
+    this.network.teach(sighting.teaching.elementId,
+                       sighting.teaching.actions, sighting.epoch);
+  }
+
+  /** Credit the AI's own recent decisions with the flight's earned
+   *  reward (decaying eligibility). A no-op with no own decisions. */
+  credit(reward: number, epoch: number): void {
+    if (this.recent.length === 0) {
+      return;
+    }
+    this.policy.reinforce(this.recent, reward, epoch);
+  }
+
+  /** The flight's epilogue: the final reinforcement of its own recent
+   *  decisions, once. A crash or a stall teaches −2; reaching the
+   *  horizon still flying teaches +0.5; anything else ends neutral. */
+  settle(outcome: string | null, epoch: number): void {
+    if (outcome === "crashed" || outcome === "stalled") {
+      this.policy.reinforce(this.recent, -2.0, epoch);
+    } else if (outcome === null) {
+      this.policy.reinforce(this.recent, 0.5, epoch);
+    }
+  }
+
+  /** THE CLASSROOM'S DEMONSTRATION STAMP: the instructor's lesson,
+   *  watched and remembered — the sensors' classes under the
+   *  demonstration's own recurrence, the goal's transition, the
+   *  decided levers. Returns the situation bus state it landed at. */
+  observeDemo(goalId: number, elementId: number, sense: SenseReading,
+              actions: ArrayLike<number>, epoch: number,
+              amount = 1.0): number {
+    return this.policy.imprint(goalId, elementId, sense, actions,
+                               this.demoContext, amount, epoch);
+  }
+
+  /** The goal tensor's TRANSITION stamp: the demonstration moved from
+   *  (element, situation) to the next element. */
+  observeTransition(goalId: number, fromElementId: number, situation: number,
+                    toGoalId: number, toElementId: number, epoch: number,
+                    amount = 1.0): void {
+    this.policy.stampTransition(goalId, fromElementId, situation,
+                                toGoalId, toElementId, amount, epoch);
+  }
+
+  // --- THE BRAIN'S LIFECYCLE (opaque tokens in, opaque tokens out) ---------
+
+  /** A fresh flight over the same memory: the runtime resets (the
+   *  recurrence starts clean), the memory persists untouched. The
+   *  flights call this as they take the brain up. */
+  beginFlight(startElementId: number): void {
+    this.network.beginFlight(startElementId);
+    this.lastDecision = null;
+    this.lastChoices = null;
+    this.recent.length = 0;
+  }
+
+  /** The exploration rate (epsilon-greedy over its own options). */
+  get exploration(): number {
+    return this.policy.epsilon;
+  }
+
+  setExploration(rate: number): void {
+    this.policy.epsilon = rate;
+  }
+
+  /** Overwrite the brain with a token (the boot transplant, the
+   *  classroom's graduate, a parent's weave). */
+  inherit(state: AiBrainState): void {
+    this.policy.restore(state);
+  }
+
+  /** Copy the whole brain out as a token. */
+  extract(): AiBrainState {
+    return this.policy.snapshot();
+  }
+
+  /**
+   * GENETIC CROSS-OVER: a child's brain woven from this brain and
+   *  another's — each memory cell from either parent, the dice
+   *  deciding, the error-neuron signs inherited the same way. A
+   *  clone when both parents are one. The weaving is the brain's own
+   *  business; the boot trainer only asks.
+   */
+  weaveWith(other: AiPilot, rng: NumpyPcg64): AiBrainState {
+    const snapA = this.policy.snapshot();
+    const snapB = other.policy.snapshot();
+    const tensors = ["location", "energy", "flight", "controls", "skill",
+                     "goal", "servo"] as const;
+    const merged: Record<string, { values: Map<number, Float32Array>;
+                                   epochs: Map<number, Int32Array> }> = {};
+    for (const tensor of tensors) {
+      const a = snapA[tensor], b = snapB[tensor];
+      const values = new Map<number, Float32Array>();
+      const epochs = new Map<number, Int32Array>();
+      for (const [key, layers] of a.values) {
+        const fromB = rng.uniform() < 0.5 && b.values.has(key);
+        values.set(key, Float32Array.from(
+          fromB ? b.values.get(key)! : layers));
+        epochs.set(key, Int32Array.from(
+          fromB ? b.epochs.get(key)! : a.epochs.get(key)!));
+      }
+      for (const [key, layers] of b.values) {
+        if (!values.has(key) && rng.uniform() < 0.5) {
+          values.set(key, Float32Array.from(layers));
+          epochs.set(key, Int32Array.from(b.epochs.get(key)!));
+        }
+      }
+      merged[tensor] = { values, epochs };
+    }
+    return {
+      location: merged.location, energy: merged.energy,
+      flight: merged.flight, controls: merged.controls,
+      skill: merged.skill, goal: merged.goal, servo: merged.servo,
+      errorSigns: snapA.errorSigns.map((sign, i) =>
+        rng.uniform() < 0.5 ? sign : snapB.errorSigns[i]),
+    };
+  }
+
+  /**
+   * THE SWARM'S MEMORY PRIMITIVE: blend a random subset of a donor's
+   * memory into this brain at the given rate — the flock's births
+   * and death screams, the singularity's rounds. One law, one
+   * implementation, and it lives inside the brain.
+   */
+  blendFrom(donor: AiPilot, rng: NumpyPcg64, rate: number,
+            share: number): void {
+    const pairs: Array<[PulseNeuron, PulseNeuron]> = [
+      [this.policy.locationTensor, donor.policy.locationTensor],
+      [this.policy.energyTensor, donor.policy.energyTensor],
+      [this.policy.flightTensor, donor.policy.flightTensor],
+      [this.policy.controlsTensor, donor.policy.controlsTensor],
+      [this.policy.skillTensor, donor.policy.skillTensor],
+      [this.policy.goalTensor, donor.policy.goalTensor],
+      [this.policy.servoTensor, donor.policy.servoTensor],
+    ];
+    for (const [mine, theirs] of pairs) {
+      // Insertion order, like the Python dict.
+      const keys = [...theirs.values.keys()];
+      if (keys.length === 0) {
+        continue;
+      }
+      const count = Math.max(1, Math.trunc(keys.length * share));
+      const chosen = rng.choice(keys.length, count);
+      for (const index of chosen) {
+        AiPilot.mergeKey(mine, theirs, keys[index], rate);
       }
     }
-    return held;
   }
 
-  relax(commands: Float64Array, dt: number): Float64Array {
-    return this.takeover
-      ? this.instructor.relax(commands, dt)
-      : this.ai.relax(commands, dt);
+  /** Newest-layer merge of one key, the station law without the
+   *  station: the recipient's freshest slot blends toward the donor's
+   *  newest layer, two-way, exactly the flock's Python law. */
+  private static mergeKey(recipient: PulseNeuron, donor: PulseNeuron,
+                          keyIndex: number, rate: number): void {
+    const donorEpochs = donor.epochs.get(keyIndex)!;
+    let newest = 0;
+    for (let layer = 1; layer < donorEpochs.length; layer++) {
+      if (donorEpochs[layer] > donorEpochs[newest]) {
+        newest = layer;
+      }
+    }
+    const recipientLayers = recipient.values.get(keyIndex);
+    if (recipientLayers !== undefined) {
+      const donorLayers = donor.values.get(keyIndex)!;
+      // float32 semantics exactly like NumPy scalar math:
+      // diff is float32; rate * diff is float64; the store rounds to float32.
+      const diff = Math.fround(donorLayers[newest] - recipientLayers[0]);
+      recipientLayers[0] = Math.fround(recipientLayers[0] + rate * diff);
+      recipient.epochs.get(keyIndex)![0] = 0;
+      return;
+    }
+    recipient.values.set(keyIndex, Float32Array.from(donor.values.get(keyIndex)!));
+    recipient.epochs.set(keyIndex, Int32Array.from(donorEpochs));
   }
 
-  get heldByInstructor(): boolean {
-    return this.takeover;
+  /** The brain's own prior wiring (the pre-training's sensible
+   *  companies), imposed as floors with this brain's own jitter. */
+  installPriors(epoch: number, rng: NumpyPcg64): void {
+    this.policy.installPriors(epoch, rng);
+  }
+
+  /** The post-repetition signal-processing pass (noise → Gaussian →
+   *  Haar → threshold → de-Haar) over what the training fired. */
+  consolidate(epoch: number, rng: NumpyPcg64): void {
+    this.policy.consolidate(epoch, rng);
+  }
+
+  /** Forget: memory cells nobody has re-fired within the span die. */
+  prune(beforeEpoch: number): number {
+    return this.policy.prune(beforeEpoch);
+  }
+
+  // --- REPORTING (the UI and the flights' questions) ------------------------
+
+  /** THE AI STATE LOG's subject: the brain's live snapshot. */
+  get stateView(): TensorStateView {
+    return this.network.stateView();
+  }
+
+  /** The AI's last per-channel choices (the panel's AERT strip). */
+  get choices(): Int32Array | null {
+    return this.lastChoices;
+  }
+
+  /** The last decision's summary: the element the AI claims, and
+   *  whether it acted. Never the key, never the cells. */
+  get lastIntent(): AiIntent | null {
+    const decision = this.lastDecision;
+    return decision === null ? null
+      : { elementId: decision.elementId, acted: decision.acted };
+  }
+
+  /** The brain's live key counts, per tensor (the boot dialog's
+   *  cubes). A diagnostic view, honestly named for what the brain
+   *  holds today. */
+  counts(): AiBrainCounts {
+    return {
+      location: this.policy.locationTensor.storedCombinations,
+      energy: this.policy.energyTensor.storedCombinations,
+      flight: this.policy.flightTensor.storedCombinations,
+      controls: this.policy.controlsTensor.storedCombinations,
+      skill: this.policy.skillTensor.storedCombinations,
+      goal: this.policy.goalTensor.storedCombinations,
+      servo: this.policy.servoTensor.storedCombinations,
+    };
+  }
+
+  /** The brain's total stored key count. */
+  get storedCombinations(): number {
+    return this.policy.storedCombinations;
+  }
+
+  /** The hands truth — the pair controllers set it (whose hands fly
+   *  decides whose decisions earn flight credit). */
+  markHands(on: boolean): void {
+    this.handsOn = on;
   }
 }

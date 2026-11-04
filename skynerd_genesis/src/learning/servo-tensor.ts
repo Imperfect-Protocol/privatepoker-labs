@@ -1277,9 +1277,18 @@ class TensorNode {
   bind(network: TensorNetwork): void {
     this.network = network;
   }
-}
 
-/** The ISRLU-scaled weight a fired message carries. */
+  /** A fresh flight over the same brain: the node re-arms at birth
+   *  (a brand new network's state — reward, stun, clocks). */
+  reset(): void {
+    this.reward = 0.1;
+    this.staged = null;
+    this.relaxAt = Infinity;
+    this.armedDelay = 0.0;
+    this.fires = 0;
+    this.lastConsolidate = -Infinity;
+  }
+}/** The ISRLU-scaled weight a fired message carries. */
 function firedWeight(node: TensorNode): number {
   return node.reward;
 }
@@ -1393,7 +1402,7 @@ export class TensorNetwork {
    *  whose output is what the tensor already said makes NO message
    *  (only news travels; the cascade settles instead of ping-ponging
    *  itself past the horizon). */
-  private readonly sensorLastGossip:
+  private sensorLastGossip:
       Array<{ panel: readonly number[]; code: number } | null> =
     [null, null, null, null];
   private goalLastGoal = -1;
@@ -1402,7 +1411,7 @@ export class TensorNetwork {
   /** The sensors' recurrent keys from the last classification — where
    *  the error law's pump lands (on-policy: the exact cells the
    *  student's own flight will recall). */
-  private readonly lastSensorKeys:
+  private lastSensorKeys:
       Array<readonly number[]> = [[], [], [], []];
   /** The epoch the current teach() pumps fire at. */
   private teachEpoch = 0;
@@ -2078,6 +2087,45 @@ export class TensorNetwork {
       sensors,
       servo: { command, dominant: dominantOf(servoMasses) },
     };
+  }
+
+  /**
+   * A FRESH FLIGHT OVER THE SAME MEMORY: the runtime resets — the
+   *  recurrence starts clean, the nodes' reward EMAs re-arm at birth,
+   *  the gossip's no-news memory empties — exactly the state a brand
+   *  new TensorNetwork over this same policy would start from. The
+   *  MEMORY (the policy's tensors) persists untouched. The AiPilot
+   *  calls this as a flight takes the brain up (the encapsulated
+   *  brain's own beginFlight).
+   */
+  beginFlight(startElementId: number): void {
+    this.now = 0.0;
+    this.elementId = startElementId;
+    this.goalId = GOAL_FREE_FLIGHT;
+    this.firedActions = null;
+    this.firedKey = [];
+    this.decisionCount = 0;
+    this.goalLastGoal = -1;
+    this.goalLastElement = -1;
+    this.skillCoherenceLast = null;
+    this.sensorLastGossip = [null, null, null, null];
+    this.lastSensorKeys = [[], [], [], []];
+    const context = this.context;
+    context.location = 0;
+    context.energy = 0;
+    context.flight = 0;
+    context.controls = 0;
+    context.element = startElementId;
+    context.lastOption = 0;
+    context.skillBins[0] = 0;
+    context.skillBins[1] = 0;
+    context.skillBins[2] = 0;
+    context.skillBins[3] = 0;
+    context.coherence = 0.0;
+    context.coherenceBin = 0;
+    for (const node of this.nodes) {
+      node.reset();
+    }
   }
 
   /** The situation bus state: the four sensors' codes, merged. */

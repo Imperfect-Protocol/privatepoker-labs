@@ -23,13 +23,13 @@
  * drones keep speaking into it.
  */
 import { NumpyPcg64 } from "../core/rng.js";
-import { ServoPolicy } from "./servo-tensor.js";
+import { AiPilot } from "./pilot.js";
 import { Flock } from "./flock.js";
 import { MISSION_TOKENS, type MissionToken } from "./mission.js";
 
 /** One speaking drone: its own brain, and the mission leg it flies. */
 export interface SingularityMember {
-  readonly policy: ServoPolicy;
+  readonly pilot: AiPilot;
   readonly token: MissionToken;
 }
 
@@ -49,10 +49,10 @@ const SHARE_SHARE = 0.05;
  * shared brain and the shared intent honest.
  */
 export class SingularityTensor {
-  /** THE SHARED TENSOR's vessel — the seven neurons the swarm
-   *  maintains together, seeded empty (the boot-trained brains arrive
-   *  inside the drones, and speak into it from round one). */
-  private readonly vessel = new ServoPolicy();
+  /** THE SHARED TENSOR's vessel — a fresh brain jar, seeded empty (the
+   *  boot-trained brains arrive inside the drones, and speak into it
+   *  from round one). */
+  private readonly vessel = AiPilot.fresh(new NumpyPcg64(1n, 1n));
   /** The formation's current super-goal (the mission leg the plurality
    *  flies). */
   superGoal: MissionToken = "takeoff";
@@ -75,7 +75,7 @@ export class SingularityTensor {
     //    the one shared vessel.
     for (let i = 0; i < members.length; i += 1) {
       if (heard[i]) {
-        Flock.blend(this.vessel, members[i].policy, rng,
+        Flock.blend(this.vessel, members[i].pilot, rng,
                     ABSORB_RATE, ABSORB_SHARE);
       }
     }
@@ -84,7 +84,7 @@ export class SingularityTensor {
     //    same tensor, acting in formation with it.
     for (let i = 0; i < members.length; i += 1) {
       if (heard[i]) {
-        Flock.blend(members[i].policy, this.vessel, rng,
+        Flock.blend(members[i].pilot, this.vessel, rng,
                     SHARE_RATE, SHARE_SHARE);
       }
     }

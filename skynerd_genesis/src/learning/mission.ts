@@ -32,10 +32,10 @@
  * The chain flies through the PILOT LAYER exactly like the classroom:
  * the mission is the machine's TRUE element cursor (the same
  * PhaseCursor, the same physics-driven advance, the same runway pin
- * via stepMachine), and whoever holds the levers is a Pilot — the
- * instructor flying the true element, the AI flying its memory, or a
- * pair of them (the AI suggesting and learning while the instructor
- * flies). No mode logic lives here.
+ * via stepMachine), and the machine's own controller seats whoever
+ * holds the levers — the instructor flying the true element, the AI
+ * flying its memory, or the pair of them (the AI suggesting and
+ * learning while the instructor flies). No mode logic lives here.
  *
  * THE WILL PHASE: when the chain completes, the drone does NOT loop —
  * its will takes over. The pilot becomes the AI in FREE FLIGHT (the
@@ -61,14 +61,13 @@ import {
   FlightInstruments, DenseReward, EpisodeOutcome, classifyOutcome,
 } from "./instruments.js";
 import {
-  ServoPolicy, TensorNetwork, ACTION_HOLD, GOAL_FREE_FLIGHT,
-  type TensorStateView,
+  ACTION_HOLD, GOAL_FREE_FLIGHT, type TensorStateView,
 } from "./servo-tensor.js";
 import { ControlMode } from "./guardian.js";
 import {
-  AIPilot, AIGuidedInstructorPilot, AIPilotWithInstructor,
-  InstructorPilot, type Pilot, type PilotSighting,
+  AiPilot, InstructorPilot, type PilotSighting,
 } from "./pilot.js";
+import { AircraftController, controllerFor } from "./aircraft-controller.js";
 import { springStickTowardNeutral, TRIM_COMMAND } from "./flight.js";
 import {
   SYLLABUS, LEVEL_OFF_LEAD_S, PhaseCursor, stepMachine, startCommandsFor,
@@ -474,12 +473,14 @@ export interface MissionOptions {
  * ONE DRONE'S SORTIE — the machine flying the attack mission. The
  * same sealed Aircraft the classroom flies, advanced by the same
  * stepMachine (physics, gear, the runway pin, the cursor); the same
- * Pilot layer at the levers; the drone's own tensor brain suggesting
- * and learning (the instructor's own element observation is the error
- * wave's source — no twin in the swarm, the instructor flies THIS
- * machine). The mission ends in the WILL PHASE: the chain complete,
- * the drone's own brain takes the controls in free flight, and its
- * life ends only physically — a crash, or leaving the area.
+ * pilot layer at the levers, seated through the machine's own
+ * controller (the mode IS the controller); the drone's own tensor
+ * brain suggesting and learning (the instructor's own element
+ * observation is the error wave's source — no twin in the swarm, the
+ * instructor flies THIS machine). The mission ends in the WILL
+ * PHASE: the chain complete, the drone's own brain takes the
+ * controls in free flight, and its life ends only physically — a
+ * crash, or leaving the area.
  */
 export class MissionFlight implements MachineHost {
   readonly aircraft: Aircraft;
@@ -491,28 +492,26 @@ export class MissionFlight implements MachineHost {
   private readonly tokens: readonly MissionToken[];
   private cursor: PhaseCursor;
 
-  private readonly policy: ServoPolicy;
-  private readonly network: TensorNetwork;
   private readonly instruments: FlightInstruments;
   private readonly epoch: number;
-  private readonly rng: NumpyPcg64;
   private readonly dense: DenseReward;
-  private readonly recent: Array<[readonly number[], Int32Array]> = [];
   private pendingReward = 0.0;
   private readonly decisionEvery = DECISION_EVERY;
   private readonly steps = Infinity;
   private commands = Float64Array.from(startCommandsFor("runway"));
   private readonly candidates: readonly number[];
 
-  /** THE PILOTS — same as the classroom: the AI suggests and learns;
-   *  the instructor flies the TRUE element; the mode IS the pilot. */
-  private readonly ai: AIPilot;
+  /** THE PILOT LAYER — same as the classroom: the AI suggests and
+   *  learns; the instructor flies the TRUE element; the controller
+   *  IS the mode (all mode logic lives in the AircraftController
+   *  classes, never here). */
+  private readonly ai: AiPilot;
   private readonly instructor: InstructorPilot;
   /** The WILL PHASE's free-flight instructor: the stabilizer whose
    *  observation keeps teaching the AI through its own flight (the
    *  swarm's LiveEpisode law). */
   private readonly freeInstructor = new InstructorPilot(TRIM_COMMAND, true);
-  private pilot: Pilot;
+  private controller: AircraftController;
   private mode: ControlMode;
   /** The flank heading — marked every tick of the flank's level leg
    *  (the rally's roll-out captures back onto it). */
@@ -525,13 +524,22 @@ export class MissionFlight implements MachineHost {
   private outcome: string | null = null;
   tick = 0;
 
-  constructor(policy: ServoPolicy, instruments: FlightInstruments,
-              epoch: number, rng: NumpyPcg64,
-              options: MissionOptions) {
-    this.policy = policy;
+  /**
+   * THE DRONE'S PILOT — the swarm builds the brain, the mission flies
+   * it: the pilot-layer's whole configuration (the mission's decision
+   * cadence, the student's stick spring) named in one place. The
+   * constructor draws the network's seeds from the seed stream, so
+   * the swarm hands the drone its own dice and this factory.
+   */
+  static pilot(seedRng: NumpyPcg64): AiPilot {
+    return new AiPilot({ seedRng, decisionEvery: DECISION_EVERY,
+                         spring: springStickTowardNeutral });
+  }
+
+  constructor(ai: AiPilot, instruments: FlightInstruments,
+              epoch: number, options: MissionOptions) {
     this.instruments = instruments;
     this.epoch = epoch;
-    this.rng = rng;
     this.flankSign = options.flankSign;
     this.world = new World({ halfExtent: options.worldHalfExtent
       ?? MISSION_AREA_M });
@@ -546,17 +554,19 @@ export class MissionFlight implements MachineHost {
     this.candidates = this.phases
       .filter((phase) => phase.stamp)
       .map((phase) => phase.elementId);
-    this.network = new TensorNetwork(policy, this.phases[0].elementId, rng);
-    this.ai = new AIPilot(this.network, this.policy, rng,
-                          this.decisionEvery, springStickTowardNeutral);
+    this.ai = ai;
+    // A fresh sortie over the same memory: the runtime resets (the
+    // recurrence starts clean at the takeoff roll), the memory persists.
+    ai.beginFlight(this.phases[0].elementId);
     this.instructor = new InstructorPilot(startCommandsFor("runway"), false);
     this.mode = options.mode ?? "both-suggest";
-    this.pilot = this.pilotFor(this.mode);
+    this.controller = controllerFor(this.aircraft, this.mode, this.ai,
+                                    this.instructor);
     this.dense = new DenseReward(instruments, 5.0);
     this.dense.reset(this.aircraft.body);
     if (options.epsilonOverride !== undefined
         && options.epsilonOverride !== null) {
-      policy.epsilon = options.epsilonOverride;
+      ai.setExploration(options.epsilonOverride);
     }
   }
 
@@ -566,10 +576,10 @@ export class MissionFlight implements MachineHost {
     return this.mode;
   }
 
-  /** Swap the whole pilot — the mode IS the pilot object. A mid-mission
-   *  swap re-seats the instructor's hand from the drone's CURRENT
-   *  lever targets; the cursor and the brain run on untouched. In the
-   *  will phase the swap is the swarm's free-flight law: the
+  /** Swap the whole controller — the mode IS the controller. A
+   *  mid-mission swap re-seats the instructor's hand from the drone's
+   *  CURRENT lever targets; the cursor and the brain run on untouched.
+   *  In the will phase the swap is the swarm's free-flight law: the
    *  free-flight instructor (the stabilizer, firm hand, captured
    *  altitude) flies or watches beside the AI. */
   setControlsMode(mode: ControlMode): void {
@@ -577,64 +587,32 @@ export class MissionFlight implements MachineHost {
       return;
     }
     this.mode = mode;
-    if (this.willPhase) {
-      this.freeInstructor.reseat(this.commands, this.aircraft.body);
-      switch (mode) {
-        case "ai": this.pilot = this.ai; break;
-        case "instructor": this.pilot = this.freeInstructor; break;
-        case "both-suggest":
-          this.pilot = new AIGuidedInstructorPilot(this.ai,
-            this.freeInstructor);
-          break;
-        case "both-guarded":
-          this.pilot = new AIPilotWithInstructor(this.ai,
-            this.freeInstructor);
-          break;
-      }
-      return;
-    }
-    this.pilot = this.pilotFor(mode, {
-      commands: this.commands,
-      body: this.aircraft.body,
-    });
-  }
-
-  /** The pilot for a controls mode — the ONLY place the modes exist. */
-  private pilotFor(mode: ControlMode, reseat?: {
-    commands: Float64Array; body: RigidBody }): Pilot {
-    const instructor = new InstructorPilot(startCommandsFor("runway"), false);
-    if (reseat !== undefined) {
-      instructor.reseat(reseat.commands, reseat.body);
-    }
-    switch (mode) {
-      case "ai": return this.ai;
-      case "instructor": return instructor;
-      case "both-suggest":
-        return new AIGuidedInstructorPilot(this.ai, instructor);
-      case "both-guarded":
-        return new AIPilotWithInstructor(this.ai, instructor);
-    }
+    const instructor = this.willPhase
+      ? this.freeInstructor : this.instructor;
+    this.controller = controllerFor(this.aircraft, mode, this.ai,
+      instructor,
+      { commands: this.commands, body: this.aircraft.body });
   }
 
   /** Whether the instructor's hand is on the levers right now (the
    *  status line and the panel care). */
   get instructorAtControls(): boolean {
-    return this.pilot.heldByInstructor;
+    return this.controller.heldByInstructor;
   }
 
   /** The hand's decisions for the panel — the classroom's contract. */
   get handInputs(): HandDecisions {
-    return this.pilot.heldByInstructor
+    return this.controller.heldByInstructor
       ? { choices: null, fresh: false }
       : {
-        choices: this.ai.lastChoices,
+        choices: this.ai.choices,
         fresh: this.tick % this.decisionEvery < this.decisionEvery / 2,
       };
   }
 
   /** THE AI STATE LOG's subject: the drone's tensor network snapshot. */
   stateView(): TensorStateView {
-    return this.network.stateView();
+    return this.ai.stateView;
   }
 
   /** How the sortie ended (null while it flies). */
@@ -703,8 +681,9 @@ export class MissionFlight implements MachineHost {
   private enterWill(): void {
     this.willPhase = true;
     this.mode = "ai";         // the will has the controls
-    this.pilot = this.ai;
     this.freeInstructor.reseat(this.commands, this.aircraft.body);
+    this.controller = controllerFor(this.aircraft, this.mode, this.ai,
+                                    this.freeInstructor);
   }
 
   /** The chain-phase sighting: the machine's TRUE element cursor, the
@@ -757,24 +736,12 @@ export class MissionFlight implements MachineHost {
       return false;
     }
     if (this.tick % this.decisionEvery === 0) {
-      if (this.recent.length > 0) {
-        this.policy.reinforce(this.recent, this.pendingReward, this.epoch);
-      }
+      this.ai.credit(this.pendingReward, this.epoch);
       this.pendingReward = 0.0;
     }
     const sighting = this.willPhase
       ? this.willSighting() : this.missionSighting();
-    this.commands = this.pilot.step(sighting, this.commands);
-    // Only the AI's own FIRED decisions earn credit — while the
-    // instructor holds the levers there is nothing of its own to credit.
-    const decision = this.ai.lastDecision;
-    if (decision !== null && this.tick % this.decisionEvery === 0
-        && decision.acted && !this.pilot.heldByInstructor) {
-      this.recent.push([decision.key, decision.actions]);
-      if (this.recent.length > 10) {
-        this.recent.shift();
-      }
-    }
+    this.commands = this.controller.step(sighting, this.commands);
     if (this.willPhase) {
       // FREE FLIGHT — the will's own hands: no chain to advance, the
       // machine consumes the inputs and the outcome is the drone's own.
@@ -783,7 +750,7 @@ export class MissionFlight implements MachineHost {
         - this.world.terrainHeight(this.aircraft.body.position.x,
                                     this.aircraft.body.position.y));
       this.tick += 1;
-      this.commands = this.pilot.relax(this.commands, this.dt);
+      this.commands = this.controller.relax(this.commands, this.dt);
       this.pendingReward += this.dense.tick(this.aircraft.body) + 0.0005;
       const outcome = classifyOutcome(this.aircraft.body, this.world,
                                       this.tick * this.dt);
@@ -804,7 +771,7 @@ export class MissionFlight implements MachineHost {
       this.flankMark.value = Math.atan2(forward.y, forward.x);
     }
     this.tick += 1;
-    this.commands = this.pilot.relax(this.commands, this.dt);
+    this.commands = this.controller.relax(this.commands, this.dt);
     this.pendingReward += this.dense.tick(this.aircraft.body) + 0.0005;
     if (!flying) {
       if (this.cursor.finished) {
@@ -846,9 +813,6 @@ export class MissionFlight implements MachineHost {
   /** The sortie's epilogue: the final reinforcement, once. */
   private finish(outcome: string): void {
     this.outcome = outcome;
-    if (outcome === EpisodeOutcome.CRASHED
-        || outcome === EpisodeOutcome.STALLED) {
-      this.policy.reinforce(this.recent, -2.0, this.epoch);
-    }
+    this.ai.settle(outcome, this.epoch);
   }
 }

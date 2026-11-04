@@ -60,7 +60,7 @@ export const TERRAIN_MAX = 305.0;
 /** The airfield's flat carve: the ellipse of plateau ground the runway
  *  lives on (the shape shared with the physics world's AIRFIELD),
  *  rimmed by a smooth roll into the natural terrain. */
-export const FIELD = { cx: AIRFIELD.cx, rx: AIRFIELD.rx, ry: AIRFIELD.ry, rim: 1.45 };
+export const FIELD = { cx: AIRFIELD.cx, rx: AIRFIELD.rx, ry: AIRFIELD.ry, rim: 4.0 };
 /** The plateau's height: 95 ft — the runway's flat ground. The
  *  aircraft's 100 ft takeoff datum is this plus 5 ft of landing gear,
  *  so standing on the runway the instruments read 100 ft. */
@@ -492,9 +492,10 @@ export class Flora {
 
   /** Nothing plants on the airfield or the roads. */
   private excluded(x: number, y: number): boolean {
-    if (x > RUNWAY.near - 110.0 && x < RUNWAY.far + 110.0
-        && Math.abs(y) < 125.0) {
-      return true;                          // the airfield's clear zone
+    const fx = (x - FIELD.cx) / FIELD.rx;
+    const fy = y / FIELD.ry;
+    if (fx * fx + fy * fy < FIELD.rim) {
+      return true;             // the whole carved apron stays clear
     }
     const [dx, dy] = this.land.roadDistances(x, y);
     return Math.abs(dx) < 13.0 || Math.abs(dy) < 13.0;

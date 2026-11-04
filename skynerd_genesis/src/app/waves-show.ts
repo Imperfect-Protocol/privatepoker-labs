@@ -41,6 +41,7 @@ import { MissionFlight, MISSION_AREA_M, type MissionToken } from "../learning/mi
 import { SingularityTensor, type SingularityMember } from "../learning/singularity.js";
 import { SYLLABUS } from "../learning/school.js";
 import { ServoPolicy, type BrainSnapshot, type TensorStateView } from "../learning/servo-tensor.js";
+import type { AiPilot } from "../learning/pilot.js";
 import { Scene, type SceneAircraft } from "./scene.js";
 import {
   hudDelta, readoutOf, meanReadoutOf, type HudDelta,
@@ -80,7 +81,7 @@ const DT = 1.0 / 50.0;
 /** One drone of the conveyor: its pair, seat, brain, machine, life. */
 interface ConveyorDrone {
   readonly pair: number;
-  readonly policy: ServoPolicy;
+  readonly pilot: AiPilot;
   readonly flight: MissionFlight;
   readonly entry: SceneAircraft;
 }
@@ -357,7 +358,7 @@ export class WavesShow {
       }
     }
     const members: SingularityMember[] = live
-      .map((d) => ({ policy: d.policy, token: d.flight.missionToken }));
+      .map((d) => ({ pilot: d.pilot, token: d.flight.missionToken }));
     this.singularity.updateRound(members, mesh, this.rng);
     for (const drone of live) {
       drone.flight.conform(this.singularity.superGoal);
@@ -375,26 +376,26 @@ export class WavesShow {
   private launchPair(): void {
     const pair = this.nextPair++;
     for (const flankSign of [-1.0, 1.0]) {
-      const policy = new ServoPolicy();
+      // The drone's own dice, drawn from the swarm's master stream: its
+      // brain and its exploration are its own, deterministic and
+      // replayable.
+      const state = this.rng.draw64();
+      const inc = this.rng.draw64();
+      const pilot = MissionFlight.pilot(new NumpyPcg64(state, inc));
       // THE BRAIN TRANSPLANT: the newborn receives the boot-trained
       // tensors first, then the flock's living mosaic teaches on top —
       // every drone starts from what the flight school learned.
       if (this.brainSnapshot !== null) {
-        policy.restore(this.brainSnapshot);
+        pilot.inherit(this.brainSnapshot);
       }
-      this.flock.seedNewborn(policy, this.rng);
-      this.flock.enroll(policy);
-      // The drone's own dice, drawn from the swarm's master stream: its
-      // exploration is its own, deterministic and replayable.
-      const state = this.rng.draw64();
-      const inc = this.rng.draw64();
+      this.flock.seedNewborn(pilot, this.rng);
+      this.flock.enroll(pilot);
       // THE PAIR SEAT: both drones ON the runway — the lane split into
       // two halves, each seat at the centre of its own half, both at
       // the same threshold (the launch interval is the trail).
       const position = new Vec3(LAUNCH_X,
         flankSign * RUNWAY.half * PAIR_SEAT_Y, SYLLABUS.runwayM);
-      const flight = new MissionFlight(policy, this.instruments, pair,
-                                       new NumpyPcg64(state, inc), {
+      const flight = new MissionFlight(pilot, this.instruments, pair, {
         flankSign,
         startPosition: position,
         epsilonOverride: PAIR_EPSILON,
@@ -409,7 +410,7 @@ export class WavesShow {
         flying: true,
         dead: false,
       });
-      this.drones.push({ pair, policy, flight, entry });
+      this.drones.push({ pair, pilot, flight, entry });
     }
   }
 
@@ -420,8 +421,8 @@ export class WavesShow {
     drone.entry.flying = false;
     drone.entry.dead = outcome !== null && died(outcome);
     if (drone.entry.dead) {
-      this.flock.reap(drone.policy);
-      this.flock.broadcastObituary(drone.policy, this.rng);
+      this.flock.reap(drone.pilot);
+      this.flock.broadcastObituary(drone.pilot, this.rng);
     }
   }
 

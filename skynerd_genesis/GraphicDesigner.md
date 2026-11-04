@@ -614,3 +614,88 @@ seams (12 diff = texture noise; the veil's gradient steps 3–7 units
 continuously across the boundary), the disc's rim legitimately jumping
 (the sun's own edge at x≈781), the terrain greens matching within 4.
 npm test 9 suites green; both tsconfigs clean.
+
+## §18 the wedges, the plinth, and the field's wide apron
+
+**THE WEDGES** (the user's attack-scenario screenshots: black
+triangles with curved boundaries eating the side panes' ground).
+Diagnosis: the tile index's indexOne() culled EVERY instance —
+terrain quads included — by its CENTRE: `clip.w <= 0.25 → invisible`.
+The quad the camera stands in, and every quad straddling the near
+plane, has its centre behind the eye while fragments of its footprint
+are still on screen → the quad vanishes → the hole shows the sky
+under the crash floor's gate → PURE BLACK at low camera heights.
+The 160 m far cells made the holes big diagonal wedges. The fix is
+THE QUAD'S OWN LAW — indexQuad() in tile-index.ts: a quad dies only
+when ALL FOUR corners (at their terrain heights) sit behind the near
+plane; the screen box comes from the corners in front (the near-plane
+crossings bounded by the projected footprint radius at the nearest
+front corner), and a camera inside a quad's footprint at the near
+plane sweeps the whole view. The trees keep indexOne — their
+footprint is honestly inside their radius. Pixel-verified at BOTH
+altitudes in the drone-attack scenario (a low climb shot at ~300 ft
+and the attack run at ~2600 ft, panels hidden, the user's exact
+state): 0 near-black spans in the side panes.
+
+**THE PLINTH** (the user's 'margin underneath the control panel that
+view is sneaking through'). The geometry truth: the slab WAS flush
+(slab.bottom − view.bottom = −1); the strip was the #cockpit-foot
+FLOW ROW under the view inside the panel — 22 px of --panel
+(#0a0f16) between the view's bottom and the panel's own bottom,
+which at dusk reads as world. The foot is now THE PANEL'S BLACK
+BASE: background #000 seated on the view's bottom border by a −9 px
+top margin, bled past the panel's side padding by −10 px margins,
+and #cockpit itself carries a 48 px black band at its bottom
+(linear-gradient) so the plinth runs solid from the dashboard's
+straight black bottom edge to the panel's bottom edge. Verified:
+rows under the view read (0,0,0) edge to edge.
+
+**THE BOTTOM EDGE IS JUST BLACK** (the user's exact words): the
+gradient's bottom stop went #03060b → #000000, and the lit highlight
+stroke now rides the sill's TOP and SIDES ONLY (the bottom edge has
+no line — the slab ends solid). shoulderOf() is the one law for the
+shape and its edge. Verified: the slab's last rows read (1,1,1),
+no stroke row, the world beginning cleanly below.
+
+**THE FIELD'S WIDE APRON** (the user: 'terrain in near vicinity of
+the runway must be flat same level as runway'): the airfield carve's
+rim widened 1.45 → 4.0 (w-units — the flat core is w<1; the roll now
+spans to 2× the ellipse, ~840 m lateral / 2100 m longitudinal), and
+the flora's exclusion widened from the runway's box to the whole
+carved apron (w < FIELD.rim) — no trees on the field's lawn. The
+height field verified numerically: the runway and its ellipse dead
+flat at 29.0 m; 250 m past the far end 29.2 m; 500 m beside centre
+36.6 m — a gentle roll into the hills, no cliffs. The physics world
+keeps its exact ellipse (the aircraft never flies the rim); the
+CPU ray-march shortcuts ride the flat core, unchanged.
+
+Both tsconfigs clean; npm test 9 suites green (pipeline 236);
+restart-check: the 2 waves-scenario FAILs are the concurrent
+session's wave→pair refactor, untouched by this work.
+
+## §19 the splash screen
+
+**THE POSTER'S OWN MOMENT** (the user: like the vite app's splash).
+index.html gained `<div id="splash">`; web/style.css paints it
+fixed, inset 0, z-index 150 (over the boot dialog's 100): the
+full-bleed splash.png cover-centred on #05070c. Both servers serve
+the same asset — the CSS layers the two URLs (url("/splash.png")
+for the deployed build, where public/ lands at the root, then
+url("/public/splash.png") for the dev server, where the repo root
+IS the web root); the 404ing layer is simply never painted.
+
+**THE LAW** (main.ts, mountSplash beside BOOT_SKIP): hold 2600 ms,
+fade 700 ms (the vite app's clock: logo fade at 2200 + duration 700),
+then .gone removes it from the layout. A click anywhere on the
+poster dismisses at once. prefers-reduced-motion shortens the fade
+to 150 ms. THE DEVELOPER'S FAST PATH: ?boot=skip mounts nothing —
+every CDP probe and restart-check's stub ride it and never see the
+splash.
+
+**Verified live, both paths**: at 1.2 s the splash holds (opacity 1,
+block, the background layers present) and the screenshot PAINTS THE
+POSTER (luminance mean 78, stdev 49 — a flat #05070c screen reads
+~7 everywhere); at 4 s it is `fading gone`, opacity 0, display none;
+under ?boot=skip it is `gone` at once. Both tsconfigs clean; npm
+test 9 suites green; restart-check unchanged (the 2 waves FAILs are
+the concurrent session's wave→pair refactor).
