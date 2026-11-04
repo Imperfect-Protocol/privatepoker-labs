@@ -180,12 +180,17 @@ function layoutSidebar(): void {
   const used = others.reduce((sum, child) => sum + child.offsetHeight, 0.0);
   const gaps = gap * (others.length + panels.length - 1);
   const avail = aside.clientHeight - padY;
-  const panelH = Math.max(120.0, (avail - used - gaps) / 2.0);
-  const panelW = Math.round(panelH * 1.5);
-  for (const canvas of panels) {
-    canvas.style.width = `${panelW}px`;
-    canvas.style.height = `${Math.round(panelH)}px`;
-  }
+  // The controls square is a NARROW horizontal strip (a fifth of the
+  // column, capped); the view takes the rest and holds 16:9. Both
+  // panels share the view's width, so the sidebar stays one column.
+  const stripH = Math.max(60.0,
+    Math.min(140.0, (avail - used - gaps) * 0.22));
+  const viewH = Math.max(120.0, avail - used - gaps - stripH);
+  const viewW = Math.round(viewH * 16 / 9);
+  els.cockpitCanvas.style.width = `${viewW}px`;
+  els.cockpitCanvas.style.height = `${Math.round(viewH)}px`;
+  els.controlsCanvas.style.width = `${viewW}px`;
+  els.controlsCanvas.style.height = `${Math.round(stripH)}px`;
 }
 
 function fitCanvas(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
