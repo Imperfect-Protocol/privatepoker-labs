@@ -6,15 +6,24 @@
  * instructor's twin.
  */
 const GEAR = new GearContact();
-function stepMachine(school: FlightSchool, aircraft: Aircraft,
-                     cursor: PhaseCursor, commands: Float64Array): boolean {
-  aircraft.command(commands, school.dt);
+/** The machine-tick's host: anything that owns a clock, a world, and
+ *  the ground's judgment — the classroom's FlightSchool, or the swarm's
+ *  mission drone (learning/mission.ts). The machine asks nothing else
+ *  of its host. */
+export interface MachineHost {
+  readonly dt: number;
+  readonly world: World;
+  grounded(body: RigidBody): boolean;
+}
+export function stepMachine(host: MachineHost, aircraft: Aircraft,
+                            cursor: PhaseCursor, commands: Float64Array): boolean {
+  aircraft.command(commands, host.dt);
   // Height above the terrain: ground effect lives in the physics.
   const agl = aircraft.body.position.z
-    - school.world.terrainHeight(aircraft.body.position.x,
-                                  aircraft.body.position.y);
-  aircraft.step(school.dt, agl);
-  GEAR.apply(aircraft.body, agl, school.dt);
+    - host.world.terrainHeight(aircraft.body.position.x,
+                               aircraft.body.position.y);
+  aircraft.step(host.dt, agl);
+  GEAR.apply(aircraft.body, agl, host.dt);
   const phase = cursor.current;
   if (phase.pin === true) {
     // The runway: hold the aircraft at 100 ft while it cannot fly (vz
@@ -34,7 +43,7 @@ function stepMachine(school: FlightSchool, aircraft: Aircraft,
     }
   }
   cursor.advance(aircraft.body);
-  if (school.grounded(aircraft.body) && phase.pin !== true) {
+  if (host.grounded(aircraft.body) && phase.pin !== true) {
     return false;
   }
   if (cursor.finished) {
@@ -275,7 +284,7 @@ function clamp(value: number, limit: number): number {
   return Math.max(-limit, Math.min(limit, value));
 }
 
-function wrapPi(angle: number): number {
+export function wrapPi(angle: number): number {
   return Math.atan2(Math.sin(angle), Math.cos(angle));
 }
 
@@ -365,6 +374,8 @@ export interface PhaseReadings {
   vsMps: number;
   /** Heading change since this phase started, rad (positive = right turn). */
   turned: number;
+  /** The aircraft's heading (HSI), rad — 0 toward +x, +π/2 toward +y. */
+  heading: number;
   /** Heading rate, rad/s (positive = turning right). */
   headingRate: number;
   /** Ticks (1/50 s) spent in this phase. */
@@ -420,13 +431,19 @@ export function elementNameOf(id: number): string {
 }
 
 /** The control law an element flies: which channels it commands, and how. */
-interface ElementLaw {
+export interface ElementLaw {
   /** Hold this bank (rad) with the ailerons, if defined. */
   readonly bankTarget?: number;
   /** Carry the heading accumulator across this element (turn roll-in/out). */
   readonly carryTurn?: boolean;
   /** Roll out onto exactly entry-heading ± 180° (a heading hold). */
   readonly headingHold?: boolean;
+  /** Roll out onto a RUNTIME heading (rad): the bank that closes the
+   *  remaining turn onto the callback's heading. The target is read
+   *  through a callback so a plan can MARK a heading at flight time
+   *  (the mission's rally returns onto its flank heading, whatever the
+   *  attack's natural arc overshot). */
+  readonly headingTo?: () => number;
   /** Hold vertical speed (m/s) with the elevator, if defined. */
   readonly vsTarget?: number;
   /** LEVEL-OFF CAPTURE: a firm nose-down that eases off with the pitch excess. */
@@ -442,6 +459,10 @@ interface ElementLaw {
   /** The spin's direction: -1 = left (default), +1 = right. Directs the
    *  pro-spin rudder and the dropped wing. */
   readonly spinSign?: number;
+  /** The heading-hold roll-out's landing amount, rad — the standard
+   *  180° turn when absent. The mission's split / attack / rally legs
+   *  land on 45° and 90°. */
+  readonly turnAmount?: number;
   readonly rudder: RudderLaw;
   readonly throttle: number;
 }
@@ -493,8 +514,11 @@ export abstract class FlightElement {
   targets(r: PhaseReadings, cursor: PhaseCursor): Float64Array {
     // The bank being held: the element's, or — in a heading-hold
     // roll-out — the bank that closes the remaining turn onto ±180°.
-    const bankTarget = this.law.headingHold === true
-      ? clamp(1.4 * wrapPi(cursor.turnDirection * Math.PI - r.turned), AILERON_LIMIT)
+    const bankTarget = this.law.headingTo !== undefined
+      ? clamp(1.4 * wrapPi(this.law.headingTo() - r.heading), AILERON_LIMIT)
+      : this.law.headingHold === true
+      ? clamp(1.4 * wrapPi(cursor.turnDirection
+          * (this.law.turnAmount ?? Math.PI) - r.turned), AILERON_LIMIT)
       : this.law.bankTarget;
     // aileron: bank-hold (or a fixed deflection in the spin entry) with
     // TURN-KINEMATICS compensation: in a banked, nose-up turn the heading
@@ -691,6 +715,7 @@ export class PhaseCursor {
       rateR: body.rateR,
       vsMps: body.velocity.z,
       turned: this.turned,
+      heading,
       headingRate: turnRate,
       ticks: this.ticks,
       alpha,
@@ -1073,7 +1098,7 @@ export const GoalChecks = {
  * TAKEOFF ROLL: full throttle, yoke neutral, wings level on the gear —
  * roll on the ground until rotation speed.
  */
-class RunwayRollElement extends FlightElement {
+export class RunwayRollElement extends FlightElement {
   readonly name: ElementName = "roll";
   readonly stamp = true;
   readonly pin = true;
@@ -1097,7 +1122,7 @@ class RunwayRollElement extends FlightElement {
  * effect — the deck comes up to the 15° climb attitude while the wing
  * starts to carry.
  */
-class RotateElement extends FlightElement {
+export class RotateElement extends FlightElement {
   readonly name: ElementName = "rotate";
   readonly stamp = true;
   readonly pin = true;
@@ -1127,7 +1152,7 @@ class RotateElement extends FlightElement {
  * takeoff's climb to 1000 ft and the stall/spin recovery's pull-up back
  * to 3000 ft are the SAME skill at different target altitudes.
  */
-class ClimbElement extends FlightElement {
+export class ClimbElement extends FlightElement {
   readonly name: ElementName = "climb";
   readonly stamp = true;
 
@@ -1151,7 +1176,7 @@ class ClimbElement extends FlightElement {
  * and settle onto the target altitude, smooth — 1000 ft after takeoff,
  * 3000 ft after the stall/spin recovery.
  */
-class LevelOffElement extends FlightElement {
+export class LevelOffElement extends FlightElement {
   readonly name: ElementName = "level off";
   readonly stamp = true;
   private readonly atAltitudeM: number;
@@ -1172,7 +1197,7 @@ class LevelOffElement extends FlightElement {
 }
 
 /** LEVEL CRUISE: hands-off, 85 mph, 2300 RPM, wings level, VSI 0. */
-class CruiseElement extends FlightElement {
+export class CruiseElement extends FlightElement {
   readonly name: ElementName = "cruise";
   readonly stamp = true;
 
@@ -1198,7 +1223,7 @@ class CruiseElement extends FlightElement {
 }
 
 /** ROLL IN: roll to the target bank and start the turn. */
-class RollInElement extends FlightElement {
+export class RollInElement extends FlightElement {
   readonly name: ElementName = "roll in";
   readonly stamp = true;
 
@@ -1215,7 +1240,7 @@ class RollInElement extends FlightElement {
 }
 
 /** TURN: hold the bank, nose on the horizon, through the full 180°. */
-class TurnElement extends FlightElement {
+export class TurnElement extends FlightElement {
   readonly name: ElementName = "turn";
   readonly stamp = true;
   private readonly leadOut: number;
@@ -1258,7 +1283,7 @@ class TurnElement extends FlightElement {
  *  The roll-out COMPLETES the turn — it carries the heading accumulator
  *  and lands on the target — so the 180° goal is graded here, at the
  *  end of the element that finishes the maneuver. */
-class RollOutElement extends FlightElement {
+export class RollOutElement extends FlightElement {
   readonly name: ElementName = "roll out";
   readonly stamp = true;
 
@@ -1280,7 +1305,7 @@ class RollOutElement extends FlightElement {
 }
 
 /** SETTLE: hold level and let the aircraft settle after the roll-out. */
-class SettleElement extends FlightElement {
+export class SettleElement extends FlightElement {
   readonly name: ElementName = "settle";
   readonly stamp = true;
 
@@ -1297,7 +1322,7 @@ class SettleElement extends FlightElement {
 
 /** DESCEND: nose below the horizon at the descent attitude, speed on
  *  the power, wings level, down to the target altitude. */
-class DescendElement extends FlightElement {
+export class DescendElement extends FlightElement {
   readonly name: ElementName = "descend";
   readonly stamp = true;
 
@@ -1326,7 +1351,7 @@ class DescendElement extends FlightElement {
  * CLIMBING TURN: the bank and the climb held together through the full
  * 180° — the vertical speed on the elevator, the speed on the power.
  */
-class ClimbingTurnElement extends FlightElement {
+export class ClimbingTurnElement extends FlightElement {
   readonly name: ElementName = "climbing turn";
   readonly stamp = true;
   private readonly leadOut: number;
@@ -1365,7 +1390,7 @@ class ClimbingTurnElement extends FlightElement {
  * the full 180° — power low, the speed on the throttle, the nose below
  * the horizon the whole way round.
  */
-class DescendingTurnElement extends FlightElement {
+export class DescendingTurnElement extends FlightElement {
   readonly name: ElementName = "descending turn";
   readonly stamp = true;
   private readonly leadOut: number;
@@ -1401,7 +1426,7 @@ class DescendingTurnElement extends FlightElement {
 
 /** STALL ENTRY: idle, yoke FULL AFT — pull it to the stop and hold it
  *  there until the wing gives up. Shown only. */
-class StallEntryElement extends FlightElement {
+export class StallEntryElement extends FlightElement {
   readonly name: ElementName = "stall entry";
   readonly stamp = false;
 
@@ -1416,7 +1441,7 @@ class StallEntryElement extends FlightElement {
 }
 
 /** WAIT: hold it into the break. Shown only. */
-class StallWaitElement extends FlightElement {
+export class StallWaitElement extends FlightElement {
   readonly name: ElementName = "wait";
   readonly stamp = false;
 
@@ -1431,7 +1456,7 @@ class StallWaitElement extends FlightElement {
 }
 
 /** BREAK: neutral yoke, let the nose drop through the stall. Shown only. */
-class StallBreakElement extends FlightElement {
+export class StallBreakElement extends FlightElement {
   readonly name: ElementName = "break";
   readonly stamp = false;
 
@@ -1446,7 +1471,7 @@ class StallBreakElement extends FlightElement {
 }
 
 /** PUSH: the stall-recovery dive — nose down, break the stall, dive out. */
-class PushElement extends FlightElement {
+export class PushElement extends FlightElement {
   readonly name: ElementName = "push";
   readonly stamp = true;
 
@@ -1468,7 +1493,7 @@ class PushElement extends FlightElement {
 }
 
 /** DROP WING: the spin entry's stalled, dropping wing. Shown only. */
-class DropWingElement extends FlightElement {
+export class DropWingElement extends FlightElement {
   readonly name: ElementName = "drop wing";
   readonly stamp = false;
 
@@ -1485,7 +1510,7 @@ class DropWingElement extends FlightElement {
 }
 
 /** SPIN: the developed, self-sustaining rotation. Shown only. */
-class SpinElement extends FlightElement {
+export class SpinElement extends FlightElement {
   readonly name: ElementName = "spin";
   readonly stamp = false;
 
@@ -1504,7 +1529,7 @@ class SpinElement extends FlightElement {
  * OPPOSITE RUDDER: full anti-spin rudder and HOLD it until the rotation
  * stops.
  */
-class OppositeRudderElement extends FlightElement {
+export class OppositeRudderElement extends FlightElement {
   readonly name: ElementName = "opposite rudder";
   readonly stamp = true;
 
@@ -1523,7 +1548,7 @@ class OppositeRudderElement extends FlightElement {
 }
 
 /** DIVE: neutral yoke, wings level, let it build 60 mph. */
-class DiveElement extends FlightElement {
+export class DiveElement extends FlightElement {
   readonly name: ElementName = "dive";
   readonly stamp = true;
 

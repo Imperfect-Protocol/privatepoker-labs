@@ -137,6 +137,7 @@ label select { text-transform: none; }
  * is left under the controls panel. */
 #cockpit {
   grid-area: sidebar;
+  position: relative;       /* the side viewports' absolute strips anchor here */
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -146,6 +147,10 @@ label select { text-transform: none; }
 }
 /* dragged shut by the grip: a zero-width column with no padding sliver */
 #cockpit.collapsed { padding-left: 0; padding-right: 0; }
+/* THE MAP'S HIDE LAW: dragging the grip far enough left (the sidebar
+ * grows past the map's own 10% floor) hides the MAP column — the
+ * sidebar then owns the whole width below the toolbar */
+#app.map-hidden { grid-template-columns: 0px 7px auto; }
 .cockpit-head {
   display: flex;
   justify-content: space-between;
@@ -156,16 +161,71 @@ label select { text-transform: none; }
   font: 400 9px var(--display);
   letter-spacing: 2px;
 }
-#cockpitCanvas,
-#controlsCanvas {
-  display: block;
-  margin-inline: auto;      /* centered when the grip made the column wide */
+/* the cockpit's canvas STACK: THE CURVED WINDSHIELD — one view area
+ * split into three seamless world panes (left, centre, right — the
+ * eye at the centre, the side cameras yawed for a continuous curved
+ * projection), with the light layer and the HUD over the centre pane
+ * and the controls strip FLOATING on top. layoutSidebar() places each
+ * canvas in px; no borders between panes — the view is continuous. */
+.cockpit-view {
+  position: relative;
+  margin-inline: auto;
   background: #03060b;
   border: 1px solid var(--line);
   border-radius: 0;
-  /* pixel width/height are set by layoutSidebar(): the view holds
-   * 16:9, the controls square is a narrow horizontal strip of the same
-   * width — together filling the sidebar's height */
+  overflow: hidden;
+  /* pixel width/height are set by layoutSidebar(): the view = the
+   * whole content area, the panes tile it */
+}
+.cockpit-view canvas {
+  position: absolute;
+  display: block;
+  /* left/top/width/height in px by layoutSidebar() */
+}
+/* THE LIGHT LAYER: flare + glare ride between the world and the HUD,
+ * composited plus-lighter — true ADDITIVE (screen family), so their
+ * ink ADDS to the world's own glow exactly like the sky shader's
+ * col +=, never alpha-pastes over it */
+#lightCanvas {
+  mix-blend-mode: plus-lighter;
+  pointer-events: none;
+}
+/* THE HUD GLASS: the cockpit ink (tapes, ladder, markers, objects)
+ * composites ADDITIVELY too — the instruments read like luminous
+ * glass over the world, adding their light instead of pasting over
+ * the scene (the classic fighter-HUD look) */
+#cockpitCanvas {
+  mix-blend-mode: plus-lighter;
+  pointer-events: none;
+}
+/* THE CONTROLS STRIP: the pilot's console FLOATS on top of the
+ * windshield's bottom-centre — an opaque slab over the world.
+ * layoutSidebar() sets its left/width/height in px. */
+#controlsCanvas {
+  display: block;
+  position: absolute;
+  bottom: 0;
+  background: #03060b;
+  border: none;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  z-index: 5;
+}
+/* the render-feature checkboxes, right next to RESET */
+label.cb {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 10px;
+  color: var(--dim);
+  font: 600 10px var(--display);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  user-select: none;
+}
+label.cb input {
+  accent-color: var(--accent);
 }
 #cockpit-foot { color: var(--dim); font-size: 10px; letter-spacing: 0.05em; min-height: 13px; }
 

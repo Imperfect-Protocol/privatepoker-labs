@@ -137,11 +137,12 @@ export class FlightSchoolShow {
   /** The classroom's dice, shared by the attempts. */
   private readonly rng = new NumpyPcg64(RNG0_STATE, RNG0_INC);
   /** THE CONTROLS DROPDOWN's sticky choice — one aircraft, one mode,
-   *  carried across attempts. The classroom's default is the
-   *  INSTRUCTOR: a fresh scenario demonstrates first (the old
-   *  demo-first pedagogy), and the person hands the aircraft to the
-   *  AI with the dropdown when they want the student's attempt. */
-  controlsMode: ControlMode = "instructor";
+   *  carried across attempts. The classroom's default is PAIR:
+   *  INSTRUCTOR (both-suggest): the instructor's hands fly the
+   *  machine while the AI suggests and learns from them every window;
+   *  the person gives the aircraft wholly to the AI with the dropdown
+   *  when they want the student's solo attempt. */
+  controlsMode: ControlMode = "both-suggest";
 
   constructor(readonly school: FlightSchool, readonly policy: ServoPolicy) {
     this.lessonNames = [...school.lessons.keys()];

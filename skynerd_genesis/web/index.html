@@ -23,10 +23,10 @@
         </label>
         <label>controls
           <select id="controls">
-            <option value="ai">AI</option>
-            <option value="instructor">instructor</option>
-            <option value="both-suggest">both · AI suggests</option>
-            <option value="both-guarded">both · guarded</option>
+            <option value="instructor">Solo: Instructor</option>
+            <option value="ai">Solo: AI</option>
+            <option value="both-suggest" selected>Pair: Instructor</option>
+            <option value="both-guarded">Pair: AI</option>
           </select>
         </label>
         <button id="next" title="N — next maneuver">&#9654; next maneuver</button>
@@ -50,6 +50,29 @@
         <button id="zoomIn" title="zoom in">+</button>
         <button id="zoomOut" title="zoom out">&minus;</button>
         <button id="zoomReset" title="reset view">reset</button>
+        <label class="cb" title="hill shading from the surface normal"><input type="checkbox" id="cbRelief">relief</label>
+        <label class="cb" title="the sun's glare veil"><input type="checkbox" id="cbGlare">glare</label>
+        <label class="cb" title="the horizon's fog dissolve"><input type="checkbox" id="cbHaze" checked>haze</label>
+        <label class="cb" title="hill shadows (the corner-ray field)"><input type="checkbox" id="cbSunShadows">shadows</label>
+        <label class="cb" title="water reflections (reserved)"><input type="checkbox" id="cbWaterRefl">refl</label>
+        <label class="cb" title="the biome checkerboard ground"><input type="checkbox" id="cbChecker" checked>checker</label>
+        <label>time
+          <select id="timeOfDay">
+            <option value="dawn">dawn</option>
+            <option value="sunrise">sunrise</option>
+            <option value="noon" selected>noon</option>
+            <option value="sunset">sunset</option>
+            <option value="dusk">dusk</option>
+            <option value="night">night</option>
+          </select>
+        </label>
+        <label>flare
+          <select id="lensFlare">
+            <option value="none" selected>none</option>
+            <option value="panavision">panavision</option>
+            <option value="michaelbay">michael bay</option>
+          </select>
+        </label>
       </div>
     </div>
 
@@ -59,14 +82,20 @@
       <div id="status">booting…</div>
     </div>
 
-    <div id="sideGrip" class="grip" title="drag to resize the side panel — past 30% it hides"></div>
+    <div id="sideGrip" class="grip" title="drag to resize the side panel — under 10% of the screen it hides"></div>
 
     <aside id="cockpit">
       <div class="cockpit-head">
         <span id="cockpit-title">—</span>
       </div>
-      <canvas id="cockpitCanvas"></canvas>
-      <canvas id="controlsCanvas"></canvas>
+      <div class="cockpit-view" id="cockpit-view">
+        <canvas id="worldCanvasL"></canvas>
+        <canvas id="worldCanvas"></canvas>
+        <canvas id="lightCanvas"></canvas>
+        <canvas id="cockpitCanvas"></canvas>
+        <canvas id="worldCanvasR"></canvas>
+        <canvas id="controlsCanvas"></canvas>
+      </div>
       <div id="cockpit-foot"></div>
     </aside>
 

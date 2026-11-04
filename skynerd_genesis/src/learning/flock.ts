@@ -88,7 +88,16 @@ export class Flock {
   /** Blend a random subset of each donor neuron into the recipient. */
   private teach(recipient: ServoPolicy, donor: ServoPolicy, rng: NumpyPcg64,
                 rate: number, fraction?: number): void {
-    const share = fraction === undefined ? this.teachFraction : fraction;
+    Flock.blend(recipient, donor, rng, rate,
+                fraction === undefined ? this.teachFraction : fraction);
+  }
+
+  /** The swarm's shared memory primitive: merge a random subset of each
+   *  donor neuron into the recipient at the given rate. The flock's
+   * births and death screams use it; the SINGULARITY TENSOR's rounds
+   * use it too (learning/singularity.ts) — one law, one implementation. */
+  static blend(recipient: ServoPolicy, donor: ServoPolicy, rng: NumpyPcg64,
+               rate: number, share: number): void {
     const pairs: Array<[PulseNeuron, PulseNeuron]> = [
       [recipient.locationTensor, donor.locationTensor],
       [recipient.energyTensor, donor.energyTensor],
