@@ -1,0 +1,81 @@
+/**
+ * Fixed-command physics trajectories vs the TS-frozen C172 reference
+ * (reference/c172-physics-frozen.json, tools/freeze-physics.mjs).
+ * The Python flight-ref trajectories are invalidated by the C172 redesign
+ * (1111 kg airframe, body-rate quaternion propagation, ground effect); the
+ * frozen file re-records the same scenarios on the corrected physics.
+ * No policy, no RNG: the deterministic core. Exact reproduction expected
+ * up to libm ulp differences; tolerance applied per sample.
+ */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+import { Vec3 } from "../src/core/vec.js";
+import { RigidBody } from "../src/physics/rigid-body.js";
+import { SurfacesState } from "../src/physics/surfaces.js";
+import { check, finish, section } from "./harness.js";
+
+const refPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "reference", "c172-physics-frozen.json");
+const ref = JSON.parse(readFileSync(refPath, "utf8"));
+
+const TOL = 1e-9;
+
+function close(a: number, b: number, tol: number): boolean {
+  return Math.abs(a - b) <= tol + 1e-12 * Math.abs(b);
+}
+
+function vecClose(got: readonly number[], want: readonly number[], name: string,
+                  tol: number, failures: string[]): boolean {
+  let ok = true;
+  for (let i = 0; i < want.length; i++) {
+    if (!close(got[i], want[i], tol)) {
+      ok = false;
+      failures.push(`${name}[${i}]: got ${got[i]} want ${want[i]}`);
+    }
+  }
+  return ok;
+}
+
+for (const run of ref.physics_runs) {
+  section(`physics: ${run.name}`);
+  {
+    const commands = Float64Array.from(run.commands);
+    const start = run.name === "stalled_drop"
+      ? { pos: new Vec3(0.0, 0.0, 50.0), vel: new Vec3(10.5, 0.0, 0.0), stalled: true }
+      : run.name === "knife_edge_slip"
+        ? { pos: new Vec3(0.0, 0.0, 300.0), vel: new Vec3(15.0, 0.0, 0.0), stalled: false }
+        : { pos: new Vec3(0.0, 0.0, 50.0), vel: new Vec3(10.5, 0.0, 0.0), stalled: false };
+    const body = new RigidBody(start.pos, start.vel);
+    if (start.stalled) {
+      body.velocity = new Vec3(5.0, 0.0, -3.5);
+    }
+    const servos = new SurfacesState();
+    const failures: string[] = [];
+    let sampleCount = 0;
+    for (let tick = 0; tick < run.ticks; tick++) {
+      servos.command(commands, run.dt);
+      const diag = body.step(servos, run.dt);
+      if (tick % 5 === 0) {
+        const want = run.samples[sampleCount];
+        const q = body.attitude;
+        vecClose([body.position.x, body.position.y, body.position.z], want.pos,
+                 `t${tick}.pos`, TOL, failures);
+        vecClose([body.velocity.x, body.velocity.y, body.velocity.z], want.vel,
+                 `t${tick}.vel`, TOL, failures);
+        vecClose([q.w, q.x, q.y, q.z], want.quat, `t${tick}.quat`, TOL, failures);
+        vecClose([body.rateP, body.rateQ, body.rateR], want.rates, `t${tick}.rates`,
+                 TOL, failures);
+        vecClose(Array.from(servos.positions), want.surfaces, `t${tick}.surfaces`,
+                 TOL, failures);
+        vecClose([diag.airspeed, diag.alpha, diag.beta, diag.qDyn, diag.lift,
+                  diag.drag, diag.thrust], want.diag, `t${tick}.diag`, TOL, failures);
+        sampleCount++;
+      }
+    }
+    check(`all ${sampleCount} samples match`, failures.length === 0,
+          failures.slice(0, 3).join("; "));
+  }
+}
+
+finish("physics.test");

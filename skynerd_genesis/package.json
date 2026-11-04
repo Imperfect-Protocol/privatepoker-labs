@@ -1,0 +1,14 @@
+{
+  "name": "skynerd-genesis",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser-native TypeScript + WebGPU port of the Skynerd Hebbian drone swarm",
+  "type": "module",
+  "scripts": {
+    "dev": "tsc -p tsconfig.web.json && node dev-server.mjs",
+    "build": "tsc -p tsconfig.json",
+    "build:web": "tsc -p tsconfig.web.json",
+    "test": "tsc -p tsconfig.json && node build/test/run.js",
+    "clean": "rm -rf build build-web"
+  }
+}
