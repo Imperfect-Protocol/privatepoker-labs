@@ -17,10 +17,14 @@
  *    known goals; fail and the instructor shows it again, forever; ONE
  *    student (same brain, same tensors, every weight carried over)
  *    for the whole page life;
- *  - drone attack waves: the swarm as a conveyor — a wave is many
- *    drones in a line, the next wave lifts off right behind the last
- *    at a distance, no waiting; every drone connects to every nearby
- *    drone, and the dying scream their memory to whoever hears.
+ *  - drone attack: the swarm as a conveyor of PAIRS — two drones lift
+ *    off from the runway abreast, the next pair five seconds behind,
+ *    pair after pair; each flies the attack mission and then its own
+ *    will decides; the flock maintains one shared SingularityTensor
+ *    — updated from every neighbour and every neighbour's neighbour —
+ *    whose super-goal keeps the carpet in formation; every drone
+ *    connects to every nearby drone, and the dying scream their memory
+ *    to whoever hears.
  *
  * The aircraft dropdown lists the scene's aircraft. Only a page reload
  * or the restart button ever starts anything over.
@@ -30,7 +34,8 @@
  */
 import { mphOf, vsHundredsOf, altFtOf, rpmOf } from "./units.js";
 import {
-  drawCockpitView, drawControlsView, droneViewOf, type DroneView,
+  drawCockpitView, drawControlsView, drawSideViewport,
+  droneViewOf, type DroneView, FOV_HALF,
 } from "./cockpit.js";
 import { FlightSchoolShow } from "./school-show.js";
 import { WavesShow } from "./waves-show.js";
@@ -45,6 +50,16 @@ import { TRIM_SPEED } from "../learning/flight.js";
 import { drawBrainView, tensorCounts } from "./boot-brain.js";
 import { ServoPolicy } from "../learning/servo-tensor.js";
 import type { Scene, SceneAircraft } from "./scene.js";
+import { LandUse } from "./land.js";
+import {
+  DEFAULT_FEATURES, GpuWorldRenderer,
+  type RenderFeatures, type TimeOfDay,
+} from "../pipeline/index.js";
+import {
+  RENDER_STATE, setTimeOfDay,
+  type LensFlare,
+} from "./render-state.js";
+import { groundRender } from "./ground-render.js";
 
 interface GoldenLesson {
   lesson: string;
@@ -73,6 +88,8 @@ const els = {
   zoomIn: document.getElementById("zoomIn") as HTMLButtonElement,
   zoomOut: document.getElementById("zoomOut") as HTMLButtonElement,
   zoomReset: document.getElementById("zoomReset") as HTMLButtonElement,
+  timeOfDay: document.getElementById("timeOfDay") as HTMLSelectElement | null,
+  lensFlare: document.getElementById("lensFlare") as HTMLSelectElement | null,
   badge: document.getElementById("badge")!,
   tabWiki: document.getElementById("tabWiki")!,
   tabAi: document.getElementById("tabAi")!,
@@ -80,6 +97,13 @@ const els = {
   cockpit: document.getElementById("cockpit") as HTMLElement,
   cockpitTitle: document.getElementById("cockpit-title")!,
   cockpitFoot: document.getElementById("cockpit-foot")!,
+  cockpitView: document.getElementById("cockpit-view") as HTMLElement | null,
+  worldCanvas: document.getElementById("worldCanvas") as HTMLCanvasElement | null,
+  lightCanvas: document.getElementById("lightCanvas") as HTMLCanvasElement | null,
+  worldCanvasL: document.getElementById("worldCanvasL") as HTMLCanvasElement | null,
+  worldCanvasR: document.getElementById("worldCanvasR") as HTMLCanvasElement | null,
+  lightCanvasL: document.getElementById("lightCanvasL") as HTMLCanvasElement | null,
+  lightCanvasR: document.getElementById("lightCanvasR") as HTMLCanvasElement | null,
   cockpitCanvas: document.getElementById("cockpitCanvas") as HTMLCanvasElement,
   controlsCanvas: document.getElementById("controlsCanvas") as HTMLCanvasElement,
   boot: document.getElementById("boot") as HTMLElement,
@@ -88,10 +112,134 @@ const els = {
   bootBrain: document.getElementById("bootBrain") as HTMLCanvasElement,
   bootExpand: document.getElementById("bootExpand") as HTMLButtonElement,
   bootDone: document.getElementById("bootDone") as HTMLButtonElement,
+  splash: document.getElementById("splash") as HTMLElement,
 };
 
 /** The scenario ids: every lesson name, then the drone attack waves. */
 const WAVES_SCENARIO = "drone-attack-waves";
+
+// --- the world renderer: the GPU pipeline when the browser grants one
+// (the cockpit falls back to its CPU path per frame otherwise) --------
+const renderFeatures: RenderFeatures = { ...DEFAULT_FEATURES };
+let gpuWorld: GpuWorldRenderer | null = null;
+/** The side viewport panes' own renderers — created on the MAIN
+ *  renderer's device once it exists (one device, three canvases);
+ *  empty until then (and forever on the CPU-path machines — the
+ *  strips stay hidden without a GPU world). */
+const sideWorlds: GpuWorldRenderer[] = [];
+{
+  const world = new LandUse();   // the plan's own arrays, shared
+  const textures = {
+    heights: world.heightsOf(),
+    biomes: world.biomesOf(),
+  };
+  void GpuWorldRenderer.create(els.worldCanvas, textures)
+    .then(async (renderer) => {
+      gpuWorld = renderer;
+      if (gpuWorld === null) {
+        return;
+      }
+      gpuWorld.setFeatures(renderFeatures);
+      gpuWorld.setTimeOfDay(RENDER_STATE.tod);
+      // the side panes: the same world on the same device, one
+      // renderer per strip canvas
+      const sides = await Promise.all([
+        GpuWorldRenderer.create(els.worldCanvasL, textures,
+                                gpuWorld.gpuDevice),
+        GpuWorldRenderer.create(els.worldCanvasR, textures,
+                                gpuWorld.gpuDevice),
+      ]);
+      for (const side of sides) {
+        if (side !== null) {
+          side.setFeatures(renderFeatures);
+          side.setTimeOfDay(RENDER_STATE.tod);
+          sideWorlds.push(side);
+        }
+      }
+    });
+}
+
+// the toolbar's render toggles (plan §5), next to RESET; absent
+// headlessly — the harness stubs have no checkbox elements
+const FEATURE_CHECKS: readonly (readonly [string,
+                                        keyof RenderFeatures])[] = [
+  ["cbRelief", "relief"],
+  ["cbGlare", "glare"],
+  ["cbHaze", "haze"],
+  ["cbSunShadows", "sunShadows"],
+  ["cbWaterRefl", "waterReflections"],
+];
+/** The toolbar's choices reach EVERY pane: the windshield and the two
+ *  side strips — one features object, fanned out. */
+function applyFeatures(): void {
+  if (gpuWorld !== null) {
+    gpuWorld.setFeatures(renderFeatures);
+  }
+  for (const side of sideWorlds) {
+    side.setFeatures(renderFeatures);
+  }
+}
+
+/** The hour reaches every pane too. */
+function applyTimeOfDay(tod: TimeOfDay): void {
+  if (gpuWorld !== null) {
+    gpuWorld.setTimeOfDay(tod);
+  }
+  for (const side of sideWorlds) {
+    side.setTimeOfDay(tod);
+  }
+}
+
+for (const [id, key] of FEATURE_CHECKS) {
+  const el = document.getElementById(id) as HTMLInputElement | null;
+  if (el === null) {
+    continue;
+  }
+  renderFeatures[key] = el.checked;
+  el.addEventListener("change", () => {
+    renderFeatures[key] = el.checked;
+    applyFeatures();
+  });
+}
+
+// the checkerboard ground (plan §5): a feature toggle like the rest —
+// both the uniform (extras.x) and the CPU ground read it
+{
+  const el = document.getElementById("cbChecker") as HTMLInputElement | null;
+  if (el !== null) {
+    renderFeatures.checker = el.checked;
+    RENDER_STATE.checker = el.checked;
+    groundRender.checker = el.checked;
+    el.addEventListener("change", () => {
+      renderFeatures.checker = el.checked;
+      RENDER_STATE.checker = el.checked;
+      groundRender.checker = el.checked;
+      applyFeatures();
+    });
+  }
+}
+
+// the sky's moods (plan §5): the uniform carries them on GPU, the
+// CPU path reads the same table — one source, both renderers
+{
+  const el = els.timeOfDay;
+  if (el !== null) {
+    el.addEventListener("change", () => {
+      const tod = el.value as TimeOfDay;
+      setTimeOfDay(tod);                          // the CPU twin
+      groundRender.setMood(RENDER_STATE.mood);
+      applyTimeOfDay(tod);
+    });
+  }
+}
+{
+  const el = els.lensFlare;
+  if (el !== null) {
+    el.addEventListener("change", () => {
+      RENDER_STATE.flare = el.value as LensFlare;
+    });
+  }
+}
 
 const state = {
   /** The classroom — ONE student for the whole page life (or null). */
@@ -181,31 +329,105 @@ function layoutSidebar(): void {
   const padY = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
   const padX = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
   const gap = parseFloat(style.rowGap) || 8.0;
-  // Everything in the column that is not a panel: its measured height
-  // comes off the panels' budget, whatever the markup grows into.
-  const panels = [els.cockpitCanvas, els.controlsCanvas];
+  // The flow children that are not the view: the title head and the
+  // foot readout. The controls strip FLOATS on the view now — it is
+  // not a row, so the view takes every metre the column has.
   const others = [...aside.children].filter(
-    (child): child is HTMLElement => !(child instanceof HTMLCanvasElement));
+    (child): child is HTMLElement =>
+      !(child instanceof HTMLCanvasElement) && child !== els.cockpitView);
   const used = others.reduce((sum, child) => sum + child.offsetHeight, 0.0);
-  const gaps = gap * (others.length + panels.length - 1);
+  const gaps = gap * others.length;   // head|view and view|foot
   const avail = aside.clientHeight - padY;
-  // The controls square is a NARROW horizontal strip; the view takes the
-  // rest and holds 16:9. The grip may have pinned the column narrower or
-  // wider than that: the view fits INSIDE the column (16:9 preserved),
-  // the strip stays proportional to the view.
-  let stripH = Math.max(60.0,
-    Math.min(140.0, (avail - used - gaps) * 0.22));
-  let viewH = Math.max(120.0, avail - used - gaps - stripH);
+  // THE VIEW = THE CURVED WINDSHIELD: the whole content area, split
+  // into three seamless panes when the GPU world renders (left, centre,
+  // right — the eye at the centre, the side cameras yawed for a
+  // continuous projection). One pane only on the CPU path — the
+  // reference view keeps the whole width.
+  // THE WIDTH LAW (the original anchor, kept): the sidebar is an
+  // AUTO grid track — its width follows its content — so the view's
+  // width must come from the HEIGHT (the 16:9 law), never from
+  // aside.clientWidth (that feeds the track back into itself and
+  // collapses the column to a stub). When the GRIP has pinned the
+  // column, the pinned width wins and the panes fill it exactly.
+  let viewH = Math.max(120.0, avail - used - gaps);
   let viewW = Math.round(viewH * 16 / 9);
-  if (sideWidth !== null && viewW > sideWidth - padX) {
-    viewW = Math.max(120.0, Math.round(sideWidth - padX));
-    viewH = Math.round(viewW * 9 / 16);
-    stripH = Math.max(48.0, Math.min(140.0, Math.round(viewH * 0.30)));
+  if (sideWidth !== null) {
+    const pinned = Math.max(120.0, Math.round(sideWidth - padX));
+    if (pinned < viewW) {
+      viewW = pinned;
+      viewH = Math.round(viewW * 9 / 16);
+    } else {
+      viewW = pinned;                    // wide: the panes fill the void
+    }
   }
-  els.cockpitCanvas.style.width = `${viewW}px`;
-  els.cockpitCanvas.style.height = `${Math.round(viewH)}px`;
-  els.controlsCanvas.style.width = `${viewW}px`;
+  const thirds = gpuWorld !== null && gpuWorld.ready
+    && sideWorlds.length === 2 && sideWorlds.every((w) => w.ready);
+  let centreW = viewW;
+  if (els.cockpitView !== null) {
+    els.cockpitView.style.width = `${Math.round(viewW)}px`;
+    els.cockpitView.style.height = `${Math.round(viewH)}px`;
+  }
+  if (thirds) {
+    // the three panes tile the view exactly — widths rounded so they
+    // SUM to the view (no subpixel seams), the centre keeps the rest
+    const wL = Math.floor(viewW / 3.0);
+    const wR = Math.floor((viewW - wL) / 2.0);
+    const wC = Math.round(viewW - wL - wR);
+    centreW = wC;
+    placeCanvas(els.worldCanvasL, 0, wL, viewH);
+    placeCanvas(els.lightCanvasL, 0, wL, viewH);
+    placeCanvas(els.worldCanvas, wL, wC, viewH);
+    placeCanvas(els.lightCanvas, wL, wC, viewH);
+    placeCanvas(els.cockpitCanvas, wL, wC, viewH);
+    placeCanvas(els.worldCanvasR, wL + wC, wR, viewH);
+    placeCanvas(els.lightCanvasR, wL + wC, wR, viewH);
+  } else {
+    hideCanvas(els.worldCanvasL);
+    hideCanvas(els.worldCanvasR);
+    hideCanvas(els.lightCanvasL);
+    hideCanvas(els.lightCanvasR);
+    placeCanvas(els.worldCanvas, 0, viewW, viewH);
+    placeCanvas(els.lightCanvas, 0, viewW, viewH);
+    placeCanvas(els.cockpitCanvas, 0, viewW, viewH);
+  }
+  // THE FLOATING CONTROLS: the console slab over the view's bottom —
+  // WIDER than the centre pane (it reaches half-way across each side
+  // pane), centred on the windshield, its own height law
+  const stripW = Math.min(viewW, Math.round(centreW * 1.5));
+  const stripH = Math.max(48.0,
+    Math.min(140.0, Math.round(viewH * 0.22)));
+  els.controlsCanvas.style.left =
+    `${Math.round((viewW - stripW) / 2)}px`;
+  els.controlsCanvas.style.width = `${Math.round(stripW)}px`;
   els.controlsCanvas.style.height = `${Math.round(stripH)}px`;
+}
+
+/** Place one pane canvas inside the view (guarded: an unchanged
+ *  placement writes nothing — the drag's layout stays cheap). */
+function placeCanvas(canvas: HTMLCanvasElement | null, x: number,
+                     w: number, h: number): void {
+  if (canvas === null) {
+    return;
+  }
+  if (canvas.style.display === "none") {
+    canvas.style.display = "block";
+  }
+  const left = `${Math.round(x)}px`;
+  const width = `${Math.round(w)}px`;
+  const height = `${Math.round(h)}px`;
+  if (canvas.style.left !== left || canvas.style.width !== width
+      || canvas.style.height !== height) {
+    canvas.style.left = left;
+    canvas.style.width = width;
+    canvas.style.height = height;
+  }
+}
+
+/** Rest one pane: out of the layout entirely. */
+function hideCanvas(canvas: HTMLCanvasElement | null): void {
+  if (canvas !== null && canvas.style.display !== "none") {
+    canvas.style.display = "none";
+  }
 }
 
 function fitCanvas(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
@@ -396,9 +618,29 @@ function drawPanel(): void {
       `${view.vs >= 0 ? "+" : ""}${vsHundredsOf(view.vs).toFixed(1)}\u00d7100fpm \u00b7 ` +
       `${mphOf(view.speed).toFixed(0)} mph \u00b7 ${rpmOf(view.throttle).toFixed(0)} rpm`
     : "crashed \u2014 the flight ended on the ground";
+  // THE CURVED WINDSHIELD: the view is three seamless panes — left,
+  // centre, right — one eye, one shared focal (the whole view spans
+  // the 90° law, so every pane renders at the same px-per-degree and
+  // the seams continue the projection), the side cameras yawed by
+  // exactly the continuity angle: half the centre pane's span plus
+  // half the side pane's span. What the centre pane's edge shows, the
+  // side pane's edge continues — a curved projection in three facets.
+  const viewW = els.cockpitView !== null
+    ? els.cockpitView.clientWidth : 0;
+  const focal = viewW / 2.0 / Math.tan(FOV_HALF);
   drawCockpitView(els.cockpitCanvas, title, view, [], foot,
-                  els.cockpitTitle, els.cockpitFoot);
+                  els.cockpitTitle, els.cockpitFoot, gpuWorld,
+                  els.lightCanvas, focal);
   drawControlsView(els.controlsCanvas, view);
+  const centreW = els.cockpitCanvas.clientWidth;
+  const sideW = els.worldCanvasL !== null
+    ? els.worldCanvasL.clientWidth : 0;
+  const yawDeg = (Math.atan(centreW / (2.0 * focal))
+                  + Math.atan(sideW / (2.0 * focal))) * 180.0 / Math.PI;
+  drawSideViewport(els.worldCanvasL, els.lightCanvasL, view,
+                   sideWorlds[0] ?? null, -yawDeg, focal);
+  drawSideViewport(els.worldCanvasR, els.lightCanvasR, view,
+                   sideWorlds[1] ?? null, yawDeg, focal);
 }
 
 // --- narration + status ------------------------------------------------------------
@@ -407,14 +649,16 @@ function renderNarration(): void {
   if (state.scenario === WAVES_SCENARIO && state.waves !== null) {
     const waves = state.waves;
     els.narration.textContent =
-      `drone attack waves \u00b7 wave ${waves.waveCount} in the air \u00b7 ` +
-      `${waves.aliveCount} flying \u00b7 the dying scream their memory to whoever hears`;
+      `drone attack \u00b7 pair ${waves.pairCount} lifted off \u00b7 ` +
+      `${waves.aliveCount} flying \u00b7 the will decides after the mission`;
     els.narration.className = "narration stage-waves";
     els.status.textContent =
-      `t ${waves.simSeconds.toFixed(1)}s \u00b7 wave ${waves.waveCount} \u00b7 ` +
+      `t ${waves.simSeconds.toFixed(1)}s \u00b7 pair ${waves.pairCount} \u00b7 ` +
       `${waves.aliveCount} flying \u00b7 ${waves.births} born \u00b7 ` +
       `${waves.obituaries} screams heard \u00b7 flock ${waves.flockSize}` +
-      ` \u00b7 links ${waves.links().length}`;
+      ` \u00b7 links ${waves.links().length}` +
+      ` \u00b7 singularity ${waves.singularityGoal}` +
+      ` (${waves.singularityRounds} rounds)`;
     els.results.hidden = false;
     els.badge.textContent = "";
     els.badge.className = "";
@@ -780,6 +1024,28 @@ function setScenario(id: string): void {
 const BOOT_SKIP =
   new URLSearchParams(location.search).get("boot") === "skip";
 
+/** THE SPLASH SCREEN: the poster's own moment — the page loads behind
+ *  the full-bleed splash.png, it holds a beat, then fades out (the
+ *  vite app's law). A click dismisses it at once; the developer's
+ *  ?boot=skip fast path (and every probe that rides it) never sees
+ *  it at all. */
+(function mountSplash(): void {
+  const splash = els.splash;
+  if (splash === null) { return; }
+  let clock: ReturnType<typeof setTimeout> | null = null;
+  let dismissed = false;
+  const dismiss = (): void => {
+    if (dismissed) { return; }
+    dismissed = true;
+    if (clock !== null) { clearTimeout(clock); }
+    splash.classList.add("fading");
+    setTimeout(() => { splash.classList.add("gone"); }, 900);
+  };
+  if (BOOT_SKIP) { splash.classList.add("gone"); return; }
+  clock = setTimeout(dismiss, 2600);
+  splash.addEventListener("click", dismiss);
+})();
+
 /** Skip mode's world: a new classroom around a beginner's brain — the
  *  same world shape bootTraining lands, minus the training. */
 function startUntrainedWorld(): void {
@@ -818,10 +1084,21 @@ function restart(): void {
   }
 }
 
+/** The scenario dropdown's lesson title: underscores to spaces,
+ *  every word capitalised except the small connective words. */
+function lessonTitleOf(name: string): string {
+  const small = new Set(["to", "for", "and", "of", "in"]);
+  return name.replace(/_/g, " ").split(" ")
+    .map((word, i) => i > 0 && small.has(word)
+      ? word
+      : word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
 function populateScenarioDropdown(lessons: readonly string[]): void {
-  const options = lessons.map((name) =>
-    `<option value="${name}">lesson: ${name.replace(/_/g, " ")}</option>`);
-  options.push(`<option value="${WAVES_SCENARIO}">drone attack waves</option>`);
+  const options = lessons.map((name, i) =>
+    `<option value="${name}">Lesson ${i + 1}: ${lessonTitleOf(name)}</option>`);
+  options.push(`<option value="${WAVES_SCENARIO}">Scenario 1: Drone Attack</option>`);
   els.scenario.innerHTML = options.join("");
 }
 
@@ -940,19 +1217,25 @@ els.zoomIn.addEventListener("click", () => {
 //   BOTTOM: visible while >= 10%; drag it lower and it HIDES; from
 //     hidden, a pull upwards of more than 10% opens it (it then tracks
 //     the pointer, so it opens exactly as tall as you pulled).
-//   SIDEBAR: visible while >= 30%; drag it narrower and it HIDES; from
+//   SIDEBAR: visible while >= 10%; drag it narrower and it HIDES; from
 //     hidden, a pull leftwards of more than 10% opens it back at its
 //     LAST width (then it tracks the pointer from there).
+//   MAP: the mirror law on the other side of the same grip — drag the
+//     handle leftwards and the sidebar grows over the map; when the
+//     map's width falls under 10% of the screen it HIDES (the sidebar
+//     takes the whole width); from hidden, a pull rightwards of more
+//     than 10% reopens it, tracking the pointer from its own floor.
 const BOTTOM_HIDE = 0.10;
 const BOTTOM_MAX = 0.85;
-const SIDE_HIDE = 0.30;
-const SIDE_MAX = 0.80;
+const SIDE_HIDE = 0.10;
 const REOPEN = 0.10;
+const GRIP_PX = 7.0;          // the grip's own track, px
 
 let bottomFrac = 0.30;       // the bottom panel's height, of the stage
 let bottomHidden = false;
 let sideHidden = false;
 let sideLastW = 0;           // the last width the sidebar showed
+let mapHidden = false;
 
 /** The stage's height: the app below the toolbar (the grips' tracks
  *  themselves are excluded — they sit between the regions). */
@@ -974,9 +1257,11 @@ function layoutBottom(): void {
 
 /** Apply the sidebar's width law to the DOM. */
 function applySide(): void {
+  els.app.classList.toggle("map-hidden", mapHidden);
   els.cockpit.classList.toggle("collapsed", sideHidden);
   if (sideWidth !== null) {
-    els.cockpit.style.width = sideHidden ? "0px" : `${Math.round(sideWidth)}px`;
+    const px = sideHidden ? 0 : Math.max(0, Math.round(sideWidth));
+    els.cockpit.style.width = `${px}px`;
   }
   layoutSidebar();
 }
@@ -1022,11 +1307,30 @@ gripDrag(els.bottomGrip, "y",
 gripDrag(els.sideGrip, "x",
   () => ({
     hidden: sideHidden,
+    mapHidden,
     w: sideWidth ?? els.cockpit.offsetWidth,
     last: sideLastW > 0 ? sideLastW : els.cockpit.offsetWidth,
   }),
   (dx, start): void => {
     const sw = window.innerWidth;
+    if (start.mapHidden) {
+      // the map is hidden: a rightward pull of more than REOPEN
+      // reopens it, tracking the pointer — the map opens exactly as
+      // wide as the pull past the threshold, but never past the
+      // sidebar's own 10% floor (the mirror of the sidebar's law)
+      const pull = -dx;
+      if (pull > sw * REOPEN) {
+        const mapW = Math.min(
+          Math.max(pull - sw * REOPEN, sw * SIDE_HIDE),
+          (sw - GRIP_PX) - sw * SIDE_HIDE);
+        mapHidden = false;
+        sideHidden = false;
+        sideWidth = (sw - GRIP_PX) - mapW;
+        sideLastW = sideWidth;
+      }
+      applySide();
+      return;
+    }
     // from hidden the pull must cross REOPEN first; from visible the
     // width just follows the pointer
     const cand = start.hidden
@@ -1034,10 +1338,22 @@ gripDrag(els.sideGrip, "x",
       : start.w + dx;
     if (cand >= sw * SIDE_HIDE) {
       sideHidden = false;
-      sideWidth = Math.min(cand, sw * SIDE_MAX);
+      // THE MAP'S LAW: the sidebar may grow until the map itself
+      // would fall under 10% of the screen — there the map SNAPS
+      // away (like the bottom panel at its own floor) and the
+      // sidebar takes the whole width
+      const mapFloor = (sw - GRIP_PX) - sw * SIDE_HIDE;
+      if (cand > mapFloor) {
+        mapHidden = true;
+        sideWidth = sw - GRIP_PX;
+      } else {
+        mapHidden = false;
+        sideWidth = Math.min(cand, mapFloor);
+      }
       sideLastW = sideWidth;
     } else {
-      sideHidden = true;                        // under 30%: it hides
+      sideHidden = true;                        // under 10%: it hides
+      mapHidden = false;
     }
     applySide();
   });
@@ -1052,7 +1368,11 @@ window.addEventListener("resize", () => {
   layoutSidebar();
   layoutBottom();
   if (sideWidth !== null) {
-    sideWidth = Math.min(sideWidth, window.innerWidth * SIDE_MAX);
+    // the map law re-derives: the sidebar may own the whole width
+    const sw = window.innerWidth;
+    const mapFloor = (sw - GRIP_PX) - sw * SIDE_HIDE;
+    sideWidth = Math.min(sideWidth, sw - GRIP_PX);
+    mapHidden = sideWidth > mapFloor;
     applySide();
   }
 });
@@ -1077,36 +1397,39 @@ async function fetchJson(url: string): Promise<any> {
   return response.json();
 }
 
-/** The boot terminal's lesson table — one row per lesson, live:
- *  attempts, the EMA score, and the pass mark. Rendered after each chunk. */
+/** The boot details' lesson table — one row per lesson, live: the
+ *  lesson's title, its attempts, and the EMA score out of 6. Rendered
+ *  as a real table (the dialog's own briefing sheet). */
 function renderBootTable(rows: ReadonlyArray<{
   lesson: string; attempts: number; score: number | null;
   status: "training" | "done";
 }>): void {
-  const width = 26;
-  const lines = rows.map((row) => {
-    const name = row.lesson.padEnd(width).slice(0, width - 1);
-    const score = row.score === null ? "     \u2013"
-      : `${row.score.toFixed(2)}`.padStart(5) + "/6";
-    const mark = row.status === "done" ? " done" : " \u00b7\u00b7\u00b7";
-    return `${name}${String(row.attempts).padStart(2)}  ${score} ${mark}`;
-  });
-  els.bootLog.textContent =
-    ["lesson".padEnd(width) + "demo   ema",
-     "-".repeat(width + 17), ...lines].join("\n");
-  // shrunk mode: keep the LAST line in view — the table scrolls to the
-  // bottom (where the classroom currently is)
+  const body = rows.map((row) => {
+    const score = row.score === null ? "\u2013"
+      : `${row.score.toFixed(2)} / 6`;
+    return `<tr class="${row.status}">` +
+      `<td>${lessonTitleOf(row.lesson)}</td>` +
+      `<td>${row.attempts}</td>` +
+      `<td>${score}</td>` +
+      `</tr>`;
+  }).join("");
+  els.bootLog.innerHTML =
+    `<table class="boot-table">` +
+    `<thead><tr><th>lesson</th><th>reps</th><th>ema</th></tr></thead>` +
+    `<tbody>${body}</tbody>` +
+    `</table>`;
+  // shrunk mode: keep the LAST row in view — the classroom is there
   if (!els.bootExpand.closest(".boot-dialog")?.classList.contains("expanded")) {
     els.bootLog.scrollTop = els.bootLog.scrollHeight;
   }
 }
 
-/** The boot dialog's expand button: the terminal grows to the full
- *  dialog, replacing the cubes; pressing it again brings them back. */
+/** The boot dialog's details button: the log drawer opens over the
+ *  cubes' panel; pressing it again brings them back. */
 els.bootExpand.addEventListener("click", () => {
   const dialog = els.bootExpand.closest(".boot-dialog")!;
   const expanded = dialog.classList.toggle("expanded");
-  els.bootExpand.textContent = expanded ? "\u29c9" : "\u29ca";
+  els.bootExpand.textContent = expanded ? "HIDE DETAILS" : "SHOW DETAILS";
 });
 
 let frameRunning = false;

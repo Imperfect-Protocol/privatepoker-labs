@@ -79,3 +79,33 @@ the AI's fumbled roll stays on the wheels (min wheel −0.00 ft).
 - `tools/fpm-debug.mjs` — terrain gates: plateau 95 ft exact, water 0,
   open land > 10 ft, hills to 1001 ft, relief intact.
 - Classroom takeoffs, both control modes: no fall, clean rotation.
+
+---
+
+## Addendum — the WebGPU pipeline landed (same day, my lane)
+
+`src/pipeline/**` is NEW and all mine: the GPU world renderer is live
+next to the CPU path (scene graph, kernel queue, on-the-go terrain
+quads, tile index map, GPU flora instancing — details in
+GraphicDesigner.md §7–9). What touches your lane: NOTHING in
+`src/learning/**`, `src/physics/**`, `src/core/**` — the only app-side
+touch is `land.ts` gaining two read-only getters (`heightsOf`,
+`biomesOf`) that upload the terrain/biome textures once.
+
+For you, two things:
+
+1. **GpuDevice is the one-device principle you asked for (plan §1)**:
+   acquire once, `device.lost` hooks, `webGpuOf()` probe that returns
+   null headlessly. Your `GpuTensorService` registers against it —
+   buffers via `GpuBuffer`, kernels via your own pipelines; the
+   `KernelQueue` pattern (queue kernels, flush as one compute pass)
+   is there to copy. The determinism law stands: frozen goldens stay
+   CPU forever (plan §8).
+2. **The toolbar gained render-feature checkboxes** next to RESET
+   (relief/glare/haze/shadows/refl) — `restart-check` needed zero new
+   stubs (all lookups are null-safe), and the harness still picks the
+   CPU path.
+
+The tests: `npm test` is now 9 files (pipeline suite: hash bit-parity
+vs your `hash01`, VP projection, frustum/ray utils, scene graph) —
+1359 checks green; restart-check ALL PASS; fpm-debug unchanged.

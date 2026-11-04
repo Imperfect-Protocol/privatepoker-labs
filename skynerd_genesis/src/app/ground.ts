@@ -43,6 +43,7 @@
  * cockpit pipeline does not change.
  */
 import { Biome, FIELD, FIELD_ELEV, LandUse, MAXMIP_LEVELS, RUNWAY, SUN_DIR, TERRAIN_MAX } from "./land.js";
+import { groundRender } from "./ground-render.js";
 
 type RGB = readonly [number, number, number];
 
@@ -366,14 +367,19 @@ export class Ground {
     const pyramid = PYRAMIDS[biome];
     const lo = Math.min(Math.floor(level), MIP_LEVELS - 2);
     const frac = level - lo;
+    // the checker's OFF state (the toolbar toggle): each level's flat
+    // mean — the same pyramid, no phase; the GPU uniform's extras.x
+    const value = (wU: number, cell: number): number =>
+      groundRender.checker
+        ? Ground.checkerMip(u, v, Math.min(wU, cell), cell)
+        : 0.5;
     const a = Ground.levelColour(pyramid[lo],
-      Ground.checkerMip(u, v, Math.min(w, pyramid[lo].cell), pyramid[lo].cell));
+      value(w, pyramid[lo].cell));
     if (frac <= 0.0) {
       return a;
     }
     const hi = pyramid[lo + 1];
-    const b = Ground.levelColour(hi,
-      Ground.checkerMip(u, v, Math.min(w, hi.cell), hi.cell));
+    const b = Ground.levelColour(hi, value(w, hi.cell));
     return [
       a[0] + (b[0] - a[0]) * frac,
       a[1] + (b[1] - a[1]) * frac,
@@ -518,14 +524,23 @@ export class Ground {
     colour = this.roadOverlay(u, v, Math.hypot(stepXU, stepXV),
                               Math.hypot(stepYU, stepYV), colour, distance);
     // THE RELIEF: the surface normal against the sun, normalised so the
-    // flat plain keeps its exact palette (roads shade with their hill)
+    // flat plain keeps its exact palette (roads shade with their hill);
+    // the mood's sun when set, else the classic constant
+    const mood = groundRender.mood;
+    const sun = mood === null ? SUN_DIR : mood.sunDir;
+    const ambientScale = mood === null ? 1.0 : mood.ambient;
+    const flat = SHADE_AMBIENT + SHADE_SUN * sun[2];
     const n = this.land.normalAt(u, v);
-    const ndl = Math.max(0.0, n[0] * SUN_DIR[0] + n[1] * SUN_DIR[1]
-                                + n[2] * SUN_DIR[2]);
-    const f = (SHADE_AMBIENT + SHADE_SUN * ndl) / SHADE_FLAT;
+    const ndl = Math.max(0.0, n[0] * sun[0] + n[1] * sun[1]
+                                + n[2] * sun[2]);
+    const f = (SHADE_AMBIENT + SHADE_SUN * ndl) / flat;
     colour = [Math.min(255.0, colour[0] * f),
               Math.min(255.0, colour[1] * f),
               Math.min(255.0, colour[2] * f)];
+    // the mood's ambient: the whole composed ground dims with the hour
+    colour = [colour[0] * ambientScale,
+              colour[1] * ambientScale,
+              colour[2] * ambientScale];
     // the runway's footprint coverage: soft slab edges in both axes
     const wU = Math.min(Math.hypot(stepXU, stepXV), RUNWAY_FILTER_MAX);
     const wV = Math.min(Math.hypot(stepYU, stepYV), RUNWAY_FILTER_MAX);

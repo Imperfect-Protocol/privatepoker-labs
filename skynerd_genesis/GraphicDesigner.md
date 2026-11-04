@@ -164,3 +164,610 @@ curriculum, vector baseline).
 - `tools/fpm-debug.mjs` — plateau 95 ft exact, open water exactly 0,
   open land min 10.5 ft, hills 1001 ft, relief leaning into the sun.
 - Classroom takeoffs, both control modes: clean rotation, no fall.
+
+---
+
+# Graphic Designer — addendum (the WebGPU pipeline, same day)
+
+The user's afternoon asks, in order: use my LightAndGeometry as
+structural inspiration (scene graph, clumps, geometries, lights —
+explicitly NOT the raytracer); WebGPU, not WebGL; all math on GPU
+(one-off host math allowed, massive only in kernels); put everything
+in `src/pipeline` with a decent OOP shape; queue kernels and make the
+conditionals happen IN the kernels on buffer data; render the terrain
+as quads generated on the go (one buffer = the quad instances); use an
+index map — project the render surface into tile→geometry indexes —
+instead of visibility rays; biome instancing on GPU; variation via
+noise textures.
+
+## 7. src/pipeline — the GPU pipeline, built programmatically
+
+```
+src/pipeline/
+  types.ts            the WebGPU surface as OUR structural interfaces
+                      (zero npm deps; compiles under BOTH tsconfigs —
+                      no ambient declares to collide with the DOM lib)
+  core/
+    gpu-device.ts     GpuDevice — the ONE device (plan §1), lost = CPU
+    kernel-queue.ts   GpuBuffer, FrameRecord (the 176-B uniform),
+                      KernelQueue — kernels queued, flushed as ONE
+                      compute pass per frame
+    wgsl.ts           the shared WGSL: Frame, the world's constants,
+                      hash01v, heightAt (the CPU path's exact hermite),
+                      normalAt, the checker law (ramp/squareMean/
+                      checkerMip/levelPair/checkerColour), the biome
+                      palettes, roads + runway paint, groundColour
+  scene/
+    camera.ts         Camera — owns the VP matrix (one-off CPU math
+                      per frame); tests pin its half-edge projections
+    light.ts          Light — the one sun (SUN_DIR)
+    vertices.ts       Vertices — the programmatic vertex stream
+    geometry.ts       Geometry — owns its GPU vertex/index buffers
+    clump.ts          Clump — spatial group with bounds (L&G's TODO,
+                      finished)
+    scene.ts          Scene + RenderClump — the graph; generate()
+                      then draw(); the clump order IS the draw order
+    sky-clump.ts      the fullscreen sky triangle (gradient + sun)
+  geometries/
+    quad.ts           the unit quad — the terrain's cell
+    cone.ts           the 8-segment cone — the tree
+  kernels/
+    terrain-quads.ts  TerrainClump — the on-the-go quad stream: near
+                      160²@12 m + far 128²@160 m around the camera,
+                      far interior SKIPPED by a kernel conditional;
+                      the VS displaces corners off the height texture,
+                      collapses index-flagged instances
+    flora-instances.ts FloraClump — biome INSTANCING on GPU: walks the
+                      20-m lattice, reads the biome texture, rolls the
+                      same hash01 in WGSL, writes tree instances
+    tile-index.ts     TileIndexMap — THE INDEX MAP: 32-px screen
+                      tiles; each instance projects its bounds into
+                      the grid (atomics), sets its visibility flag;
+                      occlusion = the rasterizer's own depth buffer
+  renderer/
+    features.ts       RenderFeatures + defaults (haze on; relief,
+                      glare, sunShadows, reflections off)
+    world-renderer.ts the WorldRenderer seam (gpu if ready else cpu)
+    gpu-world-renderer.ts  the conductor: textures uploaded once
+                      (height r32float, biome r8uint, 256² variation
+                      noise from hash01 value noise), group 0, the
+                      scene, per frame: uniform write → kernel queue →
+                      ONE render pass → submit
+  util/
+    intersect.ts      frustum planes, sphere culling, ray-AABB — the
+                      CPU twins of the kernel tests (testable headless)
+```
+
+The WGSL mirrors the CPU laws function-for-function — hash01v is proven
+bit-identical to land.ts's hash01 by test over ±600 lattice ranges;
+heightAt is the same hermite bilinear; the checker law is the same
+antiderivative box filter with the same 6-level ×1.12 pyramid; the
+roads and runway paint are the same formulas. The parity probes
+(plan §7) can diff exactly.
+
+## 8. The app seam (my files, one touch in land.ts)
+
+- `cockpit.ts` — `drawCockpitView` gained the optional `world`
+  renderer param: GPU-ready → it renders the world layer and this
+  canvas carries only the HUD ink (ladder, tapes, marker, overlays,
+  glare per feature); otherwise today's CPU path, unchanged.
+  `drawWorldObjects` takes `withTrees` — the GPU forest owns the trees.
+- `main.ts` — creates `GpuWorldRenderer` (null-safe: the harness has
+  no worldCanvas and no navigator.gpu → CPU path, zero new stubs),
+  the render-feature checkboxes (also null-safe), sizes the new
+  canvas stack.
+- `land.ts` — two getters: `heightsOf()`, `biomesOf()` (the pipeline's
+  texture uploads). No math touched.
+- `web/index.html` — the `.cockpit-view` canvas stack (worldCanvas
+  under cockpitCanvas) + the checkbox row next to RESET (relief, glare,
+  haze, shadows, refl).
+- `web/style.css` — the stack's positioning; the panel look moved to
+  the wrapper.
+- `test/pipeline.test.ts` — NEW suite: hash bit-parity, VP half-edge
+  projections, frustum cull, ray-AABB, the geometries' shapes, the
+  scene graph's frame order, the WGSL common's integrity (entry points
+  present, no template holes, braces balance). 23 checks, all green.
+
+## 9. Bugs the build caught (and the honest gaps)
+
+- The VP matrix had −fwd in the view row while the projection expected
+  +depth for w: every NDC came out sign-flipped — found by the test's
+  half-edge probes, fixed (+fwd, z mapped to [0,1]).
+- The near grid's half offset was (n−1)/2 — a 6-m slit at the field
+  boundary where the far field's kept ring meets it; n/2 centres the
+  grid exactly on its half-extent.
+- The shared WGSL initially had no texture/sampler declarations —
+  every module would have failed to compile; the review sweep caught
+  it before any browser saw it.
+- KNOWN NOT DONE (phases): the corner-ray shadow field (the sunShadows
+  checkbox flows to the uniform; no kernel consumes it yet), the water
+  reflections pass, GPU tensors (Engineer's §8). The GPU path itself
+  has NOT been eyeballed in a browser yet — types, WGSL review and the
+  headless battery are green; `npm run dev` is the next look.
+
+## Final state (the pipeline build, all verified green)
+
+- `npm test` — 9 files, 1359 checks (pipeline suite new, 23 checks).
+- `tools/restart-check.mjs` — ALL PASS (the harness runs the compiled
+  app with the pipeline present, picking the CPU path cleanly).
+- `tools/fpm-debug.mjs` — all terrain gates unchanged.
+- Both tsconfigs compile the whole tree with the pipeline in.
+
+## 10. The browser eyeball — the class of bug no headless test can catch
+
+Driven headless Chrome Canary (159) over the DevTools protocol with a
+zero-dependency websocket driver (`/tmp/cdp-*.mjs` — session scratch,
+not shipped): live console capture + DOM probe + screenshots + GPU
+buffer readbacks. The plan §7 eyeball happened; every WGSL module now
+compiles and the GPU path renders in a real browser (Metal).
+
+Bugs the eyeball caught, all fixed and re-verified (npm test 236,
+restart-check ALL PASS):
+
+- **WGSL ternaries** — Canary's Tint rejects `?:` outright ("invalid
+  character found"); even a trivial one. Rewrote all 7 sites to
+  `select(false, true, cond)` (checkerRamp, foldDist, runwayShade ×2,
+  road paint ×2, tree habits ×2).
+- **`patch` is a reserved WGSL keyword** — the road patch roll renamed
+  `paving`.
+- **Vector comparisons** — `colour == base` on vec3f is a `vec3<bool>`;
+  wrapped in `all(...)` (runway paint, 3 sites).
+- **Quad record field** — the index entry read `q.z` on a
+  `{x,y,size,pad}` record; `q.size` is the quad.
+- **KernelQueue flush set only bind group 0** — every compute pipeline
+  is [group0, own]; the queue now carries the full bind-group list.
+- **Draw passes never set the index buffer** — `setIndexBuffer(raw,
+  "uint32")` added in both clumps' drawPass (quad + cone).
+- **THE BIG ONE — dispatch ordering**: all kernels flushed into ONE
+  compute pass. WebGPU does NOT order dispatches within a pass — the
+  tile-index kernel read the quad buffer while the gen kernel still
+  wrote it, every frame. QueuedKernel now carries a PHASE; flush
+  groups same-phase kernels and opens one compute pass per phase
+  (pass boundaries are the barriers). Terrain gen + flora gen = phase
+  0; both index kernels = phase 1 → 2 passes per frame.
+- **THE consts bit-pattern bug** — `GenConsts.cols` is i32 in WGSL but
+  was seeded through a `Float32Array([160, ...])`: the kernel read
+  float-160's bits as int = 1,124,073,472, so every quad write landed
+  out of bounds (robust buffers: silently dropped). The gen kernel
+  had never written a quad — that was the entire "no terrain". The
+  consts now seed through a mixed u32/f32 ArrayBuffer view.
+- **The resize flicker + half-height view** — layoutSidebar measured
+  `#cockpit-view` (the wrapper whose size it sets) as a fixed-height
+  child: measure-my-own-output = two-frame oscillation between two
+  sizes (the person's "buffer #1 vs buffer #2" diagnosis, exactly
+  right). The wrapper is now excluded from the measured children; the
+  view fills the column (381×215 → 574×323 on the same window).
+- **The terrain waves ("ocean" artifact)** — the quad grid placed
+  quads at camPos + slot offset, so every 12-m quad slid continuously
+  across the heightfield as the camera moved: vertices sampled
+  different heights each frame and the whole surface rippled. The grid
+  origin now SNAPS to the world lattice (`floor(camPos/cell)*cell`,
+  both fields; the far interior skip snaps to the near lattice the
+  same way) — the geometry-clipmap law. Verified by readback: quad
+  records bit-identical while the camera stays in one cell; shift by
+  exactly 12 when it crosses. The surface is world-fixed.
+
+GPU evidence trail (flags/instances readback via staging buffers,
+MAP_READ probes): gen wrote nothing → after the consts fix, quads at
+[-960,-960,12]... flags live, terrain green, trees visible, runway
+painted, feature checkboxes shift pixels, zero console errors, both
+tsconfigs clean, npm test + restart-check green throughout.
+
+## 11. The sky's moods, the flares, the checker toggle, the crash floor
+
+The person asked for four more toolbar things, all landed with the
+parity law intact (one source of truth, both paths read it):
+
+- **THE TIME OF DAY** — `src/pipeline/renderer/time-of-day.ts` is the
+  single table both renderers read: 6 moods (dawn, sunrise, noon,
+  sunset, dusk, night), each carrying the sun direction, zenith, fog,
+  disc tint, disc size, brightness, ambient scale and cloud tint.
+  `noon` IS the pre-mood constants exactly, so default parity holds.
+  The Frame uniform grew 4 rows (176 → 240 B): zenith+discSize,
+  fog+brightness, sunTint+ambient, extras (the checker toggle). The WGSL
+  sky/terrain/tree read the mood from the uniform (÷255 — the table
+  carries 0..255 like the CPU constants); the CPU cockpit and ground
+  read `RENDER_STATE.mood` / `groundRender`. The relief's sun follows
+  the mood on BOTH paths (the GPU always did; ground.ts now too).
+- **THE LENS FLARES** — a `flare` dropdown (none/panavision/michael
+  bay) drawing additive ink on the HUD canvas over whichever world
+  layer rendered: panavision = the long thin blue anamorphic streak +
+  warm halo + vertical whisper; michaelbay = white-hot core + cross
+  streaks + ring + a chain of coloured ghosts marching through the
+  frame centre. Both gate on sun-facing (align²) and track the mood's
+  tint/size; both paths get them (the HUD canvas is shared).
+- **THE CHECKER TOGGLE** — `checker` joins RenderFeatures (default
+  on), flows to the uniform's extras.x; the WGSL checkerColour takes
+  the flat per-level mean when off (no phase — the same pyramid, so
+  the palette/brightness law is untouched); the CPU checkerTap's twin
+  branch reads groundRender.checker.
+- **THE CRASH FLOOR** — the background goes BLACK 15° below the
+  horizon (SKY_FLOOR_SIN, both sky laws: the WGSL skyFs and the CPU
+  per-pixel sky): a crashed camera looks into darkness, never into
+  sky-through-the-ground. The terrain still covers the real ground
+  plane; the floor only owns the background gaps under the world.
+
+Verified live (Canary/Metal, the CDP feature probe): noon's luminance
+signature UNCHANGED from the classic build (meanLum 101, max 247.4 —
+exact palette parity); sunset warms (72,60,64 with a purple zenith
+melting to the orange horizon — eyeballed), night is near-black
+(18,22,28, dark moonlit ground — eyeballed), sunrise pink-tinged
+(89,83,97); checker off shifts the ground (69→84 restored); the flare
+families' streaks visibly bloom in the sunset shots (the Bay vertical
+vs the Panavision horizontal — eyeballed both); zero console errors;
+npm test (236 pipeline checks) + restart-check ALL PASS; both
+tsconfigs clean.
+
+## 12. The setting sun — blendy, chewed, glaring (both paths, parity)
+
+The person asked for blendier sun edges and a more glaring, irregular
+sunset. THE SETTING LAW, one formula on both renderers: the bigger the
+disc, the lower the sun, and the more the atmosphere owns it —
+
+- the SETTING FACTOR s = (discSize − 0.035)/0.055, 0 at noon's clean
+  circle, 1 at the sunset swell (sunrise 0.727);
+- THE WOBBLE: two harmonics chew the rim — 0.08·sin(4θ+1.7) +
+  0.05·sin(9θ+0.6) — an irregular silhouette, not a circle;
+- THE SQUASH: refraction flattens the disc vertically (÷(1+0.35s));
+- THE BLENDY EDGE: solid at the wobbled core, fully melted just
+  beyond the wobbled radius (never a hard rim) — the GPU mixes
+  (radius−base)/(disc·0.32) clamped, the CPU twin draws the wobbled
+  48-gon with a radial gradient that fades from 0.90 at 62% to 0 at
+  the rim;
+- THE GLARE: wider (×(1+0.8s)) and far stronger (0.28+1.1s — sunset
+  glares ~5× noon) in the sky itself; the veil doubles too
+  (×(1+1.2s)) and takes the mood's tint warmed toward white.
+
+Verified with a camera pointed straight at the sun (noon/sunset/
+sunrise PNGs off a scratch renderer): the sunset disc is a soft
+glowing irregular blob — the close-up shows the dissolve rim and the
+asymmetric chewed envelope, no hard edge anywhere; noon keeps its
+clean bright circle (s = 0 — the classic look untouched). npm test
+(236) + restart-check ALL PASS; both tsconfigs clean.
+
+## 13. The sun matches its sky (the sticker fix, both paths)
+
+The person's eye: the sunset disc read as a DARK ORANGE STICKER
+against the bright glow around it — the mood's disc tint [255,140,64]
+is darker in G/B than the sunset fog band it sits in. THE FIX, one law
+on both renderers: the disc's FILL is the tint lifted 65% toward white
+(GPU: `core = mix(tint, vec3f(1.0), 0.65)`; CPU twin in drawSun) — a
+hot core that can never be darker than the sky around it, the blendy
+rim then melting INTO the sky's own shade. noon's tint [255,253,242]
+lifts to [255,255,248] — the classic disc, visually unchanged.
+
+Pixel truth off a live sunset render (camera aimed at the sun, exact
+canvas samples): disc centre [255,255,210], brighter than the sky 90px
+away [255,255,196] (brighterThanSky: true) — the sun is now the
+brightest thing in its sky, one blown-out warm field, no seam. npm
+test (236) + restart-check ALL PASS; both tsconfigs clean.
+
+## 14. Light is additive — the flare, the glare, the HUD glass
+
+The person's screenshot caught the last flaw: over the sunset sky the
+panavision streak read as a foreign washed-out line. TWO root causes,
+both fixed:
+
+- **THE COLOUR FAMILY** — the flare ink now derives ENTIRELY from the
+  sun's tint (glare(lift) = tint lifted toward white — the same
+  family skyFs's glow uses): warm orange streaks at sunset, near-
+  white at noon. The Bay ghosts' cool/violet accents are MIXES OF THE
+  TINT, never fixed RGB. One light source, one colour family.
+- **THE COMPOSITE** — flare/glare can't match the sky while alpha-
+  pasted over it. NEW #lightCanvas sits between the world canvas and
+  the HUD, mix-blend-mode: plus-lighter (TRUE additive — screen
+  family). The sun, the flare and the glare veil draw on it (GPU
+  path; the CPU path keeps its in-canvas `lighter`, which is the
+  same physics). Their ink now ADDS to the sky's own glow, exactly
+  like the shader's col +=.
+- **THE HUD GLASS** — #cockpitCanvas composites plus-lighter too:
+  tapes, ladder, markers and objects glow additively over the world
+  (the fighter-HUD look), ONLY on the GPU path — on the CPU path the
+  HUD canvas holds the opaque world itself, so its blend flips back
+  to normal per frame (adding it would double-brighten).
+- the flare blooms with the hour: strength × (0.75 + 0.6·s) — the low
+  sun's streaks bloom harder, matching its sky.
+
+Live verdicts (Canary/Metal): sunset + bay hunt frames show the flare
+additive over the world with its ghost chain visible and the HUD
+"instrument overlay highly visible... blend smoothly with surrounding
+sky colors"; the HUD glass reads as "glowing luminous overlays,
+blending subtly with the world" (analyzer's own words). Zero console
+errors; npm test (236) + restart-check ALL PASS; both tsconfigs clean.
+
+## §15 the pilot's iris, the hour's grade, the map's law, and the curved windshield
+
+**The iris (HDR adaptation)** — `IrisAdaptation` (cockpit.ts): the eye
+tightens toward the sun on the glare's own align³ bloom (the veil and
+the iris are one reflex), easing on the eye's time constants — a 0.2 s
+flinch toward the light, a 1.0 s reopen away from it. One `iris` per
+app; every pane renders through it. The exposure rides the Frame
+uniform (extras.y, 240 → 256 B for the grade row) and multiplies
+skyFs/terrainFs/treeFs's exits; the CPU compose and the sun/glare/
+flare ink (drawSun's fill+glare alphas, drawSunGlare, drawLensFlare
+strength) scale by the same number. Facing the sun dead-on the world
+dims to ~45% and the glare recedes with it.
+
+**The hour's grade (the user's colour list)** — the SkyMood table gained
+`grade` (0..255, applied mean-1: tint without darkening): dawn dark
+pinkish [214,186,202], sunrise bright pink [255,208,224], noon white
+(the identity — parity exact), sunset orange [255,180,120], dusk
+purple-orange [238,172,192], night purple-navy [148,152,224]. GPU: the
+grade row (extras sibling) + `gradeFilter()` in WGSL_COMMON, applied in
+terrainFs and treeFs after the ambient, before the haze. CPU: the same
+mean-1 law in drawWorld's compose (gradeR/G/B × GROUND_GRADE=0.55) and
+the haze blends to the fog from the GRADED colour. The CONTROLS strip
+wears the hour too: `gradeControlsVeil` — a source-atop veil at 50%
+(the drawn ink only, the frozen alarm stays red), under it the
+instruments read like the hour's own light.
+
+**The map's hide law (the user's 10%)** — SIDE_HIDE 0.30 → 0.10, and the
+grip now owns BOTH sides of its track: dragging far left grows the
+sidebar past the map's own 10% floor and the MAP column snaps away
+(#app.map-hidden → the 0px track), the sidebar owning the whole width;
+from hidden, a rightward pull past REOPEN reopens the map, tracking the
+pointer, clamped to the sidebar's own floor (the poison-loop fix:
+mapW can never exceed the track). The sidebar keeps its own mirror law
+(under 10% it hides; a left pull reopens at its last width).
+
+**THE CURVED WINDSHIELD (the user's own design)** — the view is one
+area split into three seamless panes: worldCanvasL | world+light+HUD |
+worldCanvasR, all inside #cockpit-view; the controls strip FLOATS on
+the view's bottom-centre (opaque console slab, border removed after the
+CDP seam probe caught its 1px border column crossing the left pane).
+The continuity law: ONE shared focal = viewW/2/tan(FOV_HALF) (the whole
+view spans the 90° law — every pane renders at the same px-per-degree),
+and the side cameras yaw by atan(centreW/2f) + atan(sideW/2f) — exactly
+half the centre pane's span plus half the side pane's span, so what the
+centre pane's edge shows the side pane's edge continues. At equal
+thirds the yaw is ±36.87° and the windshield sees 110° (the curved
+projection's bonus). `yawedCameraOf` rotates fwd/right about the up
+axis; drawCockpitView/drawSideViewport take the shared focal. The CPU
+path (no GPU world) keeps one full-width pane — the reference view.
+
+**THE CRASH FLOOR'S GATE (the takeoff black band)** — the user's
+screenshot at 3–4 k ft showed the −15° band painting black across the
+climb: the far terrain box ends (now 160×160 cells, ±12.8 km) and the
+sky BELOW −15° went black although the camera was flying. The floor is
+the CRASH view: `CRASH_FLOOR_EYE_M = 25` (world-renderer.ts) gates it —
+extras.z on GPU, the eye-height twin on CPU; a flying camera keeps the
+haze band there instead (the world dissolves into fog at its far edge,
+never a black band), a crashed one looks into darkness. Pixel-probed:
+row 0.75 pre-horizon fog rgb(184,200,214), band gone at 3 k and 4.9 k ft.
+
+**The drag stall** — three costs found and killed: fitCanvas reassigned
+canvas.width EVERY frame (a full clear+realloc of the ~10 M-pixel HUD
+surface at Retina) — now guarded, assign only on change; the layout
+writes are guarded the same way (unchanged placement writes nothing);
+the panes are absolute inside the view, so a drag reflows nothing but
+the two grid tracks. The hang probe (bottom hidden → map hidden → both
+hidden, twelve-step drags) answers every CDP evaluate in 0–4 ms with
+zero console errors — the page never stops answering.
+
+Verification: CDP sides probe — panes 234×3 at natural width, 384×3
+wide, L/R luminance 96/88 vs main 123 (the world renders in the sides);
+map hides at the floor and reopens tracking; sidebar hides under 10%
+and reopens at its last width; the seam scan shows the 1px border column
+(fixed). Takeoff probe to 4.9 k ft: the band rows read fog, not black.
+npm test: 9 suites green (pipeline 236). Both tsconfigs clean.
+
+## §16 the side panes' shade parity — one sky, three panes
+
+**The diagnosis** (the user's screenshots): the side panes rendered only
+the bare GPU world — the sun's disc+glow (drawSun), the glare veil, the
+lens flare, the tower, the houses and the CLOUDS are all 2D ink on the
+centre pane's light/HUD canvases, so the sides wore a different sky.
+
+**The law**: every pane of the windshield gets its OWN additive ink
+canvas. #lightCanvasL and #lightCanvasR sit over their world panes
+(plus-lighter, like the centre's #lightCanvas), placed by the same
+layoutSidebar thirds. drawSideViewport now takes the pane's ink canvas
+and draws the centre's exact light laws through the yawed camera:
+drawSun + drawLensFlare + drawSunGlare (the glare gate from the toolbar,
+the iris exposure inside each) in "lighter" ink, then drawWorldObjects
+(the tower, the hamlet houses, the CLOUDS — withTrees=false: the GPU
+instances the forest itself, so the CPU painter trees must not
+double-draw). No HUD instruments on the sides — peripheral vision.
+hideInk clears a pane's ink when it rests.
+
+**The floating controls grew**: the console slab is now 1.5× the centre
+pane's width (min(viewW, centreW*1.5)), centred on the windshield, so it
+reaches half-way across each side pane — its own height law unchanged.
+
+**Verified** (CDP probes + pixel scans): the side ink layers render
+(LUM-INK L 22.5, R 25.6 — sun glow, veil, clouds), zero console errors;
+the seam continuity holds with glare ON and OFF — sky rows differ ~12
+(texture noise), terrain rows ≤36 (field edges at the seam), 0 at the
+slab; the one 45-diff spot at the C|R seam is the sun glow's own radial
+gradient (its steepest region), not a projection jump — a discontinuity
+would shift EVERY sky row by the yaw. The sun's glow is visible in the
+left pane (the noon sun stands forward-left); the clouds ride all three
+panes now. npm test 9 suites green; both tsconfigs clean.
+
+## §17 one environment, three windows + the plane dashboard
+
+**THE SHARED LIGHT** (the user's parity demand): the glare veil and the
+lens flare used to compute their strength from EACH PANE'S own
+sun-align — a yawed camera faces the sun differently, so the sides wore
+a different veil strength than the centre (the user's screenshots).
+Now drawCockpitView computes the light ONCE per frame from the CENTRE
+pane's camera — sharedLight {align, exposure} — and drawSunGlare /
+drawLensFlare read it for every pane; only the sun's SCREEN POSITION is
+each pane's own projection (the iris was already shared: one reflex,
+one exposure for the whole windshield). One environment, three
+windows; the projection differs, nothing else.
+
+**THE PLANE DASHBOARD** (the user's drawn shape): the controls console
+is no longer a rectangle. dashboardPath() paints a real instrument
+panel's silhouette — rounded top corners (the glareshield's shoulders),
+straight vertical sides, a shallow-U bottom whose ends RISE so the
+world shows through the canvas's bottom corners. The canvas's own CSS
+body/border are gone: the path IS the panel (a vertical body gradient
+from the lit lip #0d1622 down to the console's #03060b, a thin
+highlight stroke along the whole sill). Verified by alpha probe:
+top corners 0, body 255, bottom corners 0, the U's ends 39 — the
+corners are transparent, the world glows through.
+
+**Sunset parity, pixel-walked**: the sun's disc straddled the C|R seam
+in the probe shot; the walk shows the sky rows matching across both
+seams (12 diff = texture noise; the veil's gradient steps 3–7 units
+continuously across the boundary), the disc's rim legitimately jumping
+(the sun's own edge at x≈781), the terrain greens matching within 4.
+npm test 9 suites green; both tsconfigs clean.
+
+## §18 the wedges, the plinth, and the field's wide apron
+
+**THE WEDGES** (the user's attack-scenario screenshots: black
+triangles with curved boundaries eating the side panes' ground).
+Diagnosis: the tile index's indexOne() culled EVERY instance —
+terrain quads included — by its CENTRE: `clip.w <= 0.25 → invisible`.
+The quad the camera stands in, and every quad straddling the near
+plane, has its centre behind the eye while fragments of its footprint
+are still on screen → the quad vanishes → the hole shows the sky
+under the crash floor's gate → PURE BLACK at low camera heights.
+The 160 m far cells made the holes big diagonal wedges. The fix is
+THE QUAD'S OWN LAW — indexQuad() in tile-index.ts: a quad dies only
+when ALL FOUR corners (at their terrain heights) sit behind the near
+plane; the screen box comes from the corners in front (the near-plane
+crossings bounded by the projected footprint radius at the nearest
+front corner), and a camera inside a quad's footprint at the near
+plane sweeps the whole view. The trees keep indexOne — their
+footprint is honestly inside their radius. Pixel-verified at BOTH
+altitudes in the drone-attack scenario (a low climb shot at ~300 ft
+and the attack run at ~2600 ft, panels hidden, the user's exact
+state): 0 near-black spans in the side panes.
+
+**THE PLINTH** (the user's 'margin underneath the control panel that
+view is sneaking through'). The geometry truth: the slab WAS flush
+(slab.bottom − view.bottom = −1); the strip was the #cockpit-foot
+FLOW ROW under the view inside the panel — 22 px of --panel
+(#0a0f16) between the view's bottom and the panel's own bottom,
+which at dusk reads as world. The foot is now THE PANEL'S BLACK
+BASE: background #000 seated on the view's bottom border by a −9 px
+top margin, bled past the panel's side padding by −10 px margins,
+and #cockpit itself carries a 48 px black band at its bottom
+(linear-gradient) so the plinth runs solid from the dashboard's
+straight black bottom edge to the panel's bottom edge. Verified:
+rows under the view read (0,0,0) edge to edge.
+
+**THE BOTTOM EDGE IS JUST BLACK** (the user's exact words): the
+gradient's bottom stop went #03060b → #000000, and the lit highlight
+stroke now rides the sill's TOP and SIDES ONLY (the bottom edge has
+no line — the slab ends solid). shoulderOf() is the one law for the
+shape and its edge. Verified: the slab's last rows read (1,1,1),
+no stroke row, the world beginning cleanly below.
+
+**THE FIELD'S WIDE APRON** (the user: 'terrain in near vicinity of
+the runway must be flat same level as runway'): the airfield carve's
+rim widened 1.45 → 4.0 (w-units — the flat core is w<1; the roll now
+spans to 2× the ellipse, ~840 m lateral / 2100 m longitudinal), and
+the flora's exclusion widened from the runway's box to the whole
+carved apron (w < FIELD.rim) — no trees on the field's lawn. The
+height field verified numerically: the runway and its ellipse dead
+flat at 29.0 m; 250 m past the far end 29.2 m; 500 m beside centre
+36.6 m — a gentle roll into the hills, no cliffs. The physics world
+keeps its exact ellipse (the aircraft never flies the rim); the
+CPU ray-march shortcuts ride the flat core, unchanged.
+
+Both tsconfigs clean; npm test 9 suites green (pipeline 236);
+restart-check: the 2 waves-scenario FAILs are the concurrent
+session's wave→pair refactor, untouched by this work.
+
+## §19 the splash screen
+
+**THE POSTER'S OWN MOMENT** (the user: like the vite app's splash).
+index.html gained `<div id="splash">`; web/style.css paints it
+fixed, inset 0, z-index 150 (over the boot dialog's 100): the
+full-bleed splash.png cover-centred on #05070c. Both servers serve
+the same asset — the CSS layers the two URLs (url("/splash.png")
+for the deployed build, where public/ lands at the root, then
+url("/public/splash.png") for the dev server, where the repo root
+IS the web root); the 404ing layer is simply never painted.
+
+**THE LAW** (main.ts, mountSplash beside BOOT_SKIP): hold 2600 ms,
+fade 700 ms (the vite app's clock: logo fade at 2200 + duration 700),
+then .gone removes it from the layout. A click anywhere on the
+poster dismisses at once. prefers-reduced-motion shortens the fade
+to 150 ms. THE DEVELOPER'S FAST PATH: ?boot=skip mounts nothing —
+every CDP probe and restart-check's stub ride it and never see the
+splash.
+
+**Verified live, both paths**: at 1.2 s the splash holds (opacity 1,
+block, the background layers present) and the screenshot PAINTS THE
+POSTER (luminance mean 78, stdev 49 — a flat #05070c screen reads
+~7 everywhere); at 4 s it is `fading gone`, opacity 0, display none;
+under ?boot=skip it is `gone` at once. Both tsconfigs clean; npm
+test 9 suites green; restart-check unchanged (the 2 waves FAILs are
+the concurrent session's wave→pair refactor).
+
+## §20 the splash's gold sun
+
+**THE TITLE'S OWN TYPE** (the user's law): "SKYNERD" rides Inter
+Display — NOT the Heavy weight. index.html's font link gained
+family=Inter+Display:wght@400;700 (Google Fonts), and #splash h1
+now sets font-family "Inter Display" at weight 700 with a touch of
+letterspacing (0.02em) and a softer line-height (0.94). Verified
+in-browser: document.fonts.check('700 64px "Inter Display"') is
+true and the computed style reads the family + weight.
+
+**THE GOLD SUN** (the user: gold sun theme, not green teal): every
+cyan accent went Sahara gold. The title's ink is warm ivory
+#faf3e2 under a gold glow text-shadow rgba(240,178,66,0.55); the
+rule is transparent → #f0b242 → transparent; the radial behind the
+title block is rgba(240,178,66,0.22).
+
+**SAHARA GOLD DARKNESS** (the user: dim with it, not black): the
+wash is warm through and through — the vertical fade runs
+rgba(31,19,6,0.10) → #1a1106 (deep amber dark, the splash's own
+base now #140d04), and the subtitle wears a sand tone #c9b28a.
+Pixel-verified: the wash corners read (26,17,6) — warm, r>b — the
+glow band above the title (120,64,27), the title ink (250,243,226),
+the rule's gold pixels r > b+35.
+
+The lifecycle re-verified after the concurrent session's edits
+settled: fade-on-clock and ?boot=skip both hold.
+
+## §21 the boot dialog's bottom edge
+
+**THE BRIEFING'S GAUGES BELOW** (the user's redesign of the SKYNERD
+FLIGHT SCHOOL dialog): the top edge is now the TITLE ALONE — the
+progress bar and DONE moved down; the bottom edge's text area +
+expand icon is REPLACED by one controls row: THE PROGRESS BAR FROM
+THE LEFT, then SHOW DETAILS, then DONE. index.html: boot-head keeps
+only the h1; a new #bootDetails drawer holds #bootLog (closed by
+default); .boot-foot now carries .boot-bar + #bootExpand + #bootDone.
+#bootExpand is a text button in DONE's family (one step dimmer);
+its label flips SHOW DETAILS ↔ HIDE DETAILS (main.ts). Expanded:
+#bootContent (the cubes) steps aside, #bootDetails flexes open and
+the log fills it — the old 51-px three-line terminal is gone, the
+collapsed dialog is clean. All element ids kept (restart-check's
+stubs address them; its closest() returns null and the log streamer
+is null-safe). Verified live: the head band reads the title only
+(max lum 238 at y=88, 36 just below); the controls row sits on the
+bottom edge (bar track x 185..789 filling from the left, SHOW
+DETAILS 799..916, DONE 926..995, all y 672..698, dialog bottom
+717); the click opens the drawer (details flex, log 542 px, label
+HIDE DETAILS, cubes display none). Both tsconfigs clean; npm test
+9 suites green; restart-check unchanged (the 2 waves FAILs remain
+the concurrent session's).
+
+## §22 the details drawer's briefing sheet
+
+**THE PRO TABLE** (the user: the details panel is ugly text — same
+font, but a table). renderBootTable (main.ts) now builds a real
+table: #bootLog's <pre> became a <div>, and the rows stream in as
+`<tr class=training|done>` with the lesson's title (lessonTitleOf —
+the same law as the dropdown), the reps, and the EMA out of 6 —
+THE "DONE" WORD ITSELF IS GONE (the row's own tint says it: rows
+wearing .done read lit, the training rows dim; the only DONE left
+is the control button on the bottom edge, where the user asked it).
+The sheet (.boot-table in style.css): a sticky uppercase header
+band (lesson | reps | ema on #071320), ruled rows with 1px
+separators, tabular-nums numerics right-aligned, tabular whitespace
+— the briefing-sheet look against the drawer's #03070d. Verified
+live: 20 rows render under the header, the geometry probe reads
+lesson names left (x 202..312) and numerics right (x 802..976), the
+expanded screenshot shows the clean dark header band + thin rules;
+no status word anywhere. Both tsconfigs clean; npm test 9 suites
+green; restart-check unchanged (the 2 waves FAILs are the
+concurrent session's).

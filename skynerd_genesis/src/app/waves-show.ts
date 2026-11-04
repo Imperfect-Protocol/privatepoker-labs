@@ -1,15 +1,31 @@
 /**
- * The drone attack waves, LIVE: the swarm as a conveyor.
+ * The drone attack, LIVE: the swarm's sortie as a conveyor of PAIRS.
  *
- * No waiting, no playback: the first wave flies while the second wave
- * lifts off right behind it at a distance, and the next behind that —
- * wave after wave, forever, every tick computed as you watch it. A
- * wave is many drones in a line; the line behind the previous wave's
- * line. Drones of neighbouring waves are CONNECTED: every drone links
- * to every nearby drone — same wave or the wave behind — the swarm's
- * mesh, drawn live on the sky. When one dies its memory shard leaves
- * the flock and it screams its tensor to whoever is still connected
- * enough to hear.
+ * Drones do NOT appear from nowhere: every PAIR LIFTS OFF FROM THE
+ * RUNWAY — both drones ON the lane, the runway's width split into two
+ * halves, each seat at the centre of its own half — and the next pair
+ * rolls five seconds behind it from the same threshold, pair after
+ * pair, forever, no waves. Each drone flies the
+ * attack mission (learning/mission.ts): the instructor's own
+ * departure (roll, rotate, the straight climb out of ground effect),
+ * the split ON THE CLIMB onto HSI ±45° (the left seat the left
+ * flank, the right seat the right flank), the climb-out in the flank
+ * to 3000 ft, the level moment in the flank, the ATTACK —
+ * the converging steep descending turns down to 500 ft onto the tank
+ * below — the rally's climbing turns up to 1500 ft, the spin own side
+ * and recover, and then THE WILL DECIDES: the drone's own brain takes
+ * the controls in free flight for whatever its tensor memory wants
+ * next. The repetition of the scenario is the conveyor itself.
+ *
+ * The flock has a SINGULARITY BRAIN: besides each drone's own
+ * tensors, the swarm maintains one shared SINGULARITY TENSOR
+ * (learning/singularity.ts), updated every round from every drone any
+ * other drone can reach within two hops of the live mesh, and shared
+ * back — and its SUPER-GOAL (the mission leg the plurality flies)
+ * keeps the whole carpet in formation: a drone that falls behind is
+ * pulled forward onto the formation's leg at the next safe boundary.
+ * When one dies its memory shard leaves the flock and it screams its
+ * tensor to whoever is still connected enough to hear.
  *
  * Every drone flies the ONE Aircraft class (physics/aircraft.ts) — the
  * same machine the flight school flies. The scene holds every drone
@@ -20,37 +36,53 @@ import { NumpyPcg64 } from "../core/rng.js";
 import { Vec3 } from "../core/vec.js";
 import { Flock } from "../learning/flock.js";
 import { FlightInstruments, EpisodeOutcome } from "../learning/instruments.js";
-import { TRIM_SPEED, LiveEpisode } from "../learning/flight.js";
+import { TRIM_SPEED } from "../learning/flight.js";
+import { MissionFlight, MISSION_AREA_M, type MissionToken } from "../learning/mission.js";
+import { SingularityTensor, type SingularityMember } from "../learning/singularity.js";
+import { SYLLABUS } from "../learning/school.js";
 import { ServoPolicy, type BrainSnapshot, type TensorStateView } from "../learning/servo-tensor.js";
+import type { AiPilot } from "../learning/pilot.js";
 import { Scene, type SceneAircraft } from "./scene.js";
 import {
   hudDelta, readoutOf, meanReadoutOf, type HudDelta,
 } from "./hud-delta.js";
 import type { ControlMode } from "../learning/guardian.js";
+import { RUNWAY } from "./land.js";
 
-/** The carpet's shape: 8 drones per line, 5 % exploration, no hazard. */
-export const WAVE_SIZE = 8;
-/** The sky holds at most this many living drones: a new wave launches
- *  only as many as fit (40 alive — nothing lifts off; 39 — one does). */
+/** The sky holds at most this many living drones: a new pair lifts off
+ * only when the sky has room for both of its seats (40 alive —
+ * nothing lifts off; 39 — the pair waits for a drone to die). */
 export const DRONE_CAP = 40;
-export const WAVE_EPSILON = 0.05;
-const WAVE_ROW_SPACING = 40.0;
-/** A new wave lifts off this often — the DISTANCE between waves, not a
- *  wait: the previous wave is still flying when the next one launches
- *  right behind it. */
-export const WAVE_SPAWN_EVERY = 4.0;
+export const PAIR_EPSILON = 0.05;
+/** THE RUNWAY SEATS: both drones of a pair start ON the runway — the
+ *  lane's width is split into two halves and each seat sits at the
+ *  CENTRE of its half (the left seat the left half's centre, the
+ *  right seat the right half's). land.ts's RUNWAY is the one source
+ *  of truth for the lane's geometry: the seats follow whatever the
+ *  runway is. */
+export const PAIR_SEAT_Y = 0.5;
+/** Every pair starts at the SAME threshold — the five-second launch
+ *  interval IS the trail (real runway ops: the pair before is rolling
+ *  or flying by the time the next one lines up). */
+const LAUNCH_X = RUNWAY.near + 50.0;
+/** The pair launch cadence, seconds — the first pair lifts off at
+ *  once, the next rolls five seconds behind it, pair after pair. */
+export const PAIR_LAUNCH_EVERY = 5.0;
+/** The SingularityTensor's update round, ticks (1 s): the swarm speaks
+ *  into the shared vessel, the vessel shares back, and the super-goal
+ *  pulls whoever fell behind. */
+const SINGULARITY_ROUND_TICKS = 50;
 /** Drones connect to every other drone within this range, metres —
- *  same wave or neighbouring waves, the swarm's mesh. */
+ *  the swarm's mesh, every nearby pair. */
 export const LINK_RANGE = 180.0;
 const TRAIL_CAP = 1200;
 const DT = 1.0 / 50.0;
 
-/** One drone of the conveyor: its generation, seat, brain, machine, life. */
+/** One drone of the conveyor: its pair, seat, brain, machine, life. */
 interface ConveyorDrone {
-  readonly wave: number;
-  readonly slot: number;
-  readonly policy: ServoPolicy;
-  readonly flight: LiveEpisode;
+  readonly pair: number;
+  readonly pilot: AiPilot;
+  readonly flight: MissionFlight;
   readonly entry: SceneAircraft;
 }
 
@@ -60,7 +92,7 @@ export interface SwarmLink {
   b: SceneAircraft;
 }
 
-/** The drone attack waves, live — see the file header. */
+/** The drone attack, live — see the file header. */
 export class WavesShow {
   readonly scene = new Scene();
   private readonly flock = new Flock();
@@ -72,21 +104,30 @@ export class WavesShow {
    *  these tensors before the flock's living mosaic teaches on top. */
   private readonly brainSnapshot: BrainSnapshot | null;
   private simTime = 0.0;
-  private nextWaveAt = 0.0;
-  /** The next wave's number (0-based; the first wave is 0). */
-  private nextWave = 0;
+  private nextPairAt = 0.0;
+  /** The next pair's number (0-based; the first pair is 0). */
+  private nextPair = 0;
   private readonly drones: ConveyorDrone[] = [];
+  /** THE SINGULARITY BRAIN — the one shared tensor the flock maintains
+   *  together, and its super-goal over the formation. */
+  private readonly singularity = new SingularityTensor();
+  private roundTick = 0;
+  /** Whose hands fly every NEW drone from the runway — the scenario's
+   *  default is the PAIR: the instructor flies, the AI suggests and
+   *  learns (the controls dropdown overrides it per drone, sticky). */
+  readonly defaultControlsMode: ControlMode = "both-suggest";
 
   constructor(seed: { state: string; inc: string },
               brain?: ServoPolicy) {
     this.rng = new NumpyPcg64(BigInt(seed.state), BigInt(seed.inc));
     this.brainSnapshot = brain === undefined ? null : brain.snapshot();
-    this.launchWave();
-    this.nextWaveAt = WAVE_SPAWN_EVERY;
+    this.launchPair();
+    this.nextPairAt = PAIR_LAUNCH_EVERY;
   }
 
-  get waveCount(): number {
-    return this.nextWave;
+  /** How many pairs have lifted off so far. */
+  get pairCount(): number {
+    return this.nextPair;
   }
 
   get simSeconds(): number {
@@ -108,6 +149,17 @@ export class WavesShow {
   }
   get obituaries(): number {
     return this.flock.obituariesHeard;
+  }
+
+  /** THE SUPER-GOAL — the mission leg the formation's plurality flies
+   *  (the singularity's shared intent, the UI's status line). */
+  get singularityGoal(): MissionToken {
+    return this.singularity.superGoal;
+  }
+
+  /** The singularity's completed update rounds. */
+  get singularityRounds(): number {
+    return this.singularity.rounds;
   }
 
   /** THE AI STATE LOG's subject: the selected drone's tensor network
@@ -191,12 +243,37 @@ export class WavesShow {
   } {
     return {
       title: "drone attack waves",
-      goal: "the swarm keeps flying: every drone that dies screams its " +
-            "memory to the flock, and every newborn inherits the boot-" +
-            "trained brain plus the living mosaic",
-      elements: ["free flight"],
-      goals: ["survive (never expire: a drone flies until it crashes)",
-              "stay inside the world's bounds",
+      goal: "pairs lift off from the runway five seconds apart, fly " +
+            "the attack mission — the split onto the flanks, the level " +
+            "moment at 3000 ft, the converging steep descending attack " +
+            "turns down to 500 ft, the rally's climbing turns up to " +
+            "1500 ft, the spin own side and recover — and then the " +
+            "will decides: the drone's own brain takes the controls in " +
+            "free flight, in formation with the flock's " +
+            "SingularityTensor: the one shared brain, updated from " +
+            "every neighbour and every neighbour's neighbour",
+      elements: ["roll", "rotate", "climb", "level off",
+                "roll in", "turn (the split onto the flank)",
+                "cruise (the level moment in the flank)",
+                "roll in", "descending turn (the attack)",
+                "descend (down to 500 ft)",
+                "climbing turn (the rally)", "climb (to 1500 ft)",
+                "stall entry", "drop wing", "spin",
+                "opposite rudder", "dive",
+                "cruise (level, then the will decides)"],
+      goals: ["take off from the runway in pairs, five seconds apart",
+              "climb out of ground effect, wings level",
+              "split on the climb: the left column onto HSI-45, the " +
+              "right onto HSI+45",
+              "climb out in the flank to 3000 ft and level off",
+              "fly level at 3000 ft — the moment in the flank",
+              "attack: the left flank's steep descending turn right, " +
+              "the right flank's steep descending turn left, down to " +
+              "500 ft",
+              "rally: the climbing turns onto HSI ±45 up to 1500 ft",
+              "spin own side and recover",
+              "fly level, and let the will decide the next steps",
+              "act in formation with the singularity's super-goal",
               "keep the swarm's memory alive (the obituaries heard)"],
     };
   }
@@ -225,8 +302,8 @@ export class WavesShow {
 
   /**
    * Advance the swarm by one 50 Hz tick: every drone's life steps at
-   * once, the dead scream once, and the next wave lifts off right
-   * behind the last at its distance — no waiting.
+   * once, the dead scream once, and the next pair rolls onto the
+   * runway five seconds behind the last — the conveyor never stops.
    */
   step(): void {
     this.simTime += DT;
@@ -241,51 +318,99 @@ export class WavesShow {
       }
     }
     this.pruneOldCrashSites();
-    // The cap: a wave lifts off only while the sky has room — 40 alive
-    // means nothing new launches; the moment one dies, room opens and
-    // the next wave launches (as many slots as fit, no waiting).
-    if (this.simTime >= this.nextWaveAt && this.aliveCount < DRONE_CAP) {
-      this.launchWave();
-      this.nextWaveAt += WAVE_SPAWN_EVERY;
+    // THE SINGULARITY'S ROUND: the flock speaks into the shared tensor,
+    // the shared tensor answers, and the super-goal pulls whoever has
+    // fallen behind onto the formation's leg.
+    this.roundTick += 1;
+    if (this.roundTick >= SINGULARITY_ROUND_TICKS) {
+      this.roundTick = 0;
+      this.runSingularityRound();
+    }
+    // The cap: a pair lifts off only while the sky has room for BOTH
+    // of its seats — 40 alive means nothing new rolls; the moment two
+    // drones die, room opens and the next pair launches.
+    if (this.simTime >= this.nextPairAt && this.aliveCount + 2 <= DRONE_CAP) {
+      this.launchPair();
+      this.nextPairAt += PAIR_LAUNCH_EVERY;
     }
   }
-  /** One wave lifts off: a line of new drones — assembled as mosaics of
-   *  what the living still remember — right behind the previous wave.
-   *  Only as many slots as the sky's cap has room for. */
-  private launchWave(): void {
-    const wave = this.nextWave++;
-    const slots = Math.min(WAVE_SIZE, DRONE_CAP - this.aliveCount);
-    for (let slot = 0; slot < slots; slot++) {
-      const policy = new ServoPolicy();
+
+  /**
+   * ONE SINGULARITY ROUND: the live members and their mesh go in, the
+   * shared vessel is maintained from everyone another member can reach
+   * within two hops, and the super-goal that comes out is conformed to
+   * by every drone of the formation.
+   */
+  private runSingularityRound(): void {
+    const live = this.drones
+      .filter((d) => d.flight.episodeOutcome === null);
+    if (live.length === 0) {
+      return;
+    }
+    const mesh: Array<[number, number]> = [];
+    for (let i = 0; i < live.length; i++) {
+      for (let j = i + 1; j < live.length; j++) {
+        if (withinRange(live[i].flight.aircraft.body.position,
+                        live[j].flight.aircraft.body.position,
+                        LINK_RANGE)) {
+          mesh.push([i, j]);
+        }
+      }
+    }
+    const members: SingularityMember[] = live
+      .map((d) => ({ pilot: d.pilot, token: d.flight.missionToken }));
+    this.singularity.updateRound(members, mesh, this.rng);
+    for (const drone of live) {
+      drone.flight.conform(this.singularity.superGoal);
+    }
+  }
+
+  /**
+   * ONE PAIR LIFTS OFF FROM THE RUNWAY: two drones abreast — the left
+   * seat the left flank's column, the right seat the right flank's —
+   * in trail behind the pair before, assembled as mosaics of what the
+   * living still remember, and each one flying the attack mission from
+   * its own takeoff roll. The conveyor never stops: pair after pair,
+   * five seconds apart, as long as the sky has room for both seats.
+   */
+  private launchPair(): void {
+    const pair = this.nextPair++;
+    for (const flankSign of [-1.0, 1.0]) {
+      // The drone's own dice, drawn from the swarm's master stream: its
+      // brain and its exploration are its own, deterministic and
+      // replayable.
+      const state = this.rng.draw64();
+      const inc = this.rng.draw64();
+      const pilot = MissionFlight.pilot(new NumpyPcg64(state, inc));
       // THE BRAIN TRANSPLANT: the newborn receives the boot-trained
       // tensors first, then the flock's living mosaic teaches on top —
       // every drone starts from what the flight school learned.
       if (this.brainSnapshot !== null) {
-        policy.restore(this.brainSnapshot);
+        pilot.inherit(this.brainSnapshot);
       }
-      this.flock.seedNewborn(policy, this.rng);
-      this.flock.enroll(policy);
-      // The drone's own dice, drawn from the swarm's master stream: its
-      // exploration is its own, deterministic and replayable.
-      const state = this.rng.draw64();
-      const inc = this.rng.draw64();
-      const position = new Vec3(0.0,
-        (slot - WAVE_SIZE / 2.0) * WAVE_ROW_SPACING, 50.0);
-      const flight = new LiveEpisode(policy, this.instruments, wave,
-                                     new NumpyPcg64(state, inc), {
+      this.flock.seedNewborn(pilot, this.rng);
+      this.flock.enroll(pilot);
+      // THE PAIR SEAT: both drones ON the runway — the lane split into
+      // two halves, each seat at the centre of its own half, both at
+      // the same threshold (the launch interval is the trail).
+      const position = new Vec3(LAUNCH_X,
+        flankSign * RUNWAY.half * PAIR_SEAT_Y, SYLLABUS.runwayM);
+      const flight = new MissionFlight(pilot, this.instruments, pair, {
+        flankSign,
         startPosition: position,
-        epsilonOverride: WAVE_EPSILON,
-        horizon: Infinity,   // drones NEVER expire: they fly until they crash
+        epsilonOverride: PAIR_EPSILON,
+        mode: this.defaultControlsMode,
+        worldHalfExtent: MISSION_AREA_M,
       });
       const entry = this.scene.add({
-        label: `Wave ${wave + 1} \u00b7 Drone ${slot + 1}`,
+        label: `Pair ${pair + 1} \u00b7 ${flankSign < 0.0 ? "left" : "right"}`,
         aircraft: flight.aircraft,
         hand: { choices: null, fresh: false },
         trail: [{ x: position.x, y: position.y, z: position.z }],
         flying: true,
         dead: false,
       });
-      this.drones.push({ wave, slot, policy, flight, entry });
+      this.drones.push({ pair, pilot, flight, entry });
     }
   }
 
@@ -296,20 +421,21 @@ export class WavesShow {
     drone.entry.flying = false;
     drone.entry.dead = outcome !== null && died(outcome);
     if (drone.entry.dead) {
-      this.flock.reap(drone.policy);
-      this.flock.broadcastObituary(drone.policy, this.rng);
+      this.flock.reap(drone.pilot);
+      this.flock.broadcastObituary(drone.pilot, this.rng);
     }
   }
 
-  /** Keep the sky honest: drones whose life ended (crashed or survived
-   *  their episode) leave the scene once their wave is two behind — the
-   *  living fly on, and the scene shows the world as it is now. Their
-   *  memory shard lives on in the flock, whatever it was. */
+  /** Keep the sky honest: drones whose life ended (crashed or flew out
+   *  of the area) leave the scene once their pair is a few pairs behind
+   *  the newest — the living fly on, and the scene shows the world as
+   *  it is now. Their memory shard lives on in the flock, whatever it
+   *  was. */
   private pruneOldCrashSites(): void {
-    const oldestKept = this.nextWave - 2;
+    const oldestKept = this.nextPair - 6;
     for (let i = this.drones.length - 1; i >= 0; i--) {
       const drone = this.drones[i];
-      if (drone.wave < oldestKept && drone.flight.episodeOutcome !== null) {
+      if (drone.pair < oldestKept && drone.flight.episodeOutcome !== null) {
         this.scene.remove(drone.entry);
         this.drones.splice(i, 1);
       }

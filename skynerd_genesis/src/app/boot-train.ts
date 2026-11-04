@@ -10,15 +10,14 @@
  * are jittered its own way from birth, so the flock differs from the
  * start and selection has real variety to select on.
  *
- * THE SCHEDULE: first one pass through the curriculum in order (one
- * shadow repetition per lesson, the whole flock), then the lessons
- * come in RANDOM order, ONE repetition at a time — until every lesson
- * has had its repetitions; then another cycle is dealt, FOREVER. The
- * dialog's DONE button is the only thing that stops it (finishNow):
- * the person decides when the brain is good enough. The champion (the
- * student with the best running fitness) is the brain that gets
- * transplanted — into the live classroom's student AND every newborn
- * drone.
+ * THE SCHEDULE: the lessons come ROUND-ROBIN, ONE repetition at a time
+ * — the curriculum in order, lap after lap, forever, until every
+ * lesson has had its repetitions and the schedule simply deals
+ * another lap. The dialog's DONE button is the only thing that stops
+ * it (finishNow): the person decides when the brain is good enough.
+ * The champion (the student with the best running fitness) is the
+ * brain that gets transplanted — into the live classroom's student
+ * AND every newborn drone.
  *
  * The trainer is chunked: runChunk() steps the flock for a wall-time
  * budget (the students fly interleaved, one tick each, round-robin —
@@ -36,9 +35,10 @@ import { NumpyPcg64 } from "../core/rng.js";
 import { RNG0_STATE, RNG0_INC } from "../learning/school.js";
 import { TRIM_SPEED } from "../learning/flight.js";
 
-/** The flock's size: how many students fly each repetition. The
- *  selection keeps the best half and rebuilds the rest from them. */
-export const FLOCK_SIZE = 16;
+/** The class's size: TEN students fly each repetition. The genetic
+ *  selection keeps the five best and weaves five new children from
+ *  them, so every round ends with ten brains again. */
+export const FLOCK_SIZE = 10;
 
 /** How many repetitions each maneuver gets in total (the first pass
  *  counts as the first). */
@@ -81,7 +81,8 @@ export interface BootProgress {
   /** The lesson table — one row per lesson: repetitions and the
    *  flock's best student's EMA score, updated live. */
   rows: BootLessonRow[];
-  /** 0..1 — the bar, left to right. */
+  /** 0..1 — the bar, left to right: the averaged match across all
+   *  lessons (5+/6 is fully trained, 3 or below barely flies). */
   fraction: number;
   /** The classroom completed: the brain is ready for transplant. */
   done: boolean;
@@ -119,8 +120,8 @@ export class BootTrainer {
    *  student flies its own dice but the whole classroom is
    *  deterministic. */
   private readonly rng = new NumpyPcg64(RNG0_STATE, RNG0_INC);
-  /** The schedule's dice: which random lesson comes next. */
-  private readonly order = new NumpyPcg64(770017n, 987654321n);
+  /** The genetics' dice: the cross-over's weaving. */
+  private readonly genes = new NumpyPcg64(770017n, 987654321n);
   /** The priors' dice: each student's jitter stream. */
   private readonly priorRng = new NumpyPcg64(20260101n, 770017n);
   /** The classroom's TIME: one fresh epoch per repetition round. */
@@ -128,10 +129,9 @@ export class BootTrainer {
   /** The round currently in the air (null = the schedule hands out
    *  the next one). */
   private current: BootRound | null = null;
-  /** The first pass's position (curriculum order). */
-  private firstPassIndex = 0;
-  /** How many random-order repetitions each lesson still owes. */
-  private readonly remaining = new Map<string, number>();
+  /** The round-robin's position: which lesson of the curriculum the
+   *  next repetition flies. */
+  private roundIndex = 0;
   /** Repetitions completed per lesson. */
   private readonly attempts = new Map<string, number>();
   /** The flock's best student's EMA goal score per lesson, 0-6. */
@@ -228,10 +228,25 @@ export class BootTrainer {
       }
     }
     const done = this.finished && this.current === null;
-    const total = this.reps * this.names.length;
-    const doneReps = [...this.attempts.values()].reduce((sum, n) => sum + n, 0);
-    const fraction = Math.min(1.0, doneReps / total);
-    return { rows: this.lessonRows(), fraction, done };
+    return { rows: this.lessonRows(), fraction: this.matchFraction(),
+             done };
+  }
+
+  /**
+   * THE PROGRESS BAR — the averaged match across ALL lessons: the
+   * flock's best student's EMA score per lesson, averaged over the
+   * whole curriculum. Averaged 5+/6 is a fully trained brain (100 %),
+   * 3 or below barely flies (10 %), and the stretch between climbs
+   * linearly.
+   */
+  private matchFraction(): number {
+    let sum = 0.0;
+    for (const name of this.names) {
+      sum += this.scores.get(name) ?? 0.0;
+    }
+    const average = sum / this.names.length;
+    const clamped = Math.min(1.0, Math.max(0.0, (average - 3.0) / 2.0));
+    return 0.1 + 0.9 * clamped;
   }
 
   /**
@@ -250,31 +265,19 @@ export class BootTrainer {
     }
   }
 
-  /** The next round on the schedule: the first pass walks the
-   *  curriculum in order; after it, a RANDOM lesson, ONE repetition
-   *  at a time — the whole flock flies it. The classroom never runs
-   *  out of work. */
+  /** The next round on the schedule: the lessons come ROUND-ROBIN, one
+   *  repetition at a time — the curriculum in order, lap after lap,
+   *  the whole flock flying each one. The classroom never runs out
+   *  of work. */
   private nextRound(): BootRound | null {
     if (this.finished) {
       return null;
     }
-    let lesson: Lesson;
-    if (this.firstPassIndex < this.names.length) {
-      lesson = this.school.lessons.get(this.names[this.firstPassIndex])!;
-      this.firstPassIndex += 1;
-    } else {
-      if (this.remaining.size === 0) {
-        this.dealCycle();
-      }
-      const pool = this.names.filter((n) => this.remaining.get(n)! > 0);
-      if (pool.length === 0) {
-        this.dealCycle();   // the cycle ran out: deal another, forever
-      }
-      const candidates = this.names.filter(
-        (n) => this.remaining.get(n)! > 0);
-      const pick = candidates[this.order.integers(candidates.length)];
-      this.remaining.set(pick, this.remaining.get(pick)! - 1);
-      lesson = this.school.lessons.get(pick)!;
+    const lesson = this.school.lessons.get(
+      this.names[this.roundIndex % this.names.length])!;
+    this.roundIndex += 1;
+    if (this.roundIndex % this.names.length === 0) {
+      this.dealCycle();   // a lap completed: the maintenance pass
     }
     const flights: ShadowFlight[] = [];
     const live: boolean[] = [];
@@ -288,13 +291,10 @@ export class BootTrainer {
     return { lesson, flights, live };
   }
 
-  /** Deal a fresh cycle: every lesson owes its repetitions — and the
-   *  dead cells die, the priors re-imposed (the endless classroom's
-   *  memory bound, and the no-brainers' immortality). */
+  /** A lap of the round-robin completed: the dead cells die and the
+   *  priors re-imposed (the endless classroom's memory bound, and the
+   *  no-brainers' immortality). */
   private dealCycle(): void {
-    for (const name of this.names) {
-      this.remaining.set(name, this.reps);
-    }
     for (const student of this.flock) {
       student.prune(this.demoEpoch - EVICTION_EPOCHS);
       student.installPriors(this.demoEpoch, this.priorRng);
@@ -302,8 +302,8 @@ export class BootTrainer {
   }
 
   /**
-   * GRADE AND SELECT: the round's grades rank the students. The best
-   * half STAYS (they progressed); the bottom half is REPLACED by
+   * GRADE AND SELECT: the round's grades rank the students. THE FIVE
+   * BEST STAY (they progressed); the other five are REPLACED by
    * clones and cross-overs of the winners — the deteriorated
    * students' brains die, the successful ones' spread. The lesson's
    * reported score is the flock's best this round, EMA-blended.
@@ -373,8 +373,8 @@ export class BootTrainer {
                     child: ServoPolicy): void {
     const snapA = parentA.snapshot();
     const snapB = parentB.snapshot();
-    const tensors = ["location", "energy", "flight", "controls", "skill",
-                     "goal", "servo"] as const;
+    const tensors = ["location", "energy", "flight", "controls", "leftSkill",
+                     "rightSkill", "goal", "servo"] as const;
     const merged: Record<string, { values: Map<number, Float32Array>;
                                    epochs: Map<number, Int32Array> }> = {};
     for (const tensor of tensors) {
@@ -382,14 +382,14 @@ export class BootTrainer {
       const values = new Map<number, Float32Array>();
       const epochs = new Map<number, Int32Array>();
       for (const [key, layers] of a.values) {
-        const fromB = this.order.uniform() < 0.5
+        const fromB = this.genes.uniform() < 0.5
                       && b.values.has(key);
         values.set(key, Float32Array.from(fromB ? b.values.get(key)! : layers));
         epochs.set(key, Int32Array.from(
           fromB ? b.epochs.get(key)! : a.epochs.get(key)!));
       }
       for (const [key, layers] of b.values) {
-        if (!values.has(key) && this.order.uniform() < 0.5) {
+        if (!values.has(key) && this.genes.uniform() < 0.5) {
           values.set(key, Float32Array.from(layers));
           epochs.set(key, Int32Array.from(b.epochs.get(key)!));
         }
@@ -399,9 +399,10 @@ export class BootTrainer {
     child.restore({
       location: merged.location, energy: merged.energy,
       flight: merged.flight, controls: merged.controls,
-      skill: merged.skill, goal: merged.goal, servo: merged.servo,
+      leftSkill: merged.leftSkill, rightSkill: merged.rightSkill,
+      goal: merged.goal, servo: merged.servo,
       errorSigns: snapA.errorSigns.map((sign, i) =>
-        this.order.uniform() < 0.5 ? sign : snapB.errorSigns[i]),
+        this.genes.uniform() < 0.5 ? sign : snapB.errorSigns[i]),
     });
   }
 

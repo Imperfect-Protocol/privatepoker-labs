@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Private Poker Labs presents: Skynerd</title>
+  <meta name="description" content="Hebbian Learning Part 2: Highly Dangerous UAV Drones Swarm Organism w/ Decentralised Brain">
+  <meta property="og:title" content="Private Poker Labs presents: Skynerd">
+  <meta property="og:description" content="Hebbian Learning Part 2: Highly Dangerous UAV Drones Swarm Organism w/ Decentralised Brain">
+  <meta property="og:image" content="/splash.png">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Private Poker Labs presents: Skynerd">
+  <meta name="twitter:description" content="Hebbian Learning Part 2: Highly Dangerous UAV Drones Swarm Organism w/ Decentralised Brain">
+  <meta name="twitter:image" content="/splash.png">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ctext y='13' font-size='13'%3E%E2%9C%88%3C/text%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Michroma&family=Rajdhani:wght@500;600;700&family=Inter+Display:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+  <div id="app">
+    <div id="bar">
+      <div class="bar-row">
+        <span class="brand">SKYNERD <span class="tag">genesis</span></span>
+        <label>scenario
+          <select id="scenario"></select>
+        </label>
+        <label>aircraft
+          <select id="aircraft"></select>
+        </label>
+        <label>controls
+          <select id="controls">
+            <option value="instructor">Solo: Instructor</option>
+            <option value="ai">Solo: AI</option>
+            <option value="both-suggest" selected>Pair: Instructor</option>
+            <option value="both-guarded">Pair: AI</option>
+          </select>
+        </label>
+        <button id="next" title="N — next maneuver">&#9654; next maneuver</button>
+        <button id="restart" title="R — restart">&#8635; restart</button>
+        <span id="badge"></span>
+      </div>
+      <div class="bar-row">
+        <button id="play" title="space">&#9208; pause</button>
+        <label>speed
+          <select id="speed">
+            <option value="0.2">0.2x</option>
+            <option value="0.3">0.3x</option>
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option>
+            <option value="2">2x</option>
+            <option value="3">3x</option>
+            <option value="5">5x</option>
+            <option value="10">10x</option>
+          </select>
+        </label>
+        <button id="zoomIn" title="zoom in">+</button>
+        <button id="zoomOut" title="zoom out">&minus;</button>
+        <button id="zoomReset" title="reset view">reset</button>
+        <label class="cb" title="hill shading from the surface normal"><input type="checkbox" id="cbRelief">relief</label>
+        <label class="cb" title="the sun's glare veil"><input type="checkbox" id="cbGlare">glare</label>
+        <label class="cb" title="the horizon's fog dissolve"><input type="checkbox" id="cbHaze" checked>haze</label>
+        <label class="cb" title="hill shadows (the corner-ray field)"><input type="checkbox" id="cbSunShadows">shadows</label>
+        <label class="cb" title="water reflections (reserved)"><input type="checkbox" id="cbWaterRefl">refl</label>
+        <label class="cb" title="the biome checkerboard ground"><input type="checkbox" id="cbChecker" checked>checker</label>
+        <label>time
+          <select id="timeOfDay">
+            <option value="dawn">Dawn</option>
+            <option value="sunrise">Sunrise</option>
+            <option value="noon" selected>Noon</option>
+            <option value="sunset">Sunset</option>
+            <option value="dusk">Dusk</option>
+            <option value="night">Night</option>
+          </select>
+        </label>
+        <label>flare
+          <select id="lensFlare">
+            <option value="none" selected>None</option>
+            <option value="panavision">NerdVision</option>
+            <option value="michaelbay">MichaelNerd</option>
+          </select>
+        </label>
+      </div>
+    </div>
+
+    <div id="stage">
+      <div id="narration" class="narration"></div>
+      <canvas id="sky"></canvas>
+      <div id="status">booting…</div>
+    </div>
+
+    <div id="sideGrip" class="grip" title="drag to resize the side panel — under 10% of the screen it hides"></div>
+
+    <aside id="cockpit">
+      <div class="cockpit-head">
+        <span id="cockpit-title">—</span>
+      </div>
+      <div class="cockpit-view" id="cockpit-view">
+        <canvas id="worldCanvasL"></canvas>
+        <canvas id="lightCanvasL"></canvas>
+        <canvas id="worldCanvas"></canvas>
+        <canvas id="lightCanvas"></canvas>
+        <canvas id="cockpitCanvas"></canvas>
+        <canvas id="worldCanvasR"></canvas>
+        <canvas id="lightCanvasR"></canvas>
+        <canvas id="controlsCanvas"></canvas>
+      </div>
+      <div id="cockpit-foot"></div>
+    </aside>
+
+    <div id="results">
+      <div class="tab-head">
+        <button class="tab active" data-tab="wiki">scenario</button>
+        <button class="tab" data-tab="ai">AI state</button>
+      </div>
+      <div class="tab-body" id="tabWiki"></div>
+      <div class="tab-body" id="tabAi" hidden></div>
+    </div>
+
+    <div id="bottomGrip" class="grip" title="drag to resize the log panel — under 10% it hides"></div>
+  </div>
+
+  <div id="boot">
+    <div class="boot-dialog">
+      <div class="boot-head">
+        <h1>SKYNERD FLIGHT SCHOOL</h1>
+      </div>
+      <div id="bootContent">
+        <canvas id="bootBrain" width="760" height="440"></canvas>
+      </div>
+      <div id="bootDetails">
+        <div id="bootLog"></div>
+      </div>
+      <div class="boot-foot">
+        <div class="boot-bar"><div id="bootFill"></div></div>
+        <button id="bootExpand" title="show the training log">SHOW DETAILS</button>
+        <button id="bootDone" title="stop the endless classroom and fly">DONE</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="splash" title="click to enter">
+    <div class="splash-content">
+      <h1>SKYNERD</h1>
+      <div class="splash-rule"></div>
+      <p class="splash-status">by Imperfect Protocol</p>
+    </div>
+  </div>
+  <script type="module" src="/build-web/src/app/main.js"></script>
+</body>
+</html>

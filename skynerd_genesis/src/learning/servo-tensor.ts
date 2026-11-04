@@ -1,5 +1,5 @@
 /**
- * THE STUDENT'S BRAIN — seven tensors connected by synapses into a
+ * THE STUDENT'S BRAIN — eight tensors connected by synapses into a
  * pulsating dynamic system, the servo policy being the assembly.
  *
  *   LocationTensor   alt x hsi | prev x element x skill
@@ -22,9 +22,15 @@
  *                        throttle — "pulling up high", "ailerons left
  *                        low", "throttle cruise"…)
  *   GoalTensor       goal x element x situation-bus   -> new goal x element
- *   SkillTensor      the PATCH PANEL: every tensor's classification
- *                     paired with every other's        -> the wire's weight
- *   ServoTensor      the SKILL tensor's forwarded classifications
+ *   LeftSkillsTensor  THE PERCEPTION PANEL: location x energy x the
+ *                     goal's element x the servo's last option, one
+ *                     WIRE per pair — the wire's weight is the
+ *                     learned association of the two signals
+ *   RightSkillsTensor THE EXECUTION PANEL: flight x controls x the
+ *                     goal's element x the servo's last option, one
+ *                     WIRE per pair — the mirror company on the
+ *                     side that acts
+ *   ServoTensor      the two skills' forwarded classifications
  *                                                   -> the four levers
  *
  * THE SIGNAL FLOW (nothing touches the Aircraft but the sensors):
@@ -35,32 +41,41 @@
  *   TEACHER that labels any binned panel) — and each sensor is
  *   RECURRENT: its key carries its OWN previous class (its situation
  *   from itself), the GOAL tensor's held element (its situation from
- *   the goal tensor), and the SKILL patch bin for its wire to the
- *   goal (its situation from the skill tensor). The demonstration
- *   STAMPS the teacher's label; the runtime RECALLS the strongest
- *   class in the key's neighborhood, and falls back to the teacher
- *   when nothing clears the bar — so a panel the school never showed
- *   still classifies, deterministically, the way the instructor would.
+ *   the goal tensor), and its SKILL panel's patch bin (its situation
+ *   from its side's skills tensor). The demonstration STAMPS the
+ *   teacher's label; the runtime RECALLS the strongest class in the
+ *   key's neighborhood, and falls back to the teacher when nothing
+ *   clears the bar — so a panel the school never showed still
+ *   classifies, deterministically, the way the instructor would.
  *
- *   The SKILL tensor is the PATCH PANEL: it stores the association
- *   weight of every PAIR of tensor signals — every sensor code with
- *   every other sensor code, each with the goal's element, and the
- *   servo's last command — a wire between every tensor and every
- *   other tensor. It fires all the wires at every decision; its
- *   recall is the learned strength of a connection.
+ *   THE TWO SKILLS TENSORS ARE TWO PATCH PANELS, one per side of the
+ *   brain: the LEFT panel wires the perception side (location,
+ *   energy, the goal's element, the servo's last command option),
+ *   the RIGHT panel the execution side (flight, controls, the same
+ *   goal element and servo option). Each stores the association
+ *   weight of every PAIR of its side's signals; it fires all its
+ *   wires at every decision; its recall is the learned strength of a
+ *   connection. THE BRIDGE: each panel also holds ONE wire keyed on
+ *   the two panels' own coherence bins — perception remembers what
+ *   execution was doing when a company occurred, and vice versa —
+ *   and at runtime the panels pulse each other: a panel whose
+ *   verdict moved stuns the other, so the two sides always judge the
+ *   same moment.
  *
  *   The GOAL tensor is the FUZZY STATE MACHINE: (goal, element,
  *   situation-bus) -> (new goal, new element). The bus is the four
  *   sensors' codes merged; the situation axis recalls fuzzily.
  *
- *   The SERVO tensor receives ALL its input from the SKILL tensor —
- *   and nothing from the Aircraft, nothing even directly from the
- *   other tensors: the skill's fired message IS the servo's whole
- *   observation — the goal/element pair, the four sensor classes, and
- *   the patch panel's coherence bin. The skill initially FORWARDS the
- *   classifications exactly as they arrived; what it mixes in over
- *   training is its wires' verdicts — the patch bins in the sensors'
- *   keys, and the coherence bin in the forwarded payload.
+ *   The SERVO tensor receives ALL its input from the TWO SKILLS
+ *   tensors — and nothing from the Aircraft, nothing even directly
+ *   from the other tensors: the panels' fired messages ARE the
+ *   servo's whole observation — the goal/element pair, the energy
+ *   class (forwarded by the LEFT panel), the flight class (the
+ *   RIGHT panel), and the two panels' coherence bins. Each panel
+ *   initially FORWARDS its side's classifications exactly as they
+ *   arrived; what it mixes in over training is its wires' verdicts —
+ *   the patch bins in the sensors' keys, and the coherence bins in
+ *   the forwarded payload.
  *
  * The hierarchy is in TIME: a tensor that receives a signal is
  * STUNNED; it relaxes through its refractory period; once relaxed it
@@ -166,6 +181,10 @@ const CODE_BAR = 0.5;
 
 /** The skill patch bins: the wire's quantized weight. 4 bins. */
 export const SKILL_BIN_AXIS = 4;
+/** The four sensors' class vocabularies, by sensor index — the error
+ *  laws' error denominators. */
+const CLASS_AXES: readonly number[] = [LOC_CLASS_AXIS, ENERGY_CLASS_AXIS,
+                                       FLIGHT_CLASS_AXIS, CONTROLS_CLASS_AXIS];
 /** The patch weight's bin edges (a wire at baseline reads bin 0). */
 const SKILL_BIN_EDGES = [0.75, 1.5, 3.0];
 const binOfWeight = (weight: number): number => {
@@ -184,11 +203,11 @@ const binOfWeight = (weight: number): number => {
  *  same rhythm. */
 export const PULSE_EVERY = 2;
 
-// --- THE PATCH PANEL's SIGNALS ---------------------------------------------
-// Every tensor's output signal, on the patch panel's wire bank. The
-// sensors' situation codes, the goal tensor's element, and the servo
-// tensor's last command option — each one a signal the skill tensor
-// can wire to any other.
+// --- THE TWO PATCH PANELS' SIGNALS ----------------------------------------
+// The patch panel's signal vocabulary: every tensor's output signal.
+// The sensors' situation codes, the goal tensor's element, and the
+// servo tensor's last command option — each one a signal a skills
+// panel can wire to another on its own side.
 
 /** The patch panel's signal bank: one slot per tensor output. */
 export const PATCH_SIGNALS = [
@@ -196,24 +215,56 @@ export const PATCH_SIGNALS = [
 ] as const;
 export type PatchSignal = typeof PATCH_SIGNALS[number];
 
-/** The wire bank: every unordered pair of signals, one wire each. */
-export const PATCH_WIRES: ReadonlyArray<readonly [PatchSignal, PatchSignal]> =
-  (() => {
-    const wires: Array<[PatchSignal, PatchSignal]> = [];
-    for (let a = 0; a < PATCH_SIGNALS.length; a++) {
-      for (let b = a + 1; b < PATCH_SIGNALS.length; b++) {
-        wires.push([PATCH_SIGNALS[a], PATCH_SIGNALS[b]]);
-      }
+/**
+ * THE LEFT PANEL'S SIGNALS — the perception side: where the plane is
+ * (location), what its energy is doing (energy), the goal tensor's
+ * held element, and the servo tensor's last command option.
+ */
+export const LEFT_PANEL_SIGNALS: ReadonlyArray<PatchSignal> =
+  ["location", "energy", "element", "servo"];
+
+/**
+ * THE RIGHT PANEL'S SIGNALS — the execution side: what to correct
+ * (flight), what the hand is doing (controls), the goal tensor's
+ * held element, and the servo tensor's last command option.
+ */
+export const RIGHT_PANEL_SIGNALS: ReadonlyArray<PatchSignal> =
+  ["flight", "controls", "element", "servo"];
+
+/** One panel's wire bank: every unordered pair of its signals. */
+function panelWires(signals: ReadonlyArray<PatchSignal>):
+    ReadonlyArray<readonly [PatchSignal, PatchSignal]> {
+  const wires: Array<[PatchSignal, PatchSignal]> = [];
+  for (let a = 0; a < signals.length; a++) {
+    for (let b = a + 1; b < signals.length; b++) {
+      wires.push([signals[a], signals[b]]);
     }
-    return wires;
-  })();
+  }
+  return wires;
+}
 
-/** The patch panel's wire count (every tensor with every other). */
-export const PATCH_WIRE_AXIS = PATCH_WIRES.length;
+/** The left panel's six company wires. */
+export const LEFT_WIRES = panelWires(LEFT_PANEL_SIGNALS);
+/** The right panel's six company wires. */
+export const RIGHT_WIRES = panelWires(RIGHT_PANEL_SIGNALS);
 
-/** The wire index of a signal pair. */
-export function wireIndexOf(a: PatchSignal, b: PatchSignal): number {
-  const index = PATCH_WIRES.findIndex(([x, y]) =>
+/**
+ * THE BRIDGE WIRE — the index, in each panel's wire bank, of the one
+ * wire the two panels share: keyed on the two panels' OWN coherence
+ * bins, so perception remembers what execution was doing when a
+ * company occurred, and vice versa.
+ */
+export const BRIDGE_WIRE = LEFT_WIRES.length;
+
+/** Each panel's wire count: its six companies plus the bridge. */
+export const LEFT_WIRE_AXIS = LEFT_WIRES.length + 1;
+export const RIGHT_WIRE_AXIS = RIGHT_WIRES.length + 1;
+
+/** The wire index of a signal pair within a panel's bank. */
+export function panelWireIndexOf(
+    wires: ReadonlyArray<readonly [PatchSignal, PatchSignal]>,
+    a: PatchSignal, b: PatchSignal): number {
+  const index = wires.findIndex(([x, y]) =>
     (x === a && y === b) || (x === b && y === a));
   return index;
 }
@@ -234,7 +285,8 @@ export interface BrainSnapshot {
   energy: NeuronSnapshot;
   flight: NeuronSnapshot;
   controls: NeuronSnapshot;
-  skill: NeuronSnapshot;
+  leftSkill: NeuronSnapshot;
+  rightSkill: NeuronSnapshot;
   goal: NeuronSnapshot;
   servo: NeuronSnapshot;
   /** The error neurons' learned signs (+1/−1, one per tensor) — the
@@ -261,9 +313,9 @@ export interface NetworkDecision {
   /** The situation bus state the decision was made at. */
   readonly situation: number;
   /** The servo tensor's observation key — the reinforcement key (the
-   *  skill tensor's FORWARDED payload: the goal/element pair, the
-   *  energy and flight classes, the patch coherence bin — the
-   *  decision's whole input, arrived from the skill tensor only). */
+   *  skills panels' FORWARDED payload: the goal/element pair, the
+   *  energy and flight classes, the two panels' coherence bins — the
+   *  decision's whole input, arrived from the skills tensors only). */
   readonly key: readonly number[];
   /** Whether the servo tensor actually fired (false = stunned). */
   readonly acted: boolean;
@@ -293,10 +345,15 @@ export class TensorContext {
   /** The skill patch bins: each sensor's wire weight to the element,
    *  quantized — the sensors' skill input. */
   readonly skillBins: [number, number, number, number] = [0, 0, 0, 0];
-  /** The patch panel's overall coherence for the current company
-   *  (raw weight + its bin — the servo's skill input). */
-  coherence = 0.0;
-  coherenceBin = 0;
+  /** The left panel's verdict on the perception company (raw weight
+   *  + its bin — the servo's skill input, forwarded by the left
+   *  panel). */
+  leftCoherence = 0.0;
+  leftCoherenceBin = 0;
+  /** The right panel's verdict on the execution company (raw weight
+   *  + its bin — forwarded by the right panel). */
+  rightCoherence = 0.0;
+  rightCoherenceBin = 0;
 
   /** The flight's current panel pulse — the only Aircraft input the
    *  network ever sees. The flight re-writes it at the head of every
@@ -332,6 +389,18 @@ export class TensorContext {
     else if (sensorIndex === 2) { this.flight = code; }
     else { this.controls = code; }
   }
+
+  /** One patch-panel signal's CURRENT slot value — the signal a
+   *  skills panel keys its wires on: a sensor's code, the goal's
+   *  element, or the servo's last command option. */
+  slotOf(signal: PatchSignal): number {
+    return signal === "location" ? this.location
+         : signal === "energy" ? this.energy
+         : signal === "flight" ? this.flight
+         : signal === "controls" ? this.controls
+         : signal === "element" ? this.element
+         : this.lastOption;
+  }
 }
 
 /**
@@ -352,7 +421,7 @@ function teacherClass(sensorIndex: number, panel: readonly number[]): number {
 }
 
 /**
- * Owns the seven tensors; encodes the panel into situation signals,
+ * Owns the eight tensors; encodes the panel into situation signals,
  * runs the fuzzy state machine, and chooses the commands. The
  * pulsating network (the stun and the gossip) lives in PulseNetwork —
  * one per flight, sharing this brain.
@@ -405,16 +474,25 @@ export class ServoPolicy {
                SKILL_BIN_AXIS, CONTROLS_CLASS_AXIS],
     ema: NEURON_EMA.controls, baseline: 0.1, maxWeight: 5.0, minWeight: 0.0,
   });
-  /** 5. THE SKILL TENSOR — THE PATCH PANEL: every tensor's signal
-   *  paired with every other's, one WIRE per pair. The wire's weight
-   *  is the learned association of the two signals occurring together;
-   *  the wires are what connect every tensor with every other tensor. */
-  readonly skillTensor = new PulseNeuron({
-    name: "the patch panel: every signal paired with every other",
-    keyShape: [PATCH_WIRE_AXIS, PATCH_SLOT_AXIS, PATCH_SLOT_AXIS],
+  /** 5. THE LEFT SKILLS TENSOR — THE PERCEPTION PATCH PANEL: the
+   *  location and energy signals, the goal's element, and the servo's
+   *  last command option, one WIRE per pair — the wire's weight is
+   *  the learned association of the two signals occurring together;
+   *  the bridge wire remembers the two panels' concurrent verdicts. */
+  readonly leftSkillTensor = new PulseNeuron({
+    name: "the perception panel: location x energy x element x servo",
+    keyShape: [LEFT_WIRE_AXIS, PATCH_SLOT_AXIS, PATCH_SLOT_AXIS],
     ema: NEURON_EMA.skill, baseline: 0.1, maxWeight: 5.0, minWeight: 0.0,
   });
-  /** 6. THE GOAL TENSOR — THE FUZZY STATE MACHINE: goal x element x
+  /** 6. THE RIGHT SKILLS TENSOR — THE EXECUTION PATCH PANEL: the
+   *  flight and controls signals, the goal's element, and the servo's
+   *  last command option — the mirror company on the side that acts. */
+  readonly rightSkillTensor = new PulseNeuron({
+    name: "the execution panel: flight x controls x element x servo",
+    keyShape: [RIGHT_WIRE_AXIS, PATCH_SLOT_AXIS, PATCH_SLOT_AXIS],
+    ema: NEURON_EMA.skill, baseline: 0.1, maxWeight: 5.0, minWeight: 0.0,
+  });
+  /** 7. THE GOAL TENSOR — THE FUZZY STATE MACHINE: goal x element x
    *  situation -> (new goal, new element). The situation axis recalls
    *  fuzzily: a bus code one step away is still the same news. */
   readonly goalTensor = new PulseNeuron({
@@ -423,39 +501,40 @@ export class ServoPolicy {
     ema: NEURON_EMA.goal, baseline: 0.1, maxWeight: 5.0, minWeight: 0.0,
     fuzzyAxes: [2],
   });
-  /** 7. THE SERVO TENSOR: THE SKILL TENSOR'S FORWARDED CLASSIFICATIONS
-   *  -> the four levers at their stops. Its key is the skill's fired
+  /** 8. THE SERVO TENSOR: THE TWO SKILLS' FORWARDED CLASSIFICATIONS
+   *  -> the four levers at their stops. Its key is the panels' fired
    *  payload — the goal/element pair and the two classes that DRIVE a
    *  correction (the energy class: whether to recover, climb, or
-   *  descend; the flight class: what to correct) plus the patch
-   *  panel's coherence bin. The LOCATION class is action-independent
+   *  descend; the flight class: what to correct) plus the TWO panels'
+   *  coherence bins. The LOCATION class is action-independent
    * (the user's own semantics) and the CONTROLS class is the hand's
    *  own state — both stay in the bus and the wires, out of the key:
    *  keying on them would fragment the skill memory across every
    *  heading bin and every lever nudge. ALL input still arrives from
-   *  the skill tensor, never from the Aircraft. The class axes and
-   *  the coherence bin recall fuzzily; the elevator's vernier is the
+   *  the skills tensors, never from the Aircraft. The class axes and
+   *  the coherence bins recall fuzzily; the elevator's vernier is the
    *  widest stop table. */
   readonly servoTensor = new PulseNeuron({
-    name: "skill forward: goal x element x energy x flight x coherence -> levers",
+    name: "skills forward: goal x element x energy x flight x left x right -> levers",
     keyShape: [GOAL_AXIS, ELEMENT_AXIS, ENERGY_CLASS_AXIS, FLIGHT_CLASS_AXIS,
-               SKILL_BIN_AXIS, HOLD_ALL_CHANNEL + 1, stopCount(1)],
+               SKILL_BIN_AXIS, SKILL_BIN_AXIS, HOLD_ALL_CHANNEL + 1, stopCount(1)],
     ema: NEURON_EMA.servo, baseline: 0.1, maxWeight: 5.0, minWeight: 0.0,
-    fuzzyAxes: [2, 3, 4],
+    fuzzyAxes: [2, 3, 4, 5],
   });
   epsilon = 0.5;
 
   // --- THE ERROR NEURONS ---------------------------------------------------
   // One per tensor (TENSOR_NODE order: location, energy, flight,
-  // controls, goal, skill, servo). The local learning units: each
-  // observes ITS tensor's error (the student against the instructor)
-  // and pumps a signed, proportional delta into that tensor's own
-  // cells — flipping its sign when its last pump made the error grow.
-  // The sign is learned state: it rides the snapshot a clone inherits.
+  // controls, goal, left skill, right skill, servo). The local
+  // learning units: each observes ITS tensor's error (the student
+  // against the instructor) and pumps a signed, proportional delta
+  // into that tensor's own cells — flipping its sign when its last
+  // pump made the error grow. The sign is learned state: it rides the
+  // snapshot a clone inherits.
   readonly errorNeurons: readonly ErrorNeuron[] = [
     new ErrorNeuron(), new ErrorNeuron(), new ErrorNeuron(),
     new ErrorNeuron(), new ErrorNeuron(), new ErrorNeuron(),
-    new ErrorNeuron(),
+    new ErrorNeuron(), new ErrorNeuron(),
   ];
 
   /** One tensor's error neuron, by node id. */
@@ -502,7 +581,7 @@ export class ServoPolicy {
 
   /** THE REFLEX: the no-brainer correction for a forwarded key, or
    *  null when the situation has no reflex. Key layout: [goal,
-   *  element, energy, flight, coherence]. */
+   *  element, energy, flight, left bin, right bin]. */
   static servoReflex(key: readonly number[]):
       readonly [number, number] | null {
     return ServoPolicy.SERVO_REFLEXES.get(
@@ -528,34 +607,47 @@ export class ServoPolicy {
 
   /**
    * IMPOSE THE PRIOR WIRES — the sensible companies cohering on the
-   * patch panel ("yawing right" hangs with "rudder left", the stall
-   * hangs with the push and the power), imposed as floors, each
-   * student's own jitter on the weight, re-imposed every classroom
-   * cycle so the forgetting law never kills them. The (a) spread runs
-   * at the first consolidation (the wires ride the dirty set).
+   * two patch panels, imposed as floors, each student's own jitter
+   * on the weight, re-imposed every classroom cycle so the
+   * forgetting law never kills them. The EXECUTION panel keeps the
+   * flight x controls companies ("yawing right" hangs with "rudder
+   * left", the stall attitude with the push); the PERCEPTION panel
+   * carries the energy emergencies to the servo's own option signal
+   * (the stall hangs with the push and the power) — the two panels
+   * share the element and the servo, so the companies still meet.
+   * The (a) spread runs at the first consolidation (the wires ride
+   * the dirty set).
    */
   installPriors(epoch: number, rng: NumpyPcg64): void {
     const jitter = (): number => 0.8 + 0.4 * rng.uniform();
     const CONTROLS_TRIM = 45 + 15 + 5 + 3;
     const RUD_LEFT = 45 + 15 + 0 * 5 + 3, RUD_RIGHT = 45 + 15 + 2 * 5 + 3;
     const PUSH = 0 * 45 + 15 + 5 + 3, PULL = 2 * 45 + 15 + 5 + 3;
-    const FULL_PWR = 45 + 15 + 5 + 4;
+    // The right panel's flight x controls companies.
     const WIRE_F = (flightClass: number, controlsClass: number): void => {
-      this.skillTensor.impose([wireIndexOf("flight", "controls"),
-        flightClass, controlsClass], 3.0 * jitter(), epoch);
+      this.rightSkillTensor.impose([panelWireIndexOf(RIGHT_WIRES,
+        "flight", "controls"), flightClass, controlsClass],
+        3.0 * jitter(), epoch);
     };
-    const WIRE_E = (energyClass: number, controlsClass: number): void => {
-      this.skillTensor.impose([wireIndexOf("energy", "controls"),
-        energyClass, controlsClass], 3.0 * jitter(), epoch);
+    // The left panel's energy x servo companies: the option that names
+    // the correction's own lever (the perception side remembers what
+    // the hand must do when the energy says so).
+    const WIRE_E = (energyClass: number, option: number): void => {
+      this.leftSkillTensor.impose([panelWireIndexOf(LEFT_WIRES,
+        "energy", "servo"), energyClass, option], 3.0 * jitter(), epoch);
     };
     WIRE_F(3, RUD_LEFT); WIRE_F(4, RUD_RIGHT);
     WIRE_F(9, 2 * 15 + 45 + 5 + 3);   // overbanked left <- aileron right
     WIRE_F(10, 0 * 15 + 45 + 5 + 3);  // overbanked right <- aileron left
     WIRE_F(12, PULL); WIRE_F(11, PUSH);
-    WIRE_E(8, PUSH); WIRE_E(9, PUSH);
-    WIRE_E(8, FULL_PWR); WIRE_E(9, FULL_PWR);
-    WIRE_E(7, PUSH);
-    WIRE_E(4, PULL);
+    const PUSH_OPTION = ServoPolicy.optionOf(1, 1);     // the stall push
+    const PULL_OPTION = ServoPolicy.optionOf(1, 8);     // the back pressure
+    const FULL_PWR_OPTION =
+      ServoPolicy.optionOf(3, ServoPolicy.FULL_THROTTLE_LEVEL);
+    WIRE_E(8, PUSH_OPTION); WIRE_E(9, PUSH_OPTION);
+    WIRE_E(8, FULL_PWR_OPTION); WIRE_E(9, FULL_PWR_OPTION);
+    WIRE_E(7, PUSH_OPTION);
+    WIRE_E(4, PULL_OPTION);
     WIRE_F(0, CONTROLS_TRIM);   // the coordinated cruise company coheres
   }
 
@@ -564,7 +656,8 @@ export class ServoPolicy {
          + this.energyTensor.storedCombinations
          + this.flightTensor.storedCombinations
          + this.controlsTensor.storedCombinations
-         + this.skillTensor.storedCombinations
+         + this.leftSkillTensor.storedCombinations
+         + this.rightSkillTensor.storedCombinations
          + this.goalTensor.storedCombinations
          + this.servoTensor.storedCombinations;
   }
@@ -582,7 +675,8 @@ export class ServoPolicy {
 
   /** A sensor's full key: its panel, its OWN previous class (the
    *  situation from itself), the goal's element, and its skill patch
-   *  bin (the situation from the goal and skill tensors). */
+   *  bin (its situation from the goal tensor and its side's skills
+   *  panel). */
   static sensorKey(panel: readonly number[], context: TensorContext,
                            sensorIndex: number): number[] {
     return [...panel, context.signalOf(sensorIndex), context.element,
@@ -590,43 +684,51 @@ export class ServoPolicy {
   }
 
   /**
-   * THE PATCH PANEL's feedback to the sensors: each sensor's wire
-   * weight to the goal's element, quantized into its patch bin. The
-   * sensors receive their situation from the skill tensor here —
-   * refreshed from the PREVIOUS codes before the encode, so the
-   * recurrence stays causal (the wires judge what was, the sensors
-   * encode what is).
+   * THE PATCH PANELS' FEEDBACK TO THE SENSORS: each sensor's wire
+   * weight to the element, quantized into its patch bin. The
+   * location and energy sensors receive their situation from the
+   * LEFT panel; the flight and controls sensors from the RIGHT —
+   * the sensors receive their situation from their side's skills
+   * tensor here, refreshed from the PREVIOUS codes before the
+   * encode, so the recurrence stays causal (the wires judge what
+   * was, the sensors encode what is).
    */
   refreshSkillBins(context: TensorContext): void {
-    const sensors: Array<keyof TensorSignals> = ["location", "energy",
-                                                 "flight", "controls"];
     for (let s = 0; s < 4; s++) {
-      const wire = wireIndexOf(sensors[s], "element");
-      const weight = this.skillTensor.recall(
+      const left = s < 2;
+      const tensor = left ? this.leftSkillTensor : this.rightSkillTensor;
+      const wire = panelWireIndexOf(left ? LEFT_WIRES : RIGHT_WIRES,
+        PATCH_SIGNALS[s], "element");
+      const weight = tensor.recall(
         [wire, context.signalOf(s), context.element]);
       context.skillBins[s] = binOfWeight(weight);
     }
   }
 
-  /** The patch panel's verdict on the current company: the mean
-   *  weight of the six sensor-sensor wires. High = the four sensors
-   *  agree (the reading is real news); low = they disagree (a gauge
-   *  flickered). Also the servo's skill input, quantized. */
-  private refreshCoherence(context: TensorContext): void {
-    const sensors: Array<keyof TensorSignals> = ["location", "energy",
-                                                 "flight", "controls"];
-    let sum = 0.0;
-    let wires = 0;
-    for (let a = 0; a < 4; a++) {
-      for (let b = a + 1; b < 4; b++) {
-        sum += this.skillTensor.recall(
-          [wireIndexOf(sensors[a], sensors[b]),
-           context.signalOf(a), context.signalOf(b)]);
-        wires += 1;
+  /** Each panel's verdict on its side's current company: the mean
+   *  weight of the panel's six company wires. High = the side's
+   *  signals agree (the reading is real news); low = they disagree
+   *  (a gauge flickered). Also the servo's skill input, quantized
+   *  and forwarded by each panel. */
+  private refreshPanelCoherences(context: TensorContext): void {
+    const verdicts: Array<[PulseNeuron,
+        ReadonlyArray<readonly [PatchSignal, PatchSignal]>,
+        (mean: number) => void]> = [
+      [this.leftSkillTensor, LEFT_WIRES,
+        (mean) => { context.leftCoherence = mean; }],
+      [this.rightSkillTensor, RIGHT_WIRES,
+        (mean) => { context.rightCoherence = mean; }],
+    ];
+    for (const [tensor, wires, verdict] of verdicts) {
+      let sum = 0.0;
+      for (const [a, b] of wires) {
+        sum += tensor.recall([panelWireIndexOf(wires, a, b),
+                              context.slotOf(a), context.slotOf(b)]);
       }
+      verdict(sum / wires.length);
     }
-    context.coherence = sum / wires;
-    context.coherenceBin = binOfWeight(context.coherence);
+    context.leftCoherenceBin = binOfWeight(context.leftCoherence);
+    context.rightCoherenceBin = binOfWeight(context.rightCoherence);
   }
 
   /** The situation bus state: the four sensors' codes, merged. The
@@ -666,9 +768,11 @@ export class ServoPolicy {
     context.controls = this.stampSensor(this.controlsTensor,
       ServoPolicy.sensorKey(sense.controls, context, 3), CONTROLS_CLASS_AXIS,
       teacherClass(3, sense.controls), amount, epoch);
-    this.refreshCoherence(context);
-    // THE PATCH PANEL fires: every wire, for this company of signals.
-    this.stampWires(context, amount, epoch);
+    this.refreshPanelCoherences(context);
+    // THE TWO PATCH PANELS fire: every wire of each side, for this
+    // company of signals — and the bridge, in both, remembers the two
+    // panels' concurrent verdicts.
+    this.stampPanelWires(context, amount, epoch);
     // The goal tensor's self-loop: under this situation, the intention
     // holds. (The advance transitions are stamped by stampTransition.)
     const bus = this.busOf(context.signals);
@@ -693,20 +797,28 @@ export class ServoPolicy {
     return teacher;
   }
 
-  /** The patch panel's wires, fired for the current company: every
-   *  signal paired with every other, exactly as the panel is wired. */
-  private stampWires(context: TensorContext, amount: number,
-                    epoch: number): void {
-    const slots: number[] = [
-      context.location, context.energy, context.flight, context.controls,
-      context.element, context.lastOption,
+  /** The two patch panels' wires, fired for the current company: each
+   *  side's signals paired exactly as its panel is wired, plus the
+   *  bridge wire — stamped in BOTH tensors, keyed on the two panels'
+   *  own coherence bins, so perception remembers what execution was
+   *  doing when this company occurred, and vice versa. */
+  private stampPanelWires(context: TensorContext, amount: number,
+                         epoch: number): void {
+    const sides: Array<[PulseNeuron,
+        ReadonlyArray<readonly [PatchSignal, PatchSignal]>]> = [
+      [this.leftSkillTensor, LEFT_WIRES],
+      [this.rightSkillTensor, RIGHT_WIRES],
     ];
-    for (let wire = 0; wire < PATCH_WIRES.length; wire++) {
-      const [a, b] = PATCH_WIRES[wire];
-      this.skillTensor.fire([wire, slots[PATCH_SIGNALS.indexOf(a)],
-                             slots[PATCH_SIGNALS.indexOf(b)]],
-                            amount, epoch);
+    for (const [tensor, wires] of sides) {
+      for (const [a, b] of wires) {
+        tensor.fire([panelWireIndexOf(wires, a, b),
+                     context.slotOf(a), context.slotOf(b)], amount, epoch);
+      }
     }
+    this.leftSkillTensor.fire([BRIDGE_WIRE, context.leftCoherenceBin,
+                               context.rightCoherenceBin], amount, epoch);
+    this.rightSkillTensor.fire([BRIDGE_WIRE, context.rightCoherenceBin,
+                                context.leftCoherenceBin], amount, epoch);
   }
 
   /**
@@ -723,16 +835,16 @@ export class ServoPolicy {
 
   // --- THE STATE MACHINE AND THE COMMAND ------------------------------------
 
-  /** The servo tensor's observation key — THE SKILL'S FORWARDED
+  /** The servo tensor's observation key — THE SKILLS' FORWARDED
    *  PAYLOAD: the goal/element pair, the energy and flight classes
-   *  (the two that DRIVE a correction), and the patch panel's
-   *  coherence bin. Bit-identical to what the skill tensor's fired
-   *  message carries: the servo's whole input arrives from the skill
-   *  tensor. */
-  private servoKey(goalId: number, elementId: number,
-                  context: TensorContext): number[] {
+   *  (the two that DRIVE a correction), and the TWO panels' coherence
+   *  bins. Bit-identical to what the skills tensors' fired messages
+   *  carry and to the demonstration's stamp: the servo's whole input
+   *  arrives from the two panels. */
+  servoKey(goalId: number, elementId: number,
+           context: TensorContext): number[] {
     return [goalId, elementId, context.energy, context.flight,
-            context.coherenceBin];
+            context.leftCoherenceBin, context.rightCoherenceBin];
   }
 
   /** The option layout: hold-all, then each lever's stops in channel
@@ -795,7 +907,7 @@ export class ServoPolicy {
   /**
    * The servo tensor's COMMAND CHOICE: hold-all or one lever driven to
    * one of its stops, epsilon-greedily from the skill cells under the
-   * SKILL TENSOR'S FORWARDED KEY (the servo's whole input), denoised
+   * SKILLS PANELS' FORWARDED KEY (the servo's whole input), denoised
    * the way a neuron fires. Returns an actions array of 4 channel
    * entries, each ACTION_HOLD, with at most one set to a stop.
    */
@@ -902,7 +1014,8 @@ export class ServoPolicy {
          + this.energyTensor.prune(beforeEpoch)
          + this.flightTensor.prune(beforeEpoch)
          + this.controlsTensor.prune(beforeEpoch)
-         + this.skillTensor.prune(beforeEpoch)
+         + this.leftSkillTensor.prune(beforeEpoch)
+         + this.rightSkillTensor.prune(beforeEpoch)
          + this.goalTensor.prune(beforeEpoch)
          + this.servoTensor.prune(beforeEpoch);
   }
@@ -923,8 +1036,9 @@ export class ServoPolicy {
   // consolidates in one pass.
 
   /** One window's spread: read the cells, run the law, write back.
-   *  NOISE LIVES IN THE SKILL TENSOR ALONE — the patch panel's wires
-   *  explore their relationships stochastically; the factual tensors
+   *  NOISE LIVES IN THE SKILLS TENSORS ALONE — the patch panels'
+   *  wires explore their relationships stochastically (the white
+   *  noise of the spread); the factual tensors
    *  (the sensors' classes, the goal's transitions, the servo's
    *  levers) are EVIDENCE: their spread is the deterministic
    *  Gaussian -> Haar -> threshold -> de-Haar, no random cell ever
@@ -1040,10 +1154,13 @@ export class ServoPolicy {
     group(this.energyTensor, 1, ENERGY_CLASS_AXIS, false, classTail);
     group(this.flightTensor, 1, FLIGHT_CLASS_AXIS, false, classTail);
     group(this.controlsTensor, 1, CONTROLS_CLASS_AXIS, false, classTail);
-    // THE SKILL TENSOR — the only NOISY one: the patch panel's wires
-    // explore their relationships stochastically; every other tensor
-    // spreads deterministically.
-    group(this.skillTensor, 1, PATCH_SLOT_AXIS, false, classTail,
+    // THE TWO SKILLS TENSORS — the only NOISY ones: the patch panels'
+    // wires explore their relationships stochastically (the white
+    // noise of the spread); every other tensor spreads
+    // deterministically.
+    group(this.leftSkillTensor, 1, PATCH_SLOT_AXIS, false, classTail,
+          ELEMENT_NOISE_SIGMA);
+    group(this.rightSkillTensor, 1, PATCH_SLOT_AXIS, false, classTail,
           ELEMENT_NOISE_SIGMA);
     group(this.goalTensor, 1, ELEMENT_AXIS, false, classTail);
     group(this.servoTensor, 2, ServoPolicy.OPTIONS, true, optionTail);
@@ -1056,7 +1173,8 @@ export class ServoPolicy {
       energy: this.energyTensor.snapshot(),
       flight: this.flightTensor.snapshot(),
       controls: this.controlsTensor.snapshot(),
-      skill: this.skillTensor.snapshot(),
+      leftSkill: this.leftSkillTensor.snapshot(),
+      rightSkill: this.rightSkillTensor.snapshot(),
       goal: this.goalTensor.snapshot(),
       servo: this.servoTensor.snapshot(),
       errorSigns: this.errorNeurons.map((neuron) => neuron.signNow),
@@ -1069,7 +1187,8 @@ export class ServoPolicy {
     this.energyTensor.restore(snapshot.energy);
     this.flightTensor.restore(snapshot.flight);
     this.controlsTensor.restore(snapshot.controls);
-    this.skillTensor.restore(snapshot.skill);
+    this.leftSkillTensor.restore(snapshot.leftSkill);
+    this.rightSkillTensor.restore(snapshot.rightSkill);
     this.goalTensor.restore(snapshot.goal);
     this.servoTensor.restore(snapshot.servo);
     for (let i = 0; i < this.errorNeurons.length
@@ -1099,7 +1218,7 @@ export class ServoPolicy {
 // until the cascade settles or the decision window's horizon passes.
 // Same coalescing law (a stunned tensor absorbs the news and fires
 // ONCE, when it relaxes), same determinism (fixed sweep order), one
-// pass over seven plain objects per step. A handler NEVER sends: it
+// pass over eight plain objects per step. A handler NEVER sends: it
 // rewards and re-arms; the RELAXATION is the only emitter.
 //
 // The firing law's signal processing — stochastic noise -> Haar in
@@ -1145,34 +1264,62 @@ export function stunTimeout(reward: number): number {
   return STUN_MIN + (STUN_MAX - STUN_MIN) * (1.0 - reach);
 }
 
-/** The seven tensor node ids, in sweep order. */
+/** The eight tensor node ids, in sweep order. */
 export const TENSOR_NODE = {
   location: 0,
   energy: 1,
   flight: 2,
   controls: 3,
   goal: 4,
-  skill: 5,
-  servo: 6,
+  leftSkill: 5,
+  rightSkill: 6,
+  servo: 7,
 } as const;
 export type TensorNodeId = (typeof TENSOR_NODE)[keyof typeof TENSOR_NODE];
 
 /** The flight's sender id (the consumer — sends the panel pulse, reads
  *  the fired command; not a tensor, never a recipient). */
-const FLIGHT_SENDER_ID = 6 as TensorNodeId;
+const FLIGHT_SENDER_ID = 7 as TensorNodeId;
+
+/**
+ * ONE SKILLS PANEL'S STATIC WIRING: its node id, its wire bank, and
+ * its two sensors (the side the panel owns). Everything else the
+ * panel's law needs it fetches from the context and the policy; this
+ * is the side itself, as a named thing.
+ */
+interface PanelSide {
+  readonly id: TensorNodeId;
+  readonly wires: ReadonlyArray<readonly [PatchSignal, PatchSignal]>;
+  readonly sensors: readonly [number, number];
+  /** The bridge's far end — the other panel. */
+  readonly other: TensorNodeId;
+}
+
+/** THE LEFT PANEL — the perception side (location, energy). */
+const LEFT_SIDE: PanelSide = {
+  id: TENSOR_NODE.leftSkill, wires: LEFT_WIRES, sensors: [0, 1],
+  other: TENSOR_NODE.rightSkill,
+};
+
+/** THE RIGHT PANEL — the execution side (flight, controls). */
+const RIGHT_SIDE: PanelSide = {
+  id: TENSOR_NODE.rightSkill, wires: RIGHT_WIRES, sensors: [2, 3],
+  other: TENSOR_NODE.leftSkill,
+};
 
 /** The message kinds that travel between tensor nodes. */
 export type TensorMessageKind =
   | "panel"      // the flight -> a sensor: the Aircraft's sub-panel bins
-  | "code"       // a sensor -> goal/skill: its named situation class
-  | "element"    // the goal -> the sensors (recurrence) and the skill
-  | "coherence"  // the skill -> sensors/goal: the wires' verdict
-  | "forward"    // the skill -> the servo: ALL the classifications,
+  | "code"       // a sensor -> goal/skills: its named situation class
+  | "element"    // the goal -> the sensors (recurrence) and the skills
+  | "coherence"  // a skills panel -> its sensors/goal: the wires' verdict
+  | "bridge"     // a skills panel -> the other panel: its verdict moved
+  | "forward"    // the skills -> the servo: their sides' classifications,
                  //   forwarded (the servo's whole input)
-  | "command"    // the servo -> skill (its last option, a patch signal)
+  | "command"    // the servo -> the skills (its last option, a patch signal)
   | "error";     // THE ERROR WAVE (upstream, negative weight): the
                  //   shadow instructor's delta, pumped backwards
-                 //   servo -> skill -> goal/sensors, each hop a stun
+                 //   servo -> the skills -> goal/sensors, each hop a stun
 
 /** One tensor message on the dispatcher — a lightweight plain object
  *  (six fields, nothing else). */
@@ -1277,9 +1424,18 @@ class TensorNode {
   bind(network: TensorNetwork): void {
     this.network = network;
   }
-}
 
-/** The ISRLU-scaled weight a fired message carries. */
+  /** A fresh flight over the same brain: the node re-arms at birth
+   *  (a brand new network's state — reward, stun, clocks). */
+  reset(): void {
+    this.reward = 0.1;
+    this.staged = null;
+    this.relaxAt = Infinity;
+    this.armedDelay = 0.0;
+    this.fires = 0;
+    this.lastConsolidate = -Infinity;
+  }
+}/** The ISRLU-scaled weight a fired message carries. */
 function firedWeight(node: TensorNode): number {
   return node.reward;
 }
@@ -1393,16 +1549,17 @@ export class TensorNetwork {
    *  whose output is what the tensor already said makes NO message
    *  (only news travels; the cascade settles instead of ping-ponging
    *  itself past the horizon). */
-  private readonly sensorLastGossip:
+  private sensorLastGossip:
       Array<{ panel: readonly number[]; code: number } | null> =
     [null, null, null, null];
   private goalLastGoal = -1;
   private goalLastElement = -1;
-  private skillCoherenceLast: readonly number[] | null = null;
+  private leftCoherenceLast: readonly number[] | null = null;
+  private rightCoherenceLast: readonly number[] | null = null;
   /** The sensors' recurrent keys from the last classification — where
    *  the error law's pump lands (on-policy: the exact cells the
    *  student's own flight will recall). */
-  private readonly lastSensorKeys:
+  private lastSensorKeys:
       Array<readonly number[]> = [[], [], [], []];
   /** The epoch the current teach() pumps fire at. */
   private teachEpoch = 0;
@@ -1410,14 +1567,14 @@ export class TensorNetwork {
    *  tick: a new row lands when it advances). */
   private decisionCount = 0;
   /** The cascade's settle horizon, in decision units. The servo sits
-   *  TWO stuns downstream (the skill must relax and forward before
+   *  TWO stuns downstream (the panels must relax and forward before
    *  the servo can even be stunned), so the horizon must cover the
-   *  whole chain: panel -> sensors -> goal/skill -> skill's forward
-   *  -> servo's fire. */
+   *  whole chain: panel -> sensors -> goal/skills -> the panels'
+   *  forwards -> servo's fire. */
   private static readonly SETTLE = 2.5;
   /** The error wave's own settle horizon — it must cover the whole
-   *  upstream chain (servo -> skill -> goal -> sensors) at each hop's
-   *  size-scaled stun. */
+   *  upstream chain (servo -> the skills -> goal -> sensors) at each
+   *  hop's size-scaled stun. */
   private static readonly ERROR_SETTLE = 2.5;
 
   constructor(policy: ServoPolicy, startElementId: number,
@@ -1429,7 +1586,7 @@ export class TensorNetwork {
     // flight's seed — the stochastic noise of the (c) consolidations
     // and the servo's exploration.
     const rngs: NumpyPcg64[] = [];
-    for (let id = 0; id < 7; id++) {
+    for (let id = 0; id < 8; id++) {
       rngs.push(new NumpyPcg64(seedRng.draw64(), seedRng.draw64()));
     }
     this.rngs = rngs;
@@ -1449,9 +1606,12 @@ export class TensorNetwork {
       new TensorNode(TENSOR_NODE.goal,
         (node, staged) => this.goalLaw(),
         (node, staged) => this.goalErrorLaw(node, staged)),
-      new TensorNode(TENSOR_NODE.skill,
-        (node, staged) => this.skillLaw(),
-        (node, staged) => this.skillErrorLaw(node, staged)),
+      new TensorNode(TENSOR_NODE.leftSkill,
+        (node, staged) => this.leftSkillLaw(),
+        (node, staged) => this.leftSkillErrorLaw(node, staged)),
+      new TensorNode(TENSOR_NODE.rightSkill,
+        (node, staged) => this.rightSkillLaw(),
+        (node, staged) => this.rightSkillErrorLaw(node, staged)),
       new TensorNode(TENSOR_NODE.servo,
         (node, staged) => this.servoLaw(node, staged),
         (node, staged) => this.servoErrorLaw(node, staged)),
@@ -1468,11 +1628,11 @@ export class TensorNetwork {
   }
 
   /**
-   * THE SWEEP — the dispatcher itself. Find the earliest relaxation
+   * The sweep — the dispatcher itself. Find the earliest relaxation
    * among the stunned nodes, advance the clock to it, fire every
    * node whose stun relaxed (in node-id order), and repeat until a
    * full sweep finds nothing before the horizon. No heap, no
-   * cancellation: seven plain fields scanned per step.
+   * cancellation: eight plain fields scanned per step.
    */
   private pump(horizon: number): void {
     for (;;) {
@@ -1542,7 +1702,11 @@ export class TensorNetwork {
     }
     this.sensorLastGossip[sensorIndex] = { panel, code };
     const weight = firedWeight(node);
-    return [TENSOR_NODE.goal, TENSOR_NODE.skill]
+    // THE SENSOR'S SIDE: location and energy gossip to the LEFT panel,
+    // flight and controls to the RIGHT — each panel hears its own side.
+    const skills = sensorIndex < 2
+      ? TENSOR_NODE.leftSkill : TENSOR_NODE.rightSkill;
+    return [TENSOR_NODE.goal, skills]
       .map((recipient) => new TensorMessage(node.id, recipient, "code",
         [code], weight, this.now));
   }
@@ -1587,76 +1751,106 @@ export class TensorNetwork {
     this.context.element = this.elementId;
     const weight = firedWeight(this.nodes[TENSOR_NODE.goal]);
     return [TENSOR_NODE.location, TENSOR_NODE.energy, TENSOR_NODE.flight,
-            TENSOR_NODE.controls, TENSOR_NODE.skill]
+            TENSOR_NODE.controls, TENSOR_NODE.leftSkill,
+            TENSOR_NODE.rightSkill]
       .map((recipient) => new TensorMessage(TENSOR_NODE.goal, recipient,
         "element", [this.goalId, this.elementId], weight, this.now));
   }
 
   /**
-   * THE SKILL'S LAW — the patch panel (always): recall the wires'
-   * verdict on the current company -> the COHERENCE message to the
-   *  sensors (their patch bins) and the goal, and THE FORWARD message
-   *  to the servo: ALL the classifications from every tensor — the
-   *  goal/element pair and the two classes that drive a correction —
-   *  plus the wires' own coherence bin. The forward IS the servo's
-   *  whole input. Initially this is pure forwarding; what the
-   *  training mixes in is the wires' verdicts (the patch bins already
-   *  in the sensors' keys, and the coherence bin riding the payload).
+   * A SKILLS PANEL'S LAW (both sides, always): recall the side's
+   *  wires' verdict on the current company -> the COHERENCE message
+   *  to the side's sensors and the goal (their patch bins), THE
+   *  BRIDGE message to the other panel when the verdict moved (the
+   *  two sides always judge the same moment), and THE FORWARD
+   *  message to the servo: the side's classifications — the LEFT
+   *  panel forwards the goal/element pair and the energy class plus
+   *  its own coherence bin, the RIGHT panel the flight class plus
+   *  its bin. The forwards ARE the servo's whole input. Initially
+   *  this is pure forwarding; what the training mixes in is the
+   *  wires' verdicts (the patch bins already in the sensors' keys,
+   *  and the coherence bins riding the payload).
    */
-  private skillLaw(): TensorMessage[] | null {
+  private panelLaw(side: PanelSide): TensorMessage[] | null {
     const context = this.context;
-    const sensors: Array<keyof TensorSignals> = ["location", "energy",
-                                                 "flight", "controls"];
-    for (let s = 0; s < 4; s++) {
-      context.skillBins[s] = binOfWeight(this.policy.skillTensor.recall(
-        [wireIndexOf(sensors[s], "element"), context.signalOf(s),
-         context.element]));
+    const left = side.id === TENSOR_NODE.leftSkill;
+    const tensor = left ? this.policy.leftSkillTensor
+                        : this.policy.rightSkillTensor;
+    // 1. the side's sensors' patch bins: each sensor's wire weight to
+    //    the goal's element, quantized.
+    for (const sensor of side.sensors) {
+      context.skillBins[sensor] = binOfWeight(tensor.recall(
+        [panelWireIndexOf(side.wires, PATCH_SIGNALS[sensor], "element"),
+         context.signalOf(sensor), context.element]));
     }
+    // 2. the panel's verdict on the current company: the mean weight
+    //    of its six company wires.
     let sum = 0.0;
-    let wires = 0;
-    for (let a = 0; a < 4; a++) {
-      for (let b = a + 1; b < 4; b++) {
-        sum += this.policy.skillTensor.recall(
-          [wireIndexOf(sensors[a], sensors[b]),
-           context.signalOf(a), context.signalOf(b)]);
-        wires += 1;
-      }
+    for (const [a, b] of side.wires) {
+      sum += tensor.recall([panelWireIndexOf(side.wires, a, b),
+                            context.slotOf(a), context.slotOf(b)]);
     }
-    context.coherence = sum / wires;
-    context.coherenceBin = binOfWeight(context.coherence);
-    const weight = firedWeight(this.nodes[TENSOR_NODE.skill]);
+    const mean = sum / side.wires.length;
+    const bin = binOfWeight(mean);
+    if (left) {
+      context.leftCoherence = mean;
+      context.leftCoherenceBin = bin;
+    } else {
+      context.rightCoherence = mean;
+      context.rightCoherenceBin = bin;
+    }
+    const node = this.nodes[side.id];
+    const weight = firedWeight(node);
     const messages: TensorMessage[] = [];
     // THE NO-NEWS LAW on the coherence channel: the wires' verdict
-    // only when it moved. The FORWARD channel always speaks — a
-    // steady input is a steady command (the stick springs to trim
+    // only when it moved (the bridge rides the same gate — the panels
+    // pulse each other on news). The FORWARD channel always speaks —
+    // a steady input is a steady command (the stick springs to trim
     // between commands).
-    const coherence = [context.coherenceBin, ...context.skillBins];
-    if (this.skillCoherenceLast === null
-        || !coherence.every((v, i) => v === this.skillCoherenceLast![i])) {
-      this.skillCoherenceLast = coherence;
-      for (const recipient of [TENSOR_NODE.location, TENSOR_NODE.energy,
-                               TENSOR_NODE.flight, TENSOR_NODE.controls,
-                               TENSOR_NODE.goal]) {
-        messages.push(new TensorMessage(TENSOR_NODE.skill, recipient,
-          "coherence", coherence, weight, this.now));
+    const verdict = [bin, context.skillBins[side.sensors[0]],
+                     context.skillBins[side.sensors[1]]];
+    const last = left ? this.leftCoherenceLast : this.rightCoherenceLast;
+    if (last === null || !verdict.every((v, i) => v === last[i])) {
+      if (left) {
+        this.leftCoherenceLast = verdict;
+      } else {
+        this.rightCoherenceLast = verdict;
       }
+      for (const recipient of [...side.sensors, TENSOR_NODE.goal]) {
+        messages.push(new TensorMessage(side.id, recipient as TensorNodeId,
+          "coherence", verdict, weight, this.now));
+      }
+      messages.push(new TensorMessage(side.id, side.other, "bridge",
+        [bin], weight, this.now));
     }
-    // THE FORWARD — the servo's whole input: bit-identical to the
-    // demonstration's servo stamp key.
-    messages.push(new TensorMessage(TENSOR_NODE.skill, TENSOR_NODE.servo,
-      "forward", [this.goalId, this.elementId, context.energy,
-                  context.flight, context.coherenceBin], weight,
-      this.now));
+    // THE FORWARD — the servo's input from this side: bit-identical to
+    // the demonstration's servo stamp key's halves.
+    messages.push(new TensorMessage(side.id, TENSOR_NODE.servo, "forward",
+      left ? [this.goalId, this.elementId, context.energy, bin]
+           : [context.flight, bin], weight, this.now));
     return messages;
   }
 
+  /** The left panel's firing law (the perception side). */
+  private leftSkillLaw(): TensorMessage[] | null {
+    return this.panelLaw(LEFT_SIDE);
+  }
+
+  /** The right panel's firing law (the execution side). */
+  private rightSkillLaw(): TensorMessage[] | null {
+    return this.panelLaw(RIGHT_SIDE);
+  }
+
   /**
-   * THE SERVO'S LAW (always): the STAGED FORWARD message — the skill
-   *  tensor's forwarded classifications — IS the observation key (the
-   *  servo's whole input, never the Aircraft, never even the other
-   *  tensors directly). Argmax over the option cells under it (pure
+   * THE SERVO'S LAW (always): the staged FORWARDS from the two panels
+   *  are the stun triggers — the observation key is assembled from
+   *  the network's own state (the same law as every other tensor:
+   *  the staged evidence triggers, the law reads the context): the
+   *  goal/element pair, the energy class (the left panel's forward),
+   *  the flight class (the right panel's), and the two panels'
+   *  coherence bins. Argmax over the option cells under it (pure
    *  recall), epsilon-greedy — the COMMAND message (the chosen
-   *  levers) to the skill (its patch signal). The flight reads the
+   *  levers) to both panels (its patch signal). The flight reads the
    *  fired command itself.
    */
   private servoLaw(node: TensorNode,
@@ -1664,15 +1858,17 @@ export class TensorNetwork {
     if (staged.kind !== "forward") {
       return null;   // nothing forwarded: nothing to command
     }
-    const key = staged.payload;
+    const key = this.policy.servoKey(this.goalId, this.elementId,
+                                     this.context);
     const actions = this.policy.chooseControls(key,
       this.rngs[TENSOR_NODE.servo]);
     this.firedActions = actions;
     this.firedKey = key;
     const option = ServoPolicy.optionOfActions(actions);
     this.context.lastOption = option;
-    return [new TensorMessage(TENSOR_NODE.servo, TENSOR_NODE.skill,
-      "command", [option], firedWeight(node), this.now)];
+    return [TENSOR_NODE.leftSkill, TENSOR_NODE.rightSkill]
+      .map((recipient) => new TensorMessage(TENSOR_NODE.servo, recipient,
+        "command", [option], firedWeight(node), this.now));
   }
 
   // --- THE ERROR WAVE (upstream) --------------------------------------------
@@ -1693,7 +1889,7 @@ export class TensorNetwork {
    * own panel vs what its memory made it fire; the goal: the
    * instructor's element vs the student's) and injects ONE ERROR
    * MESSAGE at the bottom of the chain. The wave then travels UPSTREAM
-   * on the same clock as the forward flow — servo -> skill ->
+   * on the same clock as the forward flow — servo -> the skills ->
    * goal -> the source sensors — each tensor stunned by the SIZE of
    * the error before its error law runs the local pump.
    */
@@ -1747,9 +1943,18 @@ export class TensorNetwork {
                      expected[3], this.context.controls];
     const size = Math.max(worstError, classError);
     this.now += 0.05;   // the wave rides after the forward cascade
-    const entry = worstChannel >= 0 ? TENSOR_NODE.servo : TENSOR_NODE.skill;
-    this.nodes[entry].receive(new TensorMessage(FLIGHT_SENDER_ID, entry,
-      "error", payload, -Math.min(1.0, size), this.now), this.now);
+    // THE WAVE'S ENTRY: a wrong lever enters at the servo (its error
+    // law pumps the servo's own cells, then routes upstream to BOTH
+    // panels); a class-only error enters at the two panels directly —
+    // each back-propagates its own side.
+    const weight = -Math.min(1.0, size);
+    const entries = worstChannel >= 0
+      ? [TENSOR_NODE.servo]
+      : [TENSOR_NODE.leftSkill, TENSOR_NODE.rightSkill];
+    for (const entry of entries) {
+      this.nodes[entry].receive(new TensorMessage(FLIGHT_SENDER_ID, entry,
+        "error", payload, weight, this.now), this.now);
+    }
     this.pump(this.now + TensorNetwork.ERROR_SETTLE);
   }
 
@@ -1758,7 +1963,7 @@ export class TensorNetwork {
    * student's — raise the instructor's cell under the STUDENT'S OWN
    * observation key (on-policy: the key its own flight will recall),
    * depress the student's wrong cell, then send the error UP to the
-   * skill (the back-propagating tensor) as a negative input.
+   * skills panels (the back-propagating tensors) as a negative input.
    */
   private servoErrorLaw(node: TensorNode,
                         staged: TensorMessage): TensorMessage[] | null {
@@ -1784,55 +1989,67 @@ export class TensorNetwork {
           this.teachEpoch);
       }
     }
-    return [new TensorMessage(TENSOR_NODE.servo, TENSOR_NODE.skill,
-      "error", payload, -Math.min(1.0, error), this.now)];
+    return [TENSOR_NODE.leftSkill, TENSOR_NODE.rightSkill]
+      .map((recipient) => new TensorMessage(TENSOR_NODE.servo, recipient,
+        "error", payload, -Math.min(1.0, error), this.now));
   }
 
   /**
-   * THE SKILL'S ERROR LAW — THE BACK-PROPAGATING TENSOR: it routes the
-   * error wave upstream (a negative input to the goal and the four
-   * source sensors), and it learns its own wires: the company the
-   * instructor would have (the expected classes) hangs together MORE,
-   * the wrong company the student actually flew hangs together LESS.
+   * A SKILLS PANEL'S ERROR LAW — THE BACK-PROPAGATING TENSOR (both
+   *  sides): it routes the error wave upstream (a negative input to
+   *  the goal and its two source sensors), and it learns its own
+   *  wires: the company the instructor would have (the expected
+   *  classes) hangs together MORE, the wrong company the student
+   *  actually flew hangs together LESS.
    */
-  private skillErrorLaw(node: TensorNode,
+  private panelErrorLaw(side: PanelSide,
                         staged: TensorMessage): TensorMessage[] | null {
     const payload = staged.payload;
-    const expected = [payload[4], payload[6], payload[8], payload[10]];
-    const actual = [payload[5], payload[7], payload[9], payload[11]];
-    const widths = [LOC_CLASS_AXIS, ENERGY_CLASS_AXIS,
-                    FLIGHT_CLASS_AXIS, CONTROLS_CLASS_AXIS];
+    const [a, b] = side.sensors;
+    const expected = [payload[4 + 2 * a], payload[4 + 2 * b]];
+    const actual = [payload[5 + 2 * a], payload[5 + 2 * b]];
+    const widths = [CLASS_AXES[a], CLASS_AXES[b]];
     let error = 0.0;
     let wrong = false;
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 2; i++) {
       if (expected[i] !== actual[i]) {
         wrong = true;
         error += Math.abs(expected[i] - actual[i]) / widths[i];
       }
     }
-    error /= 4.0;
-    const pump = this.policy.errorNeuronOf(TENSOR_NODE.skill).pump(error);
+    error /= 2.0;
+    const left = side.id === TENSOR_NODE.leftSkill;
+    const tensor = left ? this.policy.leftSkillTensor
+                        : this.policy.rightSkillTensor;
+    const pump = this.policy.errorNeuronOf(side.id).pump(error);
     if (wrong && pump !== 0.0) {
-      const sensors: Array<keyof TensorSignals> = ["location", "energy",
-                                                   "flight", "controls"];
-      for (let a = 0; a < 4; a++) {
-        for (let b = a + 1; b < 4; b++) {
-          const wire = wireIndexOf(sensors[a], sensors[b]);
-          this.policy.skillTensor.fire([wire, expected[a], expected[b]],
-                                        pump * 0.5, this.teachEpoch);
-          this.policy.skillTensor.fire([wire, actual[a], actual[b]],
-                                        -pump * 0.5, this.teachEpoch);
-        }
-      }
+      const wire = panelWireIndexOf(side.wires,
+        PATCH_SIGNALS[a], PATCH_SIGNALS[b]);
+      tensor.fire([wire, expected[0], expected[1]], pump * 0.5,
+                  this.teachEpoch);
+      tensor.fire([wire, actual[0], actual[1]], -pump * 0.5,
+                  this.teachEpoch);
     }
-    // Route the wave: the goal and the sensors each get their turn.
+    // Route the wave: the goal and the side's sensors each get their
+    // turn (the goal then mirrors the wave to all four sensors — the
+    // same double delivery the single panel's wave had).
     const weight = -Math.min(1.0, Math.abs(staged.weight) + error);
-    const messages = [TENSOR_NODE.goal, TENSOR_NODE.location,
-                      TENSOR_NODE.energy, TENSOR_NODE.flight,
-                      TENSOR_NODE.controls]
-      .map((recipient) => new TensorMessage(TENSOR_NODE.skill, recipient,
+    const messages = [TENSOR_NODE.goal, ...side.sensors]
+      .map((recipient) => new TensorMessage(side.id, recipient as TensorNodeId,
         "error", payload, weight, this.now));
     return wrong || payload[1] >= 0 ? messages : null;
+  }
+
+  /** The left panel's error law (the perception side). */
+  private leftSkillErrorLaw(_node: TensorNode,
+                            staged: TensorMessage): TensorMessage[] | null {
+    return this.panelErrorLaw(LEFT_SIDE, staged);
+  }
+
+  /** The right panel's error law (the execution side). */
+  private rightSkillErrorLaw(_node: TensorNode,
+                             staged: TensorMessage): TensorMessage[] | null {
+    return this.panelErrorLaw(RIGHT_SIDE, staged);
   }
 
   /**
@@ -1927,12 +2144,16 @@ export class TensorNetwork {
         rng, epoch);
       return;
     }
-    if (nodeId === TENSOR_NODE.skill) {
-      const sensors: Array<keyof TensorSignals> = ["location", "energy",
-                                                   "flight", "controls"];
-      for (let s = 0; s < 4; s++) {
-        ServoPolicy.spreadWindow(this.policy.skillTensor,
-          [wireIndexOf(sensors[s], "element"), context.signalOf(s)],
+    if (nodeId === TENSOR_NODE.leftSkill
+        || nodeId === TENSOR_NODE.rightSkill) {
+      const left = nodeId === TENSOR_NODE.leftSkill;
+      const side = left ? LEFT_SIDE : RIGHT_SIDE;
+      const tensor = left ? this.policy.leftSkillTensor
+                          : this.policy.rightSkillTensor;
+      for (const sensor of side.sensors) {
+        ServoPolicy.spreadWindow(tensor,
+          [panelWireIndexOf(side.wires, PATCH_SIGNALS[sensor], "element"),
+           context.signalOf(sensor)],
           [context.element], PATCH_SLOT_AXIS, classTail, rng, epoch,
           ELEMENT_NOISE_SIGMA);   // the wires explore stochastically
       }
@@ -1972,16 +2193,19 @@ export class TensorNetwork {
       this.nodes[s].receive(new TensorMessage(FLIGHT_SENDER_ID,
         s as TensorNodeId, "panel", panels[s], 1.0, this.now), this.now);
     }
-    // The standing invitations: the goal and the skill have news to
-    // consider each decision (their handlers reward and stun; their
-    // laws fire once relaxed). The servo receives NOTHING here — its
-    // only input is the skill's forward, once the skill relaxes.
+    // The standing invitations: the goal and the two skills panels
+    // have news to consider each decision (their handlers reward and
+    // stun; their laws fire once relaxed). The servo receives NOTHING
+    // here — its only input is the panels' forwards, once they relax.
     this.nodes[TENSOR_NODE.goal].receive(new TensorMessage(
       FLIGHT_SENDER_ID, TENSOR_NODE.goal, "element", [goalId], 1.0,
       this.now), this.now);
-    this.nodes[TENSOR_NODE.skill].receive(new TensorMessage(
-      FLIGHT_SENDER_ID, TENSOR_NODE.skill, "element", [this.elementId],
-      1.0, this.now), this.now);
+    this.nodes[TENSOR_NODE.leftSkill].receive(new TensorMessage(
+      FLIGHT_SENDER_ID, TENSOR_NODE.leftSkill, "element",
+      [this.elementId], 1.0, this.now), this.now);
+    this.nodes[TENSOR_NODE.rightSkill].receive(new TensorMessage(
+      FLIGHT_SENDER_ID, TENSOR_NODE.rightSkill, "element",
+      [this.elementId], 1.0, this.now), this.now);
     // SWEEP: dispatch until the cascade settles.
     this.pump(this.now + TensorNetwork.SETTLE);
     const actions = this.firedActions
@@ -2078,6 +2302,48 @@ export class TensorNetwork {
       sensors,
       servo: { command, dominant: dominantOf(servoMasses) },
     };
+  }
+
+  /**
+   * A FRESH FLIGHT OVER THE SAME MEMORY: the runtime resets — the
+   *  recurrence starts clean, the nodes' reward EMAs re-arm at birth,
+   *  the gossip's no-news memory empties — exactly the state a brand
+   *  new TensorNetwork over this same policy would start from. The
+   *  MEMORY (the policy's tensors) persists untouched. The AiPilot
+   *  calls this as a flight takes the brain up (the encapsulated
+   *  brain's own beginFlight).
+   */
+  beginFlight(startElementId: number): void {
+    this.now = 0.0;
+    this.elementId = startElementId;
+    this.goalId = GOAL_FREE_FLIGHT;
+    this.firedActions = null;
+    this.firedKey = [];
+    this.decisionCount = 0;
+    this.goalLastGoal = -1;
+    this.goalLastElement = -1;
+    this.leftCoherenceLast = null;
+    this.rightCoherenceLast = null;
+    this.sensorLastGossip = [null, null, null, null];
+    this.lastSensorKeys = [[], [], [], []];
+    const context = this.context;
+    context.location = 0;
+    context.energy = 0;
+    context.flight = 0;
+    context.controls = 0;
+    context.element = startElementId;
+    context.lastOption = 0;
+    context.skillBins[0] = 0;
+    context.skillBins[1] = 0;
+    context.skillBins[2] = 0;
+    context.skillBins[3] = 0;
+    context.leftCoherence = 0.0;
+    context.leftCoherenceBin = 0;
+    context.rightCoherence = 0.0;
+    context.rightCoherenceBin = 0;
+    for (const node of this.nodes) {
+      node.reset();
+    }
   }
 
   /** The situation bus state: the four sensors' codes, merged. */

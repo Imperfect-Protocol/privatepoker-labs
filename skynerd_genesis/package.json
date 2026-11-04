@@ -6,9 +6,16 @@
   "type": "module",
   "scripts": {
     "dev": "tsc -p tsconfig.web.json && node dev-server.mjs",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.web.json && vite build && vite build --ssr server/standalone-entry.js --outDir dist/server --emptyOutDir false",
     "build:web": "tsc -p tsconfig.web.json",
+    "build:node": "tsc -p tsconfig.json",
+    "build:wasmer": "npm run build && cp -R reference wasmer.toml app.yaml ./dist",
+    "deploy:wasmer": "cd dist && wasmer deploy",
     "test": "tsc -p tsconfig.json && node build/test/run.js",
-    "clean": "rm -rf build build-web"
+    "clean": "rm -rf build build-web dist"
+  },
+  "devDependencies": {
+    "vite": "^6.4.3",
+    "vite-plugin-standalone": "^2.0.0-alpha.5"
   }
 }

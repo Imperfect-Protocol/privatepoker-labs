@@ -69,31 +69,33 @@ if (!guard.tookOver) console.log("guarded: no danger arose in this run (no takeo
   flight.release();
 }
 
-// WAVES: the stabilizer and the sticky modes.
+// WAVES: the attack mission (pairs off the runway) and the sticky modes.
 {
   const waves = new WavesShow({ state: "35399562948360463058890781895381311971", inc: "87136372517582989555478159403783844777" }, graduate);
-  for (let i = 0; i < 600; i++) waves.step();   // 12 s: the first wave is up
+  for (let i = 0; i < 600; i++) waves.step();   // 12 s: the first wave is rolling
   const modes = waves.scene.aircraft.map((e) => e.label);
   console.log("waves drones:", waves.aliveCount, "entries:", modes.length);
-  // select a drone and put the instructor on its levers
+  // select a drone and put the instructor solely on its levers
   const label = waves.scene.current.label;
   waves.setControlsMode("instructor");
   console.log("selected:", label, "mode:", waves.selectedControlsMode);
   const drone0 = waves.drones.find((d) => d.entry.label === label);
   const before = drone0.entry.aircraft.body.position.z;
-  for (let i = 0; i < 10000; i++) waves.step();  // 200 s of stabilizer (out-of-bounds homing included)
+  for (let i = 0; i < 10000; i++) waves.step();  // 200 s of the mission (the flank climb-out)
   const drone = waves.drones.find((d) => d.entry.label === label);
   if (drone === undefined) {
-    console.log("stabilizer: drone DIED before the check — homing failed");
+    console.log("mission: drone LEFT the scene before the check");
   } else {
     const after = drone.entry.aircraft.body.position.z;
-    const bank = drone.entry.aircraft.body.bank * DEG;
     const dist = Math.hypot(drone.entry.aircraft.body.position.x, drone.entry.aircraft.body.position.y);
-    console.log(`stabilizer 200s: alt ${before.toFixed(1)}m -> ${after.toFixed(1)}m, bank ${bank.toFixed(1)}°, dist-from-origin ${dist.toFixed(0)}m, alive=${drone.flight.episodeOutcome === null}`);
+    console.log(`mission 200s: alt ${before.toFixed(1)}m -> ${after.toFixed(1)}m, ` +
+      `token ${drone.flight.missionToken}, dist-from-origin ${dist.toFixed(0)}m, ` +
+      `alive=${drone.flight.episodeOutcome === null}, ` +
+      `singularity ${waves.singularityGoal}`);
   }
-  // stickiness: another drone keeps AI
+  // stickiness: another drone keeps the scenario's own default mode
   const other = waves.drones.find((d) => d.flight.episodeOutcome === null && d.entry.label !== label);
-  console.log("other drone mode (should be ai):", other.flight.controlsMode);
+  console.log("other drone mode (should be both-suggest):", other.flight.controlsMode);
   // guarded takeover from a spiral: pick a flying drone, force mode, and watch
   waves.setControlsMode("both-guarded");
   console.log("guarded set on the current selection; instructor holding:", waves.selectedInstructorAtControls);

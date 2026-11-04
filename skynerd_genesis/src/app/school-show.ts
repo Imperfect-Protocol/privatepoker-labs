@@ -9,13 +9,14 @@
  * the result holds a moment, and the next attempt begins.
  */
 import {
-  FlightSchool, SoloFlight, InstructorTwin, gradeName,
+  FlightSchool, SoloFlight, InstructorTwin, gradeName, DECISION_EVERY,
   type Lesson, type GoalReportRow, RNG0_STATE, RNG0_INC,
 } from "../learning/school.js";
 import { FlightInstruments } from "../learning/instruments.js";
 import { ServoPolicy } from "../learning/servo-tensor.js";
 import type { TensorStateView } from "../learning/servo-tensor.js";
-import { TRIM_SPEED } from "../learning/flight.js";
+import { AiPilot } from "../learning/pilot.js";
+import { TRIM_SPEED, springStickTowardNeutral } from "../learning/flight.js";
 import { NumpyPcg64 } from "../core/rng.js";
 import { Aircraft } from "../physics/aircraft.js";
 import { Scene, type SceneAircraft } from "./scene.js";
@@ -137,15 +138,28 @@ export class FlightSchoolShow {
   /** The classroom's dice, shared by the attempts. */
   private readonly rng = new NumpyPcg64(RNG0_STATE, RNG0_INC);
   /** THE CONTROLS DROPDOWN's sticky choice — one aircraft, one mode,
-   *  carried across attempts. The classroom's default is the
-   *  INSTRUCTOR: a fresh scenario demonstrates first (the old
-   *  demo-first pedagogy), and the person hands the aircraft to the
-   *  AI with the dropdown when they want the student's attempt. */
-  controlsMode: ControlMode = "instructor";
+   *  carried across attempts. The classroom's default is PAIR:
+   *  INSTRUCTOR (both-suggest): the instructor's hands fly the
+   *  machine while the AI suggests and learns from them every window;
+   *  the person gives the aircraft wholly to the AI with the dropdown
+   *  when they want the student's solo attempt. */
+  controlsMode: ControlMode = "both-suggest";
 
-  constructor(readonly school: FlightSchool, readonly policy: ServoPolicy) {
+  /** THE CLASSROOM'S STUDENT — the ONE encapsulated tensor brain, its
+   *  memory transplanted from the boot graduate and carried attempt to
+   *  attempt (each SoloFlight resets its runtime, never its memory). */
+  readonly student: AiPilot;
+  /** The transplanted brain's record (the boot graduate's snapshot),
+   *  kept for re-seating a restarted classroom. */
+  readonly policy: ServoPolicy;
+
+  constructor(readonly school: FlightSchool, brain: ServoPolicy) {
     this.lessonNames = [...school.lessons.keys()];
     this.lesson = school.lessons.values().next().value!;
+    this.policy = brain;
+    this.student = new AiPilot({ seedRng: this.rng,
+      decisionEvery: DECISION_EVERY, spring: springStickTowardNeutral });
+    this.student.inherit(brain.snapshot());
     this.entry = this.scene.add({
       label: "Aircraft",
       aircraft: new Aircraft(this.lesson.spawn()),
@@ -166,7 +180,7 @@ export class FlightSchoolShow {
    * dropdown last chose. */
   private startFlight(): void {
     const twin = new InstructorTwin(this.lesson);
-    this.flight = new SoloFlight(this.school, this.lesson, this.policy,
+    this.flight = new SoloFlight(this.school, this.lesson, this.student,
                                  this.rng, this.demoEpoch++,
                                  this.controlsMode, twin);
     this.entry = this.scene.replace(this.entry, {

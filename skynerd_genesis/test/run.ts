@@ -7,3 +7,4 @@ import "./physics.test.js";
 import "./episode.test.js";
 import "./units.test.js";
 import "./school.test.js";
+import "./pipeline.test.js";

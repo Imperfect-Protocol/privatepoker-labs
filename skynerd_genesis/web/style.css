@@ -137,15 +137,23 @@ label select { text-transform: none; }
  * is left under the controls panel. */
 #cockpit {
   grid-area: sidebar;
+  position: relative;       /* the side viewports' absolute strips anchor here */
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 10px;
-  background: var(--panel);
+  /* THE PANEL'S BLACK PLINTH: the bottom band under the view reads
+     as the dashboard's own base — solid black from the foot to the
+     panel's bottom edge, so no margin can ever read as view leaking */
+  background: linear-gradient(to top, #000 48px, var(--panel) 48px);
   overflow: hidden;         /* the panels size themselves; nothing spills */
 }
 /* dragged shut by the grip: a zero-width column with no padding sliver */
 #cockpit.collapsed { padding-left: 0; padding-right: 0; }
+/* THE MAP'S HIDE LAW: dragging the grip far enough left (the sidebar
+ * grows past the map's own 10% floor) hides the MAP column — the
+ * sidebar then owns the whole width below the toolbar */
+#app.map-hidden { grid-template-columns: 0px 7px auto; }
 .cockpit-head {
   display: flex;
   justify-content: space-between;
@@ -156,18 +164,87 @@ label select { text-transform: none; }
   font: 400 9px var(--display);
   letter-spacing: 2px;
 }
-#cockpitCanvas,
-#controlsCanvas {
-  display: block;
-  margin-inline: auto;      /* centered when the grip made the column wide */
+/* the cockpit's canvas STACK: THE CURVED WINDSHIELD — one view area
+ * split into three seamless world panes (left, centre, right — the
+ * eye at the centre, the side cameras yawed for a continuous curved
+ * projection), with the light layer and the HUD over the centre pane
+ * and the controls strip FLOATING on top. layoutSidebar() places each
+ * canvas in px; no borders between panes — the view is continuous. */
+.cockpit-view {
+  position: relative;
+  margin-inline: auto;
   background: #03060b;
   border: 1px solid var(--line);
   border-radius: 0;
-  /* pixel width/height are set by layoutSidebar(): the view holds
-   * 16:9, the controls square is a narrow horizontal strip of the same
-   * width — together filling the sidebar's height */
+  overflow: hidden;
+  /* pixel width/height are set by layoutSidebar(): the view = the
+   * whole content area, the panes tile it */
 }
-#cockpit-foot { color: var(--dim); font-size: 10px; letter-spacing: 0.05em; min-height: 13px; }
+.cockpit-view canvas {
+  position: absolute;
+  display: block;
+  /* left/top/width/height in px by layoutSidebar() */
+}
+/* THE LIGHT LAYER: flare + glare ride between the world and the HUD,
+ * composited plus-lighter — true ADDITIVE (screen family), so their
+ * ink ADDS to the world's own glow exactly like the sky shader's
+ * col +=, never alpha-pastes over it */
+#lightCanvas {
+  mix-blend-mode: plus-lighter;
+  pointer-events: none;
+}
+#lightCanvasL, #lightCanvasR {
+  mix-blend-mode: plus-lighter;
+  pointer-events: none;
+}
+/* THE HUD GLASS: the cockpit ink (tapes, ladder, markers, objects)
+ * composites ADDITIVELY too — the instruments read like luminous
+ * glass over the world, adding their light instead of pasting over
+ * the scene (the classic fighter-HUD look) */
+#cockpitCanvas {
+  mix-blend-mode: plus-lighter;
+  pointer-events: none;
+}
+/* THE CONTROLS STRIP: the pilot's console FLOATS on top of the
+ * windshield's bottom-centre — an opaque slab over the world.
+ * layoutSidebar() sets its left/width/height in px. */
+#controlsCanvas {
+  display: block;
+  position: absolute;
+  bottom: 0;
+  border: none;
+  border-radius: 0;
+  z-index: 5;
+  /* no CSS body: the canvas paints its own dashboard shape — the
+   * corners outside the path stay transparent, the world shows */
+}
+/* the render-feature checkboxes, right next to RESET */
+label.cb {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 10px;
+  color: var(--dim);
+  font: 600 10px var(--display);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  user-select: none;
+}
+label.cb input {
+  accent-color: var(--accent);
+}
+/* THE PANEL'S BLACK BASE: the strip under the view reads as the
+   dashboard's own plinth — solid black, edge to edge, so no margin
+   under the controls can ever read as view sneaking through. The
+   negative top margin seats it on the view's bottom border; the side
+   and bottom margins carry it past the panel's padding to its edges. */
+#cockpit-foot {
+  color: var(--dim); font-size: 10px; letter-spacing: 0.05em; min-height: 13px;
+  background: #000;
+  margin: -9px -10px -10px;
+  padding: 5px 10px 9px;
+}
 
 /* --- results panel (bottom edge, ending at the sidebar's left edge) -------- */
 #results {
@@ -269,6 +346,82 @@ td .bad { color: var(--bad); }
 td .na { color: var(--dim); }
 #school td:nth-child(2) { color: var(--dim); }
 
+/* --- the splash screen -------------------------------------------------------
+ * The poster's own moment (the vite app's splash law): the page loads
+ * behind the full-bleed poster, it holds a beat, then fades out. The
+ * two URLs layer the same asset for both servers — /splash.png for
+ * the deployed build (public/ lands at the root), /public/splash.png
+ * for the dev server (the repo root IS the web root); the one that
+ * 404s is simply never painted. */
+#splash {
+  position: fixed;
+  inset: 0;
+  z-index: 150;              /* over the boot dialog (100), under nothing */
+  cursor: pointer;           /* the whole poster is the skip button */
+  opacity: 1.0;
+  transition: opacity 0.7s ease;
+  background: #140d04;        /* the Sahara dusk under the poster */
+  background-image:
+    url("/splash.png"),
+    url("/public/splash.png");
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: cover;
+  display: grid;
+  place-items: center;
+  isolation: isolate;
+}
+/* the poster dimmed under the title — not black: SAHARA GOLD DARKNESS,
+   the warm dust the sun sets through. A vertical fade into the deep
+   amber dark + the gold sun's own glow behind the title block */
+#splash::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background:
+    linear-gradient(180deg, rgba(31, 19, 6, 0.10), #1a1106 96%),
+    radial-gradient(circle, rgba(240, 178, 66, 0.22), transparent 34rem);
+}
+#splash .splash-content {
+  width: min(92vw, 760px);
+  padding: 48px 24px;
+  text-align: center;
+}
+#splash h1 {
+  margin: 0;
+  color: #faf3e2;
+  font-family: "Inter Display", Inter, ui-sans-serif, system-ui,
+               -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: clamp(3.2rem, 12vw, 8.5rem);
+  font-weight: 700;
+  line-height: 0.94;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  text-shadow: 0 0 34px rgba(240, 178, 66, 0.55);
+}
+#splash .splash-rule {
+  width: min(380px, 70vw);
+  height: 1px;
+  margin: 26px auto 16px;
+  background: linear-gradient(90deg, transparent, #f0b242, transparent);
+}
+#splash .splash-status {
+  margin: 0;
+  color: #c9b28a;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono",
+               monospace;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+#splash.fading { opacity: 0.0; pointer-events: none; }
+#splash.gone { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  #splash { transition-duration: 0.15s; }
+}
+
 /* --- boot pre-learning dialog ----------------------------------------------
  * Black screen, the terminal dialog in the middle: the training log
  * streams while the bar fills left to right. Vanishes when the tensors
@@ -302,8 +455,9 @@ td .na { color: var(--dim); }
   color: #e0f2ff;
   text-transform: uppercase;
 }
-/* The head: the title, the endless classroom's progress bar, and the
- * DONE button — the only stop. The bar and the button share a row. */
+/* The head: the title alone — the dialog's face. The controls ride
+ * the bottom edge (the foot), the way a mission briefing reads:
+ * title up top, the ship's gauges below. */
 .boot-head {
   margin-bottom: 12px;
 }
@@ -312,14 +466,15 @@ td .na { color: var(--dim); }
   border: 1px solid var(--line, #12293a);
   border-radius: 0;
   overflow: hidden;
-  margin-top: 8px;
   flex: 1;
 }
-.head-row {
+/* The foot: the dialog's controls row on the BOTTOM EDGE — the
+ * progress bar from the left, then SHOW DETAILS, then DONE. */
+.boot-foot {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-top: 8px;
+  margin-top: 10px;
 }
 #bootDone {
   flex: none;
@@ -362,53 +517,81 @@ td .na { color: var(--dim); }
   width: 760px;
   height: 440px;
 }
-/* The footer: the 3-line terminal, and the expand icon to its right. */
-.boot-foot {
-  display: flex;
-  align-items: stretch;
-  gap: 8px;
-  margin-top: 8px;
+/* The details drawer: the training log, closed by default — SHOW
+ * DETAILS opens it over the cubes' panel. */
+#bootDetails {
+  display: none;
+  flex: none;
   min-height: 0;
+  margin-top: 8px;
 }
 #bootLog {
   margin: 0;
   flex: 1;
   min-height: 0;
-  height: 51px;             /* three lines, scrollable — nothing is lost */
   overflow-y: auto;
-  font: 500 12px/1.55 var(--mono);
-  color: #6fa8c8;
-  white-space: pre-wrap;
   border: 1px solid var(--line, #12293a);
   border-radius: 0;
   background: #03070d;
-  padding: 6px 10px;
   scrollbar-width: thin;
 }
+/* THE LESSON TABLE: the details drawer's briefing sheet — ruled
+ * columns, a header band, numeric cells right-aligned, and the
+ * row's own state as its tint (training dim, done lit) — no status
+ * word, the row itself says it. */
+.boot-table {
+  width: 100%;
+  border-collapse: collapse;
+  font: 500 12px/1.45 var(--mono);
+  color: #8fb6cf;
+}
+.boot-table th {
+  position: sticky;
+  top: 0;
+  padding: 7px 14px;
+  background: #071320;
+  color: #5c819a;
+  font: 600 10px var(--mono);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  text-align: left;
+  border-bottom: 1px solid var(--line, #12293a);
+}
+.boot-table td {
+  padding: 5px 14px;
+  border-bottom: 1px solid rgba(18, 41, 58, 0.55);
+  white-space: nowrap;
+}
+.boot-table td:nth-child(2),
+.boot-table td:nth-child(3) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.boot-table tr.done td { color: #d5ecfa; }
+.boot-table tr.done td:nth-child(3) { color: #7fe0a8; }
+.boot-table tr.training td:nth-child(1) { color: #b9d6e8; }
 #bootExpand {
-  /* fixed square, pretty: the terminal's height, framed like a panel */
+  /* a text button in DONE's family, one step dimmer — the details
+   * are secondary to the flight */
+  flex: none;
+  padding: 5px 14px;
   border: 1px solid var(--line, #12293a);
   border-radius: 0;
-  background: #050910;
-  color: var(--dim, #45606e);
-  font: 400 14px var(--display);
-  width: 51px;
-  height: 51px;
-  flex: 0 0 auto;
-  align-self: flex-end;
+  clip-path: var(--chamfer);
+  background: #071320;
+  color: #7fb6d4;
+  font: 600 11px var(--mono);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
   cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
   transition: color 120ms, border-color 120ms, background 120ms;
 }
 #bootExpand:hover {
-  color: #e0f2ff;
-  border-color: var(--accent, #00b7ff);
-  background: #0a1420;
+  color: #a0e6ff;
+  border-color: #35c8ff;
+  background: #0a1c2c;
 }
-/* EXPANDED: the terminal takes the whole content, the cubes step aside. */
+/* EXPANDED: the log takes the content's place, the cubes step aside. */
 .boot-dialog.expanded #bootContent { display: none; }
-.boot-dialog.expanded .boot-foot { flex: 1; margin-top: 0; }
+.boot-dialog.expanded #bootDetails { display: flex; flex: 1; }
 .boot-dialog.expanded #bootLog { height: auto; flex: 1; overflow-y: auto; }
-.boot-dialog.expanded #bootExpand { height: auto; align-self: stretch; }
