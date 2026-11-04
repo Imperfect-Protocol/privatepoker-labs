@@ -12,9 +12,11 @@ export { AeroTables, aeroForce, controlStabilityMoment, dampingSlopePerAxis } fr
 export type { AeroDiag, SurfacePositions } from "./physics/aero.js";
 export { SurfacesState, SURFACE_LIMITS, SURFACE_SLEW_RATE, AILERON, ELEVATOR, RUDDER, THROTTLE } from "./physics/surfaces.js";
 export { RigidBody } from "./physics/rigid-body.js";
-export { FlightInstruments, DenseReward, EpisodeOutcome, classifyOutcome, binError, ERROR_BINS } from "./learning/instruments.js";
-export type { EpisodeOutcomeName } from "./learning/instruments.js";
-export { ServoPolicy, EASE_OFF, HOLD, PUSH, ACTION_AXIS, SURFACE_AXIS, HOLD_ALL_SURFACE, ACTION_DELTA, GOAL_AXIS, ELEMENT_AXIS, GOAL_FOLLOW_INSTRUCTOR, GOAL_FREE_FLIGHT, ELEMENT_FREE_FLIGHT, NEURON_EMA } from "./learning/servo-tensor.js";
+export { FlightInstruments, DenseReward, EpisodeOutcome, classifyOutcome, binError, ERROR_BINS, GaugeBins, LOCATION_SHAPE, ENERGY_SHAPE, FLIGHT_SHAPE, CONTROLS_SHAPE, SITUATION_AXIS, SITUATION_CELL_AXIS, levelValue, levelOf, stopCount } from "./learning/instruments.js";
+export type { EpisodeOutcomeName, SenseReading } from "./learning/instruments.js";
+export { ServoPolicy, TensorNetwork, ACTION_HOLD, HOLD_ALL_CHANNEL, ACTION_DELTA, GOAL_AXIS, ELEMENT_AXIS, GOAL_FOLLOW_INSTRUCTOR, GOAL_FREE_FLIGHT, ELEMENT_FREE_FLIGHT, NEURON_EMA, ELEMENT_FIRE_BAR } from "./learning/servo-tensor.js";
+export type { NetworkDecision } from "./learning/servo-tensor.js";
+export { ErrorNeuron, TEACH_ETA } from "./learning/error-neuron.js";
 export { PulseNeuron, Refractory, denoiseProjection, NEURON_LAYERS } from "./learning/neurons.js";
 export type { NeuronSnapshot, BrainSnapshot } from "./learning/servo-tensor.js";
 export type { NeuronSpec } from "./learning/neurons.js";

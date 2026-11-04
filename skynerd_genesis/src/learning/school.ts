@@ -24,10 +24,13 @@
  * nudges (push / ease / hold), stamped into the servo tensor at the
  * demo's established phases only (the stall/spin ENTRY is never stamped —
  * the student must never learn to enter a departure; the recovery is the
- * lesson). Where an entry cannot be replayed from memory at all, the
- * instructor sets the aircraft up into the maneuver and hands it over at
- * that phase boundary (Lesson.repeatFrom) — the student repeats the part
- * it was taught.
+ * lesson).
+ *
+ * REPETITION IS OF THE WHOLE MANEUVER: the student starts exactly where
+ * the instructor started — every exercise except takeoff from level
+ * flight at 80 mph with the trim controls, takeoff from the runway —
+ * and flies the entire maneuver itself. No mid-maneuver handoffs: the
+ * same spawn, the same neutral controls, the whole maneuver.
  *
  * The grading is goal-based: every taught phase carries named goals, each
  * weighted by the demonstration's own decision-tick count in that phase,
@@ -42,11 +45,13 @@ import { NumpyPcg64 } from "../core/rng.js";
 import { RigidBody } from "../physics/rigid-body.js";
 import { SurfacesState, SURFACE_LIMITS } from "../physics/surfaces.js";
 import { AeroTables, RHO_SEA_LEVEL } from "../physics/aero.js";
-import { Aircraft } from "../physics/aircraft.js";import { FlightInstruments, type SenseReading } from "./instruments.js";
-import { ServoPolicy, HOLD, PUSH, EASE_OFF, HOLD_ALL_SURFACE,
-         ELEMENT_FIRE_BAR, ACTION_DELTA,
-       } from "./servo-tensor.js";
-import { Refractory } from "./neurons.js";
+import { Aircraft } from "../physics/aircraft.js";
+import { FlightInstruments, type SenseReading } from "./instruments.js";
+import {
+  ServoPolicy, TensorNetwork, TensorContext, PULSE_EVERY,
+  ACTION_HOLD, ACTION_DELTA,
+} from "./servo-tensor.js";
+import { levelOf } from "./instruments.js";
 import { TRIM_SPEED, TRIM_COMMAND, springStickTowardNeutral } from "./flight.js";
 
 // Desire slots the school names in the will. After a lesson, waking that
@@ -132,9 +137,12 @@ export const SYLLABUS = {
   liftOffToM: 100.0 / 3.28084,      // 100 ft AGL — hold the pull through ground effect
   climbToM: 1000.0 / 3.28084,       // 1000 ft
   stallAltM: 3000.0 / 3.28084,      // 3000 ft
+  highAltM: 5000.0 / 3.28084,       // 5000 ft — the climb lesson's target
   bankTurn: 25.0 * Math.PI / 180.0,   // 20-30 deg band, aim 25
   bankSteep: 60.0 * Math.PI / 180.0,  pitchClimb: 15.0 * Math.PI / 180.0,
   pitchDive: -30.0 * Math.PI / 180.0,
+  pitchDescend: -0.025,             // rad (-1.4°): the descent that holds ~85 mph near idle
+  descendThrottle: 0.15,           // near-idle: the descent is mostly the glide
   pitchRecovery: 15.0 * Math.PI / 180.0,    // both recoveries climb back at 15 deg
   turnAmount: Math.PI,              // 180 horizontal degrees
   turnLeadOut: 0.18,               // rad: start the roll-out early so the
@@ -143,13 +151,16 @@ export const SYLLABUS = {
                                    // (bigger bank turns longer to level)
   cruiseSpeedMps: 38.0,            // 85 mph — the speed held in turns
   steepSpeedMps: 48.0,             // 107 mph — the 2 g steep-turn equilibrium
-  cruiseThrottle: 0.8,             // 2300 RPM
+  steepClimbSpeedMps: 40.0,        // ~90 mph — what full power holds at 2 g
+  climbSpeedMps: 36.0,             // ~80 mph — what the 15° climb holds at full power
+  exerciseStartMps: 80.0 / 2.23694,  // 80 mph — EVERY exercise start except takeoff
+  cruiseThrottle: 0.8,               // 2300 RPM
   idleThrottle: 0.1,
 } as const;
 
 // numpy.random.default_rng(0) PCG64 state, frozen: the classroom's dice.
-const RNG0_STATE = 35399562948360463058890781895381311971n;
-const RNG0_INC = 87136372517582989555478159403783844777n;
+export const RNG0_STATE = 35399562948360463058890781895381311971n;
+export const RNG0_INC = 87136372517582989555478159403783844777n;
 
 function clamp(value: number, limit: number): number {
   return Math.max(-limit, Math.min(limit, value));
@@ -174,12 +185,13 @@ export function pitchOf(body: RigidBody): number {
  * (The constructor's pitch parameter is nose-DOWN-positive; spawns that
  * need a nose-up attitude pass the negative of this.)
  */
-export function cruiseTrimAlpha(): number {
+/** The level-flight trim angle of attack at a speed (default: the cruise
+ *  the trim commands hold). */
+export function cruiseTrimAlpha(speed: number = TRIM_SPEED): number {
   const t = new AeroTables();
-  const cl = (2.0 * t.mass * 9.81) / (1.225 * TRIM_SPEED * TRIM_SPEED * t.wingArea);
+  const cl = (2.0 * t.mass * 9.81) / (1.225 * speed * speed * t.wingArea);
   return (cl - t.cl0) / t.clAlpha;
 }
-
 /** The airframe every school helper computes against. */
 const SCHOOL_TABLES = new AeroTables();
 
@@ -281,6 +293,9 @@ export const ELEMENT_VOCABULARY = [
   "spin",                              // the developed spin
   "opposite rudder",                   // anti-spin rudder to the stop
   "dive",                              // the spin-recovery dive
+  "descend",                           // the held nose-down descent
+  "climbing turn",                     // the bank held together with a climb
+  "descending turn",                   // the bank held together with a descent
 ] as const;
 export type ElementName = typeof ELEMENT_VOCABULARY[number];
 
@@ -309,6 +324,9 @@ interface ElementLaw {
   readonly aileronOverride?: number;
   /** Fixed elevator override (stall-break neutrals, spin back pressure). */
   readonly elevatorOverride?: number;
+  /** The spin's direction: -1 = left (default), +1 = right. Directs the
+   *  pro-spin rudder and the dropped wing. */
+  readonly spinSign?: number;
   readonly rudder: RudderLaw;
   readonly throttle: number;
 }
@@ -459,7 +477,9 @@ export abstract class FlightElement {
     } else if (this.law.rudder === "antiSpin") {
       rudder = clamp(-0.5 * r.rateR, RUDDER_LIMIT);
     } else if (this.law.rudder === "proSpin") {
-      rudder = -RUDDER_LIMIT;
+      // Full rudder WITH the spin's rotation: left spin = left rudder,
+      // right spin = right rudder.
+      rudder = (this.law.spinSign ?? -1.0) * RUDDER_LIMIT;
     } else {
       rudder = this.law.rudder;
     }
@@ -608,8 +628,8 @@ export class PhaseCursor {
 /**
  * One standard maneuver: a spawn state plus the phase procedure that flies
  * it. `desire`/`targets` carry the lesson's intent (the will handshake is
- * a later milestone); `durationCap` bounds the flight even if a phase
- * never completes.
+ * a later milestone). There is NO timeout: a flight lives until the
+ * element chain is complete or the wheels touch the ground.
  */
 export class Lesson {
   readonly phases: readonly FlightElement[];
@@ -627,47 +647,31 @@ export class Lesson {
               phases: readonly FlightElement[], options: {
                 durationCap?: number,
                 startKind?: "runway" | "cruise" | "cruise1000" | "cruise3000",
-                repeatFrom?: number,
                 goalId?: number,
                 targetBearing?: number | null,
               } = {}) {
     this.phases = phases;
-    this.durationCap = options.durationCap ?? 60.0;
+    this.durationCap = options.durationCap ?? Infinity;
     this.startKind = options.startKind ?? "cruise";
-    this.repeatFrom = options.repeatFrom ?? 0;
     this.goalId = options.goalId ?? 1;
     this.targetBearing = options.targetBearing ?? null;
   }
   readonly startKind: "runway" | "cruise" | "cruise1000" | "cruise3000";
-  /**
-   * The phase the STUDENT's repeat starts from. 0 = from the maneuver's
-   * start. Above 0 the instructor sets the aircraft up into the maneuver
-   * and hands it over at that phase's boundary — used where the entry
-   * cannot be replayed from memory: the stall/spin entry is never taught
-   * (the student must never learn to enter a departure), and a turn's
-   * roll-in from level cruise collides with the hold-all reflex the
-   * level-cruise lesson stamps at the same instrument bins.
-   */
-  readonly repeatFrom: number;
 
   /** The classroom start state for this maneuver. */
   spawn(): RigidBody {
-    const trim = cruiseTrimAlpha();
+    // EVERY exercise except takeoff starts from the SAME place: level
+    // flight at 3000 ft, 80 mph, wings level, nose at the 80 mph trim —
+    // the instructor's start and the student's start are identical.
+    const speed = SYLLABUS.exerciseStartMps;
+    const trim = cruiseTrimAlpha(speed);
     switch (this.startKind) {
       case "runway":
         return new RigidBody(new Vec3(0.0, 0.0, SYLLABUS.runwayM),
                               new Vec3(0.0, 0.0, 0.0));
-      case "cruise1000":
-        return new RigidBody(new Vec3(0.0, 0.0, SYLLABUS.climbToM),
-                              new Vec3(TRIM_SPEED, 0.0, 0.0),
-                              0.0, -trim, 0.0);
-      case "cruise3000":
-        return new RigidBody(new Vec3(0.0, 0.0, SYLLABUS.stallAltM),
-                              new Vec3(TRIM_SPEED, 0.0, 0.0),
-                              0.0, -trim, 0.0);
       default:
-        return new RigidBody(new Vec3(0.0, 0.0, SYLLABUS.climbToM),
-                              new Vec3(TRIM_SPEED, 0.0, 0.0),
+        return new RigidBody(new Vec3(0.0, 0.0, SYLLABUS.stallAltM),
+                              new Vec3(speed, 0.0, 0.0),
                               0.0, -trim, 0.0);
     }
   }
@@ -675,10 +679,22 @@ export class Lesson {
 
 export interface DemoTickOptions {
   timeEpoch?: number;
+  /** The demonstration's own recurrent signal context — its sensors'
+   *  running codes, the goal's element, the patch bins. The
+   *  demonstration owns it, exactly the way the student's network
+   *  owns its own. */
+  context: TensorContext;
+  /** The PREVIOUS decision tick's element and situation bus state, so
+   *  the demonstration can stamp the goal tensor's state transition
+   *  (the element the plan advanced FROM, under the situation it
+   *  advanced from). Null on the first decision tick. */
+  prevDecision?: { elementId: number; situation: number } | null;
 }
 
 export interface DemoTickResult {
   stamped: boolean;
+  /** The situation bus state the stamp landed at (when stamped). */
+  situation?: number;
 }
 
 /** Advance one fixed tick; returns false when the flight has ended.
@@ -693,35 +709,14 @@ export interface Stepper {
   readonly seconds: number;
   readonly finished: boolean;
 }
-/**
- * The state the instructor hands the student when the repeat starts inside
- * a maneuver (repeatFrom > 0): the aircraft's body, its rates, and the
- * controls as the instructor left them ("your controls").
- */
-export interface HandoffState {
-  readonly position: Vec3;
-  readonly velocity: Vec3;
-  readonly attitude: Quaternion;
-  readonly rateP: number;
-  readonly rateQ: number;
-  readonly rateR: number;
-  readonly commands: Float64Array;
-  readonly phaseIndex: number;
-}
-
-/** A flight start either from the lesson's spawn or an instructor handoff. */
-export interface FlightStart {
-  readonly body: RigidBody;
-  readonly phaseIndex: number;
-  readonly commands: Float64Array;
-}
 
 /** The hand's decisions as the controls panel shows them
  *  (see ClassroomFlight.handInputs): the commands are the aircraft's own
  *  (Aircraft.commands); these are the choices on top of them. */
 export interface HandInputs {
-  /** The student's last per-channel decision (EASE_OFF / HOLD / PUSH),
-   *  or null while the instructor eases (no decisions happen). */
+  /** The student's last per-channel decision (the commanded lever level
+   *  0..6, or -1 for hold), or null while the instructor eases (no
+   *  decisions happen). */
   readonly choices: Int32Array | null;
   /** Whether a decision window just opened — the 5 Hz brain beat. */
   readonly fresh: boolean;
@@ -740,12 +735,19 @@ abstract class ClassroomFlight implements Stepper {
 
   constructor(readonly lesson: Lesson, protected readonly school: FlightSchool,
               protected readonly policy: ServoPolicy,
-              start: FlightStart | null = null) {
-    const body = start === null ? lesson.spawn() : start.body;
-    this.aircraft = new Aircraft(body);
-    this.cursor = new PhaseCursor(lesson.phases, this.aircraft.body,
-                                  start === null ? 0 : start.phaseIndex);
-    this.steps = Math.floor(lesson.durationCap / school.dt);
+              timeCapSeconds?: number) {
+    // The maneuver's start: the SAME spawn for the instructor and the
+    // student — level flight at 80 mph (the runway for takeoff), wings
+    // level, nose at the trim.
+    this.aircraft = new Aircraft(lesson.spawn());
+    this.cursor = new PhaseCursor(lesson.phases, this.aircraft.body);
+    // NO TIMEOUT by default: the flight lives until the scenario's
+    // element chain is complete or the wheels touch the ground. A cap is
+    // an explicit opt-in for the headless tools only (SchoolSession's
+    // examCap).
+    this.steps = timeCapSeconds === undefined
+      ? Infinity
+      : Math.floor(timeCapSeconds / school.dt);
   }
 
   /** The physical body of the flight's one aircraft. */
@@ -761,8 +763,7 @@ abstract class ClassroomFlight implements Stepper {
     return this.ended;
   }
 
-  /** The hand's own input state — a COPY (the machine is sealed; the
-   *  handoff capture and nothing else reads this). */
+  /** The hand's own input state — a COPY (the machine is sealed). */
   get commands(): Float64Array {
     return Float64Array.from(this.handCommands());
   }
@@ -777,8 +778,8 @@ abstract class ClassroomFlight implements Stepper {
    * happen:
    *  - the commanded targets live on the aircraft itself
    *    (Aircraft.commands — the hand's inputs);
-   *  - choices: the student's LAST per-channel decision, one of
-   *    EASE_OFF / HOLD / PUSH per surface — null while the instructor's
+   *  - choices: the student's LAST per-channel decision — the commanded
+   *    lever level (0..6) or hold (-1) — null while the instructor's
    *    hand eases its smooth demonstration path (no decisions happen);
    *  - fresh: whether a decision window just opened — the 5 Hz brain
    *    beat made visible.
@@ -786,37 +787,52 @@ abstract class ClassroomFlight implements Stepper {
   abstract get handInputs(): HandInputs;
 
   /** One physics tick with the phase bookkeeping and the runway pin. */
-  protected tickPhysics(commands: Float64Array): boolean {
+  /** One tick of the shared machine: the physics, the runway pin, the
+   *  cursor's advance, the ground check. Returns whether this
+   *  aircraft is still flying (false = grounded, or its plan
+   *  complete). Used for the flight's own aircraft AND the shadow
+   *  instructor's twin. */
+  protected stepAircraft(aircraft: Aircraft, cursor: PhaseCursor,
+                         commands: Float64Array): boolean {
     const dt = this.school.dt;
-    this.aircraft.command(commands, dt);
+    aircraft.command(commands, dt);
     // Height above the terrain: ground effect lives in the physics.
-    const agl = this.aircraft.body.position.z
-      - this.school.world.terrainHeight(this.aircraft.body.position.x,
-                                        this.aircraft.body.position.y);
-    this.aircraft.step(dt, agl);
-    const phase = this.cursor.current;
+    const agl = aircraft.body.position.z
+      - this.school.world.terrainHeight(aircraft.body.position.x,
+                                        aircraft.body.position.y);
+    aircraft.step(dt, agl);
+    const phase = cursor.current;
     if (phase.pin === true) {
       // The runway: hold the aircraft at 10 ft while it cannot fly (vz
       // would go negative) — the takeoff roll, and the sag after rotation
       // until the wing carries it. It unpins itself the moment it flies.
-      if (this.body.position.z < SYLLABUS.runwayM + 0.001) {
-        this.body.position = new Vec3(this.body.position.x, this.body.position.y,
-                                      SYLLABUS.runwayM);
-        this.body.velocity = new Vec3(this.body.velocity.x, this.body.velocity.y,
-                                      Math.max(0.0, this.body.velocity.z));
+      if (aircraft.body.position.z < SYLLABUS.runwayM + 0.001) {
+        aircraft.body.position = new Vec3(aircraft.body.position.x,
+                                         aircraft.body.position.y,
+                                         SYLLABUS.runwayM);
+        aircraft.body.velocity = new Vec3(aircraft.body.velocity.x,
+                                          aircraft.body.velocity.y,
+                                          Math.max(0.0, aircraft.body.velocity.z));
         // The gear: wings level, deck at the ground attitude until an
         // element commands rotation — a pitch target or a held elevator
         // pull. The roll shows pitch 0, yoke neutral.
-        holdGroundDeck(this.body, !phase.rotates);
+        holdGroundDeck(aircraft.body, !phase.rotates);
       }
     }
-    this.cursor.advance(this.body);
-    this.tick += 1;
-    if (this.school.grounded(this.body) && phase.pin !== true) {
-      this.ended = true;
+    cursor.advance(aircraft.body);
+    if (this.school.grounded(aircraft.body) && phase.pin !== true) {
       return false;
     }
-    if (this.cursor.finished || this.tick >= this.steps) {
+    if (cursor.finished) {
+      return false;
+    }
+    return true;
+  }
+
+  protected tickPhysics(commands: Float64Array): boolean {
+    const alive = this.stepAircraft(this.aircraft, this.cursor, commands);
+    this.tick += 1;
+    if (!alive || this.tick >= this.steps) {
       this.ended = true;
       return false;
     }
@@ -828,10 +844,18 @@ abstract class ClassroomFlight implements Stepper {
 export class DemoFlight extends ClassroomFlight {
   readonly hand: InstructorHand;
   stamped = 0;
+  /** The demonstration's own recurrent signal context — its sensors'
+   *  running codes (the recurrence), carried decision to decision
+   *  exactly the way the student's network carries its own. */
+  readonly context: TensorContext;
+  /** The last STAMPED decision (element + situation bus), so the next
+   *  stamp can record the goal tensor's state transition. */
+  private lastDecision: { elementId: number; situation: number } | null = null;
 
   constructor(school: FlightSchool, lesson: Lesson, policy: ServoPolicy,
               private readonly timeEpoch = 0) {
     super(lesson, school, policy);
+    this.context = new TensorContext(lesson.phases[0].elementId);
     // Parked on the runway, the hand starts neutral-idle; already flying,
     // it starts at the trim.
     this.hand = new InstructorHand(startCommandsFor(lesson.startKind));
@@ -854,11 +878,22 @@ export class DemoFlight extends ClassroomFlight {
     // targets); the stamp decision happens at decision ticks, reading
     // the same raw.
     const raw = this.cursor.phaseTargets(this.body);
-    if (this.tick % DECISION_EVERY === 0) {
+    // THE PULSE CADENCE: the sensors are stunned one decision per
+    // arrival, so they fire every SECOND decision (PULSE_EVERY) — and
+    // the demonstration stamps at exactly that rhythm, or it would
+    // stamp a path the student's own cadence never walks.
+    if (this.tick % DECISION_EVERY === 0
+        && (this.tick / DECISION_EVERY) % PULSE_EVERY === 0) {
       const demo = this.school.demoTick(this.policy, this.lesson, this.cursor,
                                        this.body, this.aircraft.surfacePositions,
-                                       raw, { timeEpoch: this.timeEpoch });
+                                       raw, { timeEpoch: this.timeEpoch,
+                                              context: this.context,
+                                              prevDecision: this.lastDecision });
       this.stamped += demo.stamped ? 1 : 0;
+      if (demo.stamped) {
+        this.lastDecision = { elementId: this.cursor.current.elementId,
+                             situation: demo.situation! };
+      }
     }
     const smooth = this.hand.easeToward(raw, dt);
     return this.tickPhysics(Float64Array.from(smooth));
@@ -1078,7 +1113,7 @@ class LevelOffElement extends FlightElement {
     super({ pitchCapture: true, vsTarget: 0.0, bankTarget: 0.0,
             rudder: 0.0, throttle: SYLLABUS.cruiseThrottle });
     this.atAltitudeM = atAltitudeM;
-    this.goals = [GoalChecks.atFlightEnd(
+    this.goals = [GoalChecks.atPhaseEnd(
       `level off smoothly at ${altitudeName}`,
       (s) => Math.abs(s.altitudeM - this.atAltitudeM) <= 25.0
              && Math.abs(s.vsMps) <= GOAL_TOLERANCES.vsLevel)];
@@ -1121,9 +1156,10 @@ class RollInElement extends FlightElement {
   readonly stamp = true;
 
   constructor(bank: number, speedTarget: number, throttle: number,
-              rudder: RudderLaw) {
-    super({ bankTarget: bank, carryTurn: true, vsTarget: 0.0,
-            speedTarget, rudder, throttle });
+              rudder: RudderLaw, vsTarget: number = 0.0,
+              pitchTarget?: number) {
+    super({ bankTarget: bank, carryTurn: true, vsTarget,
+            speedTarget, rudder, throttle, pitchTarget });
   }
 
   done(r: PhaseReadings): boolean {
@@ -1179,9 +1215,10 @@ class RollOutElement extends FlightElement {
   readonly name: ElementName = "roll out";
   readonly stamp = true;
 
-  constructor(speedTarget: number, throttle: number) {
-    super({ headingHold: true, carryTurn: true, vsTarget: 0.0,
-            speedTarget, rudder: 0.0, throttle });
+  constructor(speedTarget: number, throttle: number, vsTarget: number = 0.0,
+              pitchTarget?: number) {
+    super({ headingHold: true, carryTurn: true, vsTarget,
+            speedTarget, rudder: 0.0, throttle, pitchTarget });
     this.goals = [
       GoalChecks.atPhaseEnd("turn a full 180°",
         (s) => Math.abs(s.turned) >= 0.87 * SYLLABUS.turnAmount
@@ -1211,13 +1248,118 @@ class SettleElement extends FlightElement {
   }
 }
 
-/** STALL ENTRY: idle, hold altitude, bleed off to the stall. Shown only. */
+/** DESCEND: nose below the horizon at the descent attitude, speed on
+ *  the power, wings level, down to the target altitude. */
+class DescendElement extends FlightElement {
+  readonly name: ElementName = "descend";
+  readonly stamp = true;
+
+  constructor(private readonly toAltitudeM: number) {
+    super({ pitchTarget: SYLLABUS.pitchDescend, bankTarget: 0.0,
+            rudder: 0.0, throttle: SYLLABUS.descendThrottle,
+            speedTarget: SYLLABUS.cruiseSpeedMps });
+  }
+
+  readonly goals = [
+    GoalChecks.hold("descend nose-down, wings level",
+      (s) => s.pitch <= -0.01
+             && Math.abs(s.bank) <= GOAL_TOLERANCES.wingsLevel),
+    GoalChecks.hold("hold 85 mph in the descent",
+      (s) => Math.abs(s.airspeed - SYLLABUS.cruiseSpeedMps)
+             <= GOAL_TOLERANCES.speedHold),
+  ];
+
+  done(r: PhaseReadings): boolean {
+    return r.altitudeM <= this.toAltitudeM + LEVEL_OFF_LEAD_S * (-r.vsMps)
+           && r.vsMps <= -0.2;
+  }
+}
+
+/**
+ * CLIMBING TURN: the bank and the climb held together through the full
+ * 180° — the vertical speed on the elevator, the speed on the power.
+ */
+class ClimbingTurnElement extends FlightElement {
+  readonly name: ElementName = "climbing turn";
+  readonly stamp = true;
+  private readonly leadOut: number;
+
+  constructor(bank: number, private readonly vsTarget: number,
+              speedTarget: number, throttle: number, rudder: RudderLaw,
+              leadOut: number, private readonly steep: boolean,
+              pitchTarget?: number) {
+    super({ bankTarget: bank, carryTurn: true, vsTarget,
+            speedTarget, rudder, throttle, pitchTarget });
+    this.leadOut = leadOut;
+    this.goals = [
+      steep
+        ? GoalChecks.hold("hold the bank at 60° (steep climbing turn)",
+            (s) => Math.abs(s.bank) >= 0.85 * SYLLABUS.bankSteep
+                   && Math.abs(s.bank) <= 1.15 * SYLLABUS.bankSteep)
+        : GoalChecks.hold("hold the bank in the 20-30° band",
+            (s) => Math.abs(s.bank) >= 0.9 * SYLLABUS.bankTurn
+                   && Math.abs(s.bank) <= 1.3 * SYLLABUS.bankTurn),
+      GoalChecks.hold("hold the climb through the turn",
+        (s) => s.vsMps >= (this.steep ? -0.8 : this.vsTarget * 0.5)),
+      GoalChecks.hold(
+        steep ? "hold ~90 mph through the steep climbing turn"
+              : "hold 80 mph through the climbing turn",
+        (s) => Math.abs(s.airspeed - speedTarget) <= (steep ? 5.0 : 4.0)),
+    ];
+  }
+
+  done(r: PhaseReadings): boolean {
+    return Math.abs(r.turned) >= SYLLABUS.turnAmount - this.leadOut;
+  }
+}
+
+/**
+ * DESCENDING TURN: the bank and a steady descent held together through
+ * the full 180° — power low, the speed on the throttle, the nose below
+ * the horizon the whole way round.
+ */
+class DescendingTurnElement extends FlightElement {
+  readonly name: ElementName = "descending turn";
+  readonly stamp = true;
+  private readonly leadOut: number;
+
+  constructor(bank: number, private readonly vsTarget: number,
+              speedTarget: number, throttle: number, rudder: RudderLaw,
+              leadOut: number, private readonly steep: boolean,
+              pitchTarget?: number) {
+    super({ bankTarget: bank, carryTurn: true, vsTarget,
+            speedTarget, rudder, throttle, pitchTarget });
+    this.leadOut = leadOut;
+    this.goals = [
+      steep
+        ? GoalChecks.hold("hold the bank at 60° (steep descending turn)",
+            (s) => Math.abs(s.bank) >= 0.85 * SYLLABUS.bankSteep
+                   && Math.abs(s.bank) <= 1.15 * SYLLABUS.bankSteep)
+        : GoalChecks.hold("hold the bank in the 20-30° band",
+            (s) => Math.abs(s.bank) >= 0.9 * SYLLABUS.bankTurn
+                   && Math.abs(s.bank) <= 1.3 * SYLLABUS.bankTurn),
+      GoalChecks.hold("hold the descent through the turn",
+        (s) => s.vsMps <= this.vsTarget * 0.5),
+      GoalChecks.hold(
+        steep ? "hold 85 mph through the steep descending turn"
+              : "hold 85 mph through the descending turn",
+        (s) => Math.abs(s.airspeed - speedTarget) <= (steep ? 5.0 : 4.0)),
+    ];
+  }
+
+  done(r: PhaseReadings): boolean {
+    return Math.abs(r.turned) >= SYLLABUS.turnAmount - this.leadOut;
+  }
+}
+
+/** STALL ENTRY: idle, yoke FULL AFT — pull it to the stop and hold it
+ *  there until the wing gives up. Shown only. */
 class StallEntryElement extends FlightElement {
   readonly name: ElementName = "stall entry";
   readonly stamp = false;
 
   constructor() {
-    super({ vsTarget: 0.0, bankTarget: 0.0, rudder: 0.0,
+    super({ elevatorOverride: ELEVATOR_LIMIT, bankTarget: 0.0, rudder: 0.0,
             throttle: SYLLABUS.idleThrottle });
   }
 
@@ -1283,13 +1425,15 @@ class DropWingElement extends FlightElement {
   readonly name: ElementName = "drop wing";
   readonly stamp = false;
 
-  constructor() {
-    super({ aileronOverride: -AILERON_LIMIT, elevatorOverride: 0.1,
-            rudder: "proSpin", throttle: SYLLABUS.idleThrottle });
+  constructor(private readonly spinSign: number = -1.0) {
+    super({ aileronOverride: spinSign * AILERON_LIMIT,
+            elevatorOverride: 0.1,
+            rudder: "proSpin", spinSign,
+            throttle: SYLLABUS.idleThrottle });
   }
 
   done(r: PhaseReadings): boolean {
-    return r.rateR <= -0.6 || r.ticks >= 200;
+    return this.spinSign * r.rateR >= 0.6 || r.ticks >= 200;
   }
 }
 
@@ -1298,9 +1442,10 @@ class SpinElement extends FlightElement {
   readonly name: ElementName = "spin";
   readonly stamp = false;
 
-  constructor() {
-    super({ aileronOverride: -0.2, elevatorOverride: 0.12,
-            rudder: "proSpin", throttle: SYLLABUS.idleThrottle });
+  constructor(private readonly spinSign: number = -1.0) {
+    super({ aileronOverride: spinSign * 0.2, elevatorOverride: 0.12,
+            rudder: "proSpin", spinSign,
+            throttle: SYLLABUS.idleThrottle });
   }
 
   done(r: PhaseReadings): boolean {
@@ -1361,40 +1506,46 @@ class DiveElement extends FlightElement {
  * share of the grade.
  */
 export class ExamFlight extends ClassroomFlight {
-  private commandsNow: Float64Array;
+  protected commandsNow: Float64Array;
   readonly trace = new GoalTrace();
   private readonly spec: LessonGoalSpec;
   private readonly savedEpsilon: number;
   /**
    * The element the student has CHOSEN to execute right now — the
    * intentional "currently climb" of the two-level goal/element plan.
-   * Starts at the handoff element (or the maneuver's first).
+   * Starts at the maneuver's first element (the repeat is of the WHOLE
+   * maneuver, from the same level-flight start the instructor had).
    */
   chosenIndex: number;
   /**
-   * The element selector's refractory period: it fires its choice, then
-   * waits one decision stunned while the servo neuron acts on it — the
-   * pulsating dynamic (one neuron fires, the other waits; the choice
-   * travels in time, not in an instantaneous loop).
+   * THE TENSOR NETWORK: the seven tensors as dispatcher nodes —
+   * input message -> reward -> stun (logsig timer) -> queue; on the
+   * timer's fire: noise -> Haar -> Gaussian -> threshold -> message
+   * -> send. One network per flight, sharing the student's brain.
    */
-  private readonly elementRefractory = new Refractory(1);
-  /** The servo neuron's stun: 1 decision after each element fire. */
-  private servoStunned = 0;
-  /** The last decision the servo neuron chose, per channel — the panel's
-   *  view of the student's inputs. */
-  private lastChoices: Int32Array | null = null;
+  protected readonly network: TensorNetwork;
+  /** The maneuver's TAUGHT elements, in chain order — the transition
+   *  candidates (entries are shown but never taught). */
+  protected readonly candidates: number[];
+  /** The last decision the controls tensor chose, per channel — the
+   *  panel's view of the student's inputs. */
+  protected lastChoices: Int32Array | null = null;
 
   constructor(school: FlightSchool, lesson: Lesson, policy: ServoPolicy,
-              private readonly rng: NumpyPcg64) {
-    super(lesson, school, policy, school.preparedStart(lesson));
+              protected readonly rng: NumpyPcg64, examCapSeconds?: number) {
+    // THE REPEAT: the whole maneuver, from the SAME start the instructor
+    // had — the lesson's spawn (level flight at 80 mph, trim controls;
+    // the runway for takeoff) and the same neutral commands.
+    super(lesson, school, policy, examCapSeconds);
     this.savedEpsilon = policy.epsilon;
     policy.epsilon = REPEAT_EPSILON;   // fly what it remembers
-    const start = school.preparedStart(lesson);
-    this.commandsNow = start === null
-      ? Float64Array.from(startCommandsFor(lesson.startKind))
-      : Float64Array.from(start.commands);
+    this.commandsNow = Float64Array.from(startCommandsFor(lesson.startKind));
     this.spec = school.goalSpec(lesson);
     this.chosenIndex = this.cursor.index;
+    this.candidates = lesson.phases.filter((phase) => phase.stamp)
+      .map((phase) => phase.elementId);
+    this.network = new TensorNetwork(policy,
+      lesson.phases[this.chosenIndex].elementId, this.rng);
   }
 
   protected handCommands(): Float64Array {
@@ -1439,8 +1590,11 @@ export class ExamFlight extends ClassroomFlight {
   release(): void {
     if (!this.ended) {
       this.ended = true;
-      this.policy.epsilon = this.savedEpsilon;
     }
+    // The epsilon ALWAYS goes back to what it was — a flight that
+    // ended naturally (ended already true) restores it just the same
+    // as one dropped mid-air.
+    this.policy.epsilon = this.savedEpsilon;
   }
 
   step(): boolean {
@@ -1450,35 +1604,33 @@ export class ExamFlight extends ClassroomFlight {
     const dt = this.school.dt;
     if (this.tick % DECISION_EVERY === 0) {
       // THE PULSATING INTENTION. The panel pulses in every decision; the
-      // neurons take turns firing, so the system never runs a feedback
-      // loop — it oscillates: choose, act, choose, act.
+      // tensors take turns firing — stunned by their signals, relaxing,
+      // gossiping their states — so the system never runs a feedback
+      // loop: it oscillates. Sense, intend, act.
       const sense = this.school.instruments.senseReading(this.body,
                                                         this.aircraft.surfacePositions,
                                                         this.lesson.targetBearing);
-      // 1. The element neuron fires (when its refractory period ends):
-      //    WHICH element of the maneuver to execute — the higher-level
-      //    goal is the assigned lesson ("take off from the runway").
-      //    The fire startles the servo neuron for one decision — but
-      //    only when the intention actually CHANGES: a re-confirmation
-      //    of the same element startles nothing, so the student keeps
-      //    acting at full cadence while it holds an element, and the
-      //    pulse travels the synapse only on a transition.
-      if (this.elementRefractory.tick()) {
-        const next = this.intend(sense);
-        if (next !== this.chosenIndex) {
-          this.servoStunned = 1;   // the new intention startles the servo neuron
+      // One decision window of the whole cascade: the sensors gossip
+      // their situation codes onto the bus; the goal tensor (once its
+      // refractory and its stun relax) fires the state transition; the
+      // controls tensor (unless the intention change startled it)
+      // fires the command.
+      const decision = this.network.decide(this.lesson.goalId, sense,
+                                            this.candidates, this.rng);
+      // The intention, as a phase index (monotone forward — the
+      // transition never regresses down the chain).
+      if (decision.elementId !== this.chosenElement.elementId) {
+        let index = this.chosenIndex;
+        while (index < this.lesson.phases.length - 1
+               && this.lesson.phases[index].elementId !== decision.elementId) {
+          index += 1;
         }
-        this.chosenIndex = next;
+        this.chosenIndex = index;
       }
-      // 2. The servo neuron fires (when its stun relaxes): WHAT TO DO
-      //    inside the chosen element — the remembered push/ease/hold.
-      if (this.servoStunned > 0) {
-        this.servoStunned -= 1;
-      } else {
-        const actions = this.policy.choose(this.chosenElement.elementId,
-                                           sense, this.rng);
-        this.commandsNow = this.policy.commandFrom(this.commandsNow, actions);
-        this.lastChoices = actions;
+      if (decision.acted) {
+        this.commandsNow = this.policy.commandFrom(this.commandsNow,
+                                                  decision.actions);
+        this.lastChoices = decision.actions;
       }
       // Grade the chosen element's flying against its named goals.
       this.trace.record(this.chosenIndex,
@@ -1492,44 +1644,95 @@ export class ExamFlight extends ClassroomFlight {
     return more;
   }
 
-  /**
-   * The element choice — intention, not obedience. Among the maneuver's
-   * TAUGHT elements (the stamped ones; entries are shown but never
-   * taught), the student executes the FURTHEST one its OWN memory
-   * supports at this reading — an element fires only on its own cells
-   * (raw evidence above the bar), never on a neighbor's blur leak, and
-   * the fired (denoised) projection must confirm it. The furthest rule
-   * is the progression: at the rotation boundary roll and rotate both
-   * fire, and the student moves on to rotate. The choice is MONOTONE:
-   * a fired element never regresses the plan below what the student
-   * already chose — a maneuver's elements are an ordered chain (roll
-   * until the speed, climb until the altitude, level off), and the
-   * reading noise at a boundary must not bounce the student back down
-   * the chain it has already climbed. Where nothing fires the student
-   * KEEPS the current element — a student does not un-choose
-   * mid-flight because a reading drifted off the demonstration's exact
-   * profile.
-   */
-  private intend(sense: SenseReading): number {
-    const evidence = this.policy.elementEvidence(this.lesson.goalId, sense);
-    const projection = this.policy.elementProjection(this.lesson.goalId,
-                                                     sense, this.rng);
-    let chosen = -1;
-    for (let i = 0; i < this.lesson.phases.length; i++) {
-      const element = this.lesson.phases[i];
-      if (!element.stamp) {
-        continue;   // shown but never taught: never a choice
-      }
-      const own = evidence[element.elementId];
-      const fired = projection[element.elementId];
-      if (own > ELEMENT_FIRE_BAR && fired > ELEMENT_FIRE_BAR) {
-        chosen = i;
-      }
+}
+
+/**
+ * THE SHADOW FLIGHT — the instructor flies a TWIN aircraft of the same
+ * lesson beside the student, hands on controls in parallel: every
+ * decision tick the student's tensors are compared against the
+ * instructor's (the classes the teacher would fire, the lever the
+ * instructor commands, the element the instructor is in) and the
+ * ERROR WAVE is taught upstream (network.teach — the sign-flipping
+ * error neurons pumping their local, idiotic gradient into each
+ * tensor's own cells). The student's own flying is graded exactly
+ * the way the exam's is, so the flock's selection can rank it.
+ *
+ * The flight ends when the INSTRUCTOR completes the lesson (the
+ * teaching data is gone), or the student's own flight ends — its
+ * grade is the trace it earned.
+ */
+export class ShadowFlight extends ExamFlight {
+  /** The instructor's twin aircraft — its own sealed machine. */
+  private readonly instructorAircraft: Aircraft;
+  private readonly instructorCursor: PhaseCursor;
+  private readonly instructorHand = new InstructorHand(
+    startCommandsFor(this.lesson.startKind));
+  /** The classroom epoch the teach pulses fire at. */
+  private readonly timeEpoch: number;
+
+  constructor(school: FlightSchool, lesson: Lesson, policy: ServoPolicy,
+              rng: NumpyPcg64, timeEpoch: number,
+              examCapSeconds?: number) {
+    super(school, lesson, policy, rng, examCapSeconds);
+    this.timeEpoch = timeEpoch;
+    this.instructorAircraft = new Aircraft(lesson.spawn());
+    this.instructorCursor = new PhaseCursor(lesson.phases,
+                                            this.instructorAircraft.body);
+  }
+
+  step(): boolean {
+    if (this.ended) {
+      return false;
     }
-    if (chosen < 0) {
-      return Math.min(this.chosenIndex, this.lesson.phases.length - 1);
+    const dt = this.school.dt;
+    // The instructor flies its twin at the student's side.
+    const rawI = this.instructorCursor.phaseTargets(
+      this.instructorAircraft.body);
+    if (this.tick % DECISION_EVERY === 0) {
+      // The student's decision, exactly the exam's.
+      const sense = this.school.instruments.senseReading(
+        this.body, this.aircraft.surfacePositions,
+        this.lesson.targetBearing);
+      const decision = this.network.decide(this.lesson.goalId, sense,
+                                            this.candidates, this.rng);
+      if (decision.elementId !== this.chosenElement.elementId) {
+        let index = this.chosenIndex;
+        while (index < this.lesson.phases.length - 1
+               && this.lesson.phases[index].elementId !== decision.elementId) {
+          index += 1;
+        }
+        this.chosenIndex = index;
+      }
+      if (decision.acted) {
+        this.commandsNow = this.policy.commandFrom(this.commandsNow,
+                                                  decision.actions);
+        this.lastChoices = decision.actions;
+      }
+      // THE TEACHING COMPARISON: the instructor's lever against the
+      // student's, the teacher's classes against the student's fired
+      // ones, the instructor's element against the student's — the
+      // error wave's fuel, computed at the same decision tick.
+      let actionsI = FlightSchool.movingLevels(
+        rawI, this.instructorAircraft.surfacePositions);
+      if (!actionsI.some((a) => a !== ACTION_HOLD)) {
+        actionsI = FlightSchool.heldLevels(
+          this.instructorAircraft.surfacePositions);
+      }
+      this.network.teach(this.instructorCursor.current.elementId, actionsI,
+                         this.timeEpoch);
+      this.trace.record(this.chosenIndex, this.cursor.readings(this.body));
     }
-    return Math.max(chosen, this.chosenIndex);   // monotone: no regression
+    const smoothI = this.instructorHand.easeToward(rawI, dt);
+    const instructorFlying = this.stepAircraft(this.instructorAircraft,
+                                               this.instructorCursor,
+                                               Float64Array.from(smoothI));
+    const studentFlying = this.tickPhysics(this.commandsNow);
+    this.commandsNow = springStickTowardNeutral(this.commandsNow, dt);
+    if (!instructorFlying || !studentFlying) {
+      this.release();
+      return false;
+    }
+    return true;
   }
 }
 
@@ -1564,7 +1767,6 @@ export class FlightSchool {
   readonly lessons = new Map<string, Lesson>();
   private readonly prepared = new Map<string, {
     phaseTicks: number[];
-    handoff: HandoffState | null;
   }>();
   private readonly goalSpecs = new Map<string, LessonGoalSpec>();
 
@@ -1577,8 +1779,8 @@ export class FlightSchool {
   private defineCurriculum(): void {
     const S = SYLLABUS;
     const lessons: [string, number, readonly number[], FlightElement[],
-                   { durationCap: number, startKind: Lesson["startKind"],
-                     repeatFrom?: number, goalId?: number,
+                   { startKind: Lesson["startKind"],
+                     goalId?: number,
                      targetBearing?: number | null }][] = [];
 
     // Goal ids on the intention tensor's goal axis: follow-instructor (0)
@@ -1595,20 +1797,31 @@ export class FlightSchool {
       new RotateElement(),
       new ClimbElement(S.climbToM),
       new LevelOffElement(S.climbToM, "1000 ft"),
-    ], { durationCap: 150.0, startKind: "runway", goalId: nextGoalId() }]);
+    ], { startKind: "runway", goalId: nextGoalId() }]);
 
     // --- LEVEL CRUISE: the 80-90 mph / 2300 RPM hands-off lesson. -------
     lessons.push(["level_cruise", DESIRE_LEVEL, [0.0, 0.0, 0.0], [
       new CruiseElement(),
-    ], { durationCap: 25.0, startKind: "cruise1000", goalId: nextGoalId() }]);
+    ], { startKind: "cruise1000", goalId: nextGoalId() }]);
+
+    // --- CLIMB: from the standard 3000 ft start, the held 15° climb at
+    // full power up to 5000 ft, then the smooth level-off. -------------
+    lessons.push(["climb_to_5000", DESIRE_CLIMB, [0.0, 0.0, 1.0], [
+      new ClimbElement(S.highAltM),
+      new LevelOffElement(S.highAltM, "5000 ft"),
+    ], { startKind: "cruise3000", goalId: nextGoalId() }]);
+
+    // --- DESCEND TO 1000 FT: nose below the horizon at the descent
+    // attitude, speed on the power, down to 1000 ft, level off there. --
+    lessons.push(["descend_to_1000", DESIRE_DESCEND, [0.0, 0.0, -1.0], [
+      new DescendElement(S.climbToM),
+      new LevelOffElement(S.climbToM, "1000 ft"),
+    ], { startKind: "cruise3000", goalId: nextGoalId() }]);
 
     // --- TURNS: 180° at 25° bank, nose held on the horizon. The roll-out
     // is a HEADING HOLD that lands on entry heading ± 180°. The student
-    // repeats from the ESTABLISHED BANK (repeatFrom): rolling in from
-    // level cruise cannot be replayed from memory — the readings there
-    // belong to the level-cruise hold-all reflex. The roll-in is still
-    // STAMPED: the student re-banks whenever the bank decays below the
-    // 20° band floor. The HSI target is the 180°-off bearing. -----------
+    // repeats the WHOLE maneuver from the same level-flight start as the
+    // instructor. The HSI target is the 180°-off bearing. ---------------
     const turnElements = (bank: number): FlightElement[] => [
       new RollInElement(bank, S.cruiseSpeedMps, S.cruiseThrottle, 0.0),
       new TurnElement(bank, S.cruiseSpeedMps, S.cruiseThrottle, 0.0,
@@ -1618,17 +1831,58 @@ export class FlightSchool {
     ];
     lessons.push(["turn_left_180", DESIRE_LEFT, [0.0, -S.bankTurn, 0.0],
                   turnElements(-S.bankTurn),
-                  { durationCap: 60.0, startKind: "cruise1000", repeatFrom: 1,
+                  { startKind: "cruise1000",
                     goalId: nextGoalId(), targetBearing: Math.PI }]);
     lessons.push(["turn_right_180", DESIRE_RIGHT, [0.0, S.bankTurn, 0.0],
                   turnElements(S.bankTurn),
-                  { durationCap: 60.0, startKind: "cruise1000", repeatFrom: 1,
+                  { startKind: "cruise1000",
+                    goalId: nextGoalId(), targetBearing: Math.PI }]);
+
+    // --- CLIMBING TURNS: 180° at 25° bank WHILE CLIMBING at full power —
+    // the vertical speed held on the elevator, the speed on the power.
+    // Descending turns: the same 180° at 25° bank while DESCENDING at
+    // reduced power, nose below the horizon the whole way round. -----
+    const climbingTurnElements = (bank: number): FlightElement[] => [
+      new RollInElement(bank, S.climbSpeedMps, 1.0, 0.0, 0.0, S.pitchClimb),
+      new ClimbingTurnElement(bank, 4.0, S.climbSpeedMps, 1.0, 0.0,
+                              S.turnLeadOut, false, S.pitchClimb),
+      new RollOutElement(S.climbSpeedMps, 1.0, 0.0, S.pitchClimb),
+      new SettleElement(),
+    ];
+    const descendingTurnElements = (bank: number): FlightElement[] => [
+      new RollInElement(bank, S.cruiseSpeedMps, S.descendThrottle, 0.0, 0.0,
+                        S.pitchDescend),
+      new DescendingTurnElement(bank, -4.0, S.cruiseSpeedMps, S.descendThrottle,
+                                0.0, S.turnLeadOut, false, S.pitchDescend),
+      new RollOutElement(S.cruiseSpeedMps, S.descendThrottle, 0.0,
+                         S.pitchDescend),
+      new SettleElement(),
+    ];
+    lessons.push(["climbing_turn_left_180", DESIRE_CLIMB,
+                  [0.0, -S.bankTurn, 1.0],
+                  climbingTurnElements(-S.bankTurn),
+                  { startKind: "cruise1000",
+                    goalId: nextGoalId(), targetBearing: Math.PI }]);
+    lessons.push(["climbing_turn_right_180", DESIRE_CLIMB,
+                  [0.0, S.bankTurn, 1.0],
+                  climbingTurnElements(S.bankTurn),
+                  { startKind: "cruise1000",
+                    goalId: nextGoalId(), targetBearing: Math.PI }]);
+    lessons.push(["descending_turn_left_180", DESIRE_DESCEND,
+                  [0.0, -S.bankTurn, -1.0],
+                  descendingTurnElements(-S.bankTurn),
+                  { startKind: "cruise3000",
+                    goalId: nextGoalId(), targetBearing: Math.PI }]);
+    lessons.push(["descending_turn_right_180", DESIRE_DESCEND,
+                  [0.0, S.bankTurn, -1.0],
+                  descendingTurnElements(S.bankTurn),
+                  { startKind: "cruise3000",
                     goalId: nextGoalId(), targetBearing: Math.PI }]);
 
     // --- STEEP TURNS: 180° at 60° bank with top rudder. A 2 g level turn
     // needs ENERGY: enter at cruise, full throttle, speed rides up to the
-    // steep-turn band (~107 mph). Like the normal turns, the student
-    // repeats from the established 60° bank. ----------------------------
+    // steep-turn band (~107 mph). The student repeats the WHOLE maneuver
+    // from the same level-flight start as the instructor. --------------
     const steepElements = (bank: number): FlightElement[] => [
       new RollInElement(bank, S.steepSpeedMps, 1.0, "top"),
       new TurnElement(bank, S.steepSpeedMps, 1.0, "top",
@@ -1638,16 +1892,56 @@ export class FlightSchool {
     ];
     lessons.push(["steep_turn_left_180", DESIRE_LEFT, [0.0, -S.bankSteep, 0.0],
                   steepElements(-S.bankSteep),
-                  { durationCap: 45.0, startKind: "cruise1000", repeatFrom: 1,
+                  { startKind: "cruise1000",
                     goalId: nextGoalId(), targetBearing: Math.PI }]);
     lessons.push(["steep_turn_right_180", DESIRE_RIGHT, [0.0, S.bankSteep, 0.0],
                   steepElements(S.bankSteep),
-                  { durationCap: 45.0, startKind: "cruise1000", repeatFrom: 1,
+                  { startKind: "cruise1000",
                     goalId: nextGoalId(), targetBearing: Math.PI }]);
 
-    // --- STALL RECOVERY: the instructor stalls it and hands over at the
-    // break; the student flies the RECOVERY: push to the dive, climb back
-    // at 15°, level off at 3000 ft. The ENTRY is never taught. -----------
+    // --- STEEP CLIMBING / DESCENDING TURNS: the same 180° at 60° bank
+    // with top rudder, but while CLIMBING at full power (what the
+    // machine can give at 2 g) or DESCENDING at idle — power at the
+    // stop either way, the vertical speed on the elevator. ---------
+    const steepClimbingTurnElements = (bank: number): FlightElement[] => [
+      new RollInElement(bank, S.steepClimbSpeedMps, 1.0, "top", 0.5),
+      new ClimbingTurnElement(bank, 0.5, S.steepClimbSpeedMps, 1.0, "top",
+                              S.steepLeadOut, true),
+      new RollOutElement(S.steepClimbSpeedMps, 1.0, 0.5),
+      new SettleElement(),
+    ];
+    const steepDescendingTurnElements = (bank: number): FlightElement[] => [
+      new RollInElement(bank, S.cruiseSpeedMps, S.idleThrottle, "top", -6.0),
+      new DescendingTurnElement(bank, -6.0, S.cruiseSpeedMps, S.idleThrottle,
+                                "top", S.steepLeadOut, true),
+      new RollOutElement(S.cruiseSpeedMps, S.descendThrottle, -6.0),
+      new SettleElement(),
+    ];
+    lessons.push(["steep_climbing_turn_left_180", DESIRE_CLIMB,
+                  [0.0, -S.bankSteep, 1.0],
+                  steepClimbingTurnElements(-S.bankSteep),
+                  { startKind: "cruise1000",
+                    goalId: nextGoalId(), targetBearing: Math.PI }]);
+    lessons.push(["steep_climbing_turn_right_180", DESIRE_CLIMB,
+                  [0.0, S.bankSteep, 1.0],
+                  steepClimbingTurnElements(S.bankSteep),
+                  { startKind: "cruise1000",
+                    goalId: nextGoalId(), targetBearing: Math.PI }]);
+    lessons.push(["steep_descending_turn_left_180", DESIRE_DESCEND,
+                  [0.0, -S.bankSteep, -1.0],
+                  steepDescendingTurnElements(-S.bankSteep),
+                  { startKind: "cruise3000",
+                    goalId: nextGoalId(), targetBearing: Math.PI }]);
+    lessons.push(["steep_descending_turn_right_180", DESIRE_DESCEND,
+                  [0.0, S.bankSteep, -1.0],
+                  steepDescendingTurnElements(S.bankSteep),
+                  { startKind: "cruise3000",
+                    goalId: nextGoalId(), targetBearing: Math.PI }]);
+
+    // --- STALL RECOVERY: from the standard 3000 ft / 80 mph start, the
+    // instructor stalls it (full-aft yoke) and recovers: push to the
+    // dive, climb back at 15°, level off at 3000 ft. The student repeats
+    // the WHOLE maneuver from the same start. The ENTRY is never taught.
     lessons.push(["stall_recovery", DESIRE_RECOVER, [0.0, 0.0, 1.0], [
       new StallEntryElement(),
       new StallWaitElement(),
@@ -1655,22 +1949,79 @@ export class FlightSchool {
       new PushElement(),
       new ClimbElement(S.stallAltM),
       new LevelOffElement(S.stallAltM, "3000 ft"),
-    ], { durationCap: 120.0, startKind: "cruise3000", repeatFrom: 3,
+    ], { startKind: "cruise3000",
          goalId: nextGoalId() }]);
 
-    // --- SPIN RECOVERY: the instructor spins it and hands over inside
-    // the developed rotation; the student recovers: opposite rudder to the
-    // stop, dive to 60 mph, climb at 15°, back to 3000 ft level. --------
+    // --- SPIN RECOVERY: from the standard 3000 ft / 80 mph start, the
+    // instructor spins it (LEFT) and recovers: opposite rudder to the
+    // stop, dive to 60 mph, climb at 15°, back to 3000 ft level. The
+    // student repeats the WHOLE maneuver from the same start. The ENTRY
+    // is never taught. The spin is LEFT. -------------------------------
     lessons.push(["spin_recovery", DESIRE_RECOVER, [0.0, 0.0, 1.0], [
       new StallEntryElement(),
       new StallWaitElement(),
-      new DropWingElement(),
-      new SpinElement(),
+      new DropWingElement(-1.0),
+      new SpinElement(-1.0),
       new OppositeRudderElement(),
       new DiveElement(),
       new ClimbElement(S.stallAltM),
       new LevelOffElement(S.stallAltM, "3000 ft"),
-    ], { durationCap: 140.0, startKind: "cruise3000", repeatFrom: 4,
+    ], { startKind: "cruise3000",
+         goalId: nextGoalId() }]);
+
+    // --- SPIN RECOVERY, RIGHT: the same recovery from a RIGHT spin —
+    // the wing drops right, the rotation is clockwise, and the rudder
+    // that stops it is the LEFT pedal. From the standard 3000 ft start;
+    // the student repeats the WHOLE maneuver from the same start; the
+    // ENTRY is never taught. ------------------------------------------
+    lessons.push(["spin_recovery_right", DESIRE_RECOVER, [0.0, 0.0, 1.0], [
+      new StallEntryElement(),
+      new StallWaitElement(),
+      new DropWingElement(1.0),
+      new SpinElement(1.0),
+      new OppositeRudderElement(),
+      new DiveElement(),
+      new ClimbElement(S.stallAltM),
+      new LevelOffElement(S.stallAltM, "3000 ft"),
+    ], { startKind: "cruise3000",
+         goalId: nextGoalId() }]);
+
+    // --- THE COMPREHENSIVE FLIGHT (the last lesson): one continuous
+    // chain, flown start to finish without a break — takeoff from the
+    // runway, the climb to 3000 ft, a left then a right 180° turn, a
+    // left then a right steep turn, a stall recovery, a LEFT spin
+    // recovery, and a RIGHT spin recovery. Every element is one already
+    // taught in its own lesson; the higher-level goal is flying the
+    // WHOLE flight in sequence. Everything after the climb happens at
+    // 3000 ft. ---------------------------------------------------------
+    const spinRecoveryLeg = (spinSign: number): FlightElement[] => [
+      new StallEntryElement(),
+      new StallWaitElement(),
+      new DropWingElement(spinSign),
+      new SpinElement(spinSign),
+      new OppositeRudderElement(),
+      new DiveElement(),
+      new ClimbElement(S.stallAltM),
+      new LevelOffElement(S.stallAltM, "3000 ft"),
+    ];
+    lessons.push(["comprehensive", DESIRE_CLIMB, [0.1, 0.0, 1.0], [
+      new RunwayRollElement(),
+      new RotateElement(),
+      new ClimbElement(S.stallAltM),
+      new LevelOffElement(S.stallAltM, "3000 ft"),
+      ...turnElements(-S.bankTurn),
+      ...turnElements(S.bankTurn),
+      ...steepElements(-S.bankSteep),
+      ...steepElements(S.bankSteep),
+      new StallEntryElement(),
+      new StallWaitElement(),
+      new StallBreakElement(),
+      new PushElement(),
+      new ClimbElement(S.stallAltM),
+      new LevelOffElement(S.stallAltM, "3000 ft"),
+      ...spinRecoveryLeg(-1.0),   // the LEFT spin recovery
+      ...spinRecoveryLeg(1.0),    // the RIGHT spin recovery
+    ], { startKind: "runway",
          goalId: nextGoalId() }]);
 
     for (const [name, desire, targets, phases, options] of lessons) {
@@ -1698,14 +2049,14 @@ export class FlightSchool {
    *
    * The stamp law mirrors how a real student learns from the instructor's
    * hands:
-   * - A control the instructor is MOVING stamps the movement (push/ease),
-   *   keyed at the actual control positions — so the student, whose own
-   *   surfaces pass the same bins, can chase it.
+   * - A control the instructor is MOVING stamps the LEVEL the lever is
+   *   passing through — so the student, whose own hand crosses the same
+   *   levels at the same speed, can chase it.
    * - A control the instructor is HOLDING AWAY from the cruise trim
-   *   stamps the held pressure: the student's stick springs toward trim,
-   *   so "hold" only means hold when the hand rests at the trim. A parked
-   *   climb pull or a held spin correction is taught as the continuous
-   *   push that keeps it there.
+   *   stamps the held level: the student's stick springs toward trim,
+   *   so "hold" only means hold when the hand re-commands the level. A
+   *   parked climb pull or a held spin correction is taught as the
+   *   level the lever is parked at.
    * - Only a genuinely hands-off reading (everything at trim) stamps the
    *   hold-all reflex.
    */
@@ -1720,44 +2071,64 @@ export class FlightSchool {
     }
     const sense = this.instruments.senseReading(body, positions,
                                                lesson.targetBearing);
-    let actions = FlightSchool.translateTargets(raw, positions);
-    if (!actions.some((a) => a !== HOLD)) {
-      actions = FlightSchool.heldPressures(positions);
+    let actions = FlightSchool.movingLevels(raw, positions);
+    if (!actions.some((a) => a !== ACTION_HOLD)) {
+      actions = FlightSchool.heldLevels(positions);
     }
-    policy.imprint(lesson.goalId, element.elementId, sense, actions,
-                   this.imprintAmount, options.timeEpoch ?? 0);
-    return { stamped: true };
+    const situation = policy.imprint(lesson.goalId, element.elementId, sense,
+                                     actions, options.context,
+                                     this.imprintAmount,
+                                     options.timeEpoch ?? 0);
+    // The goal tensor's state transition: what the plan advanced FROM,
+    // under the situation it advanced from (the previous decision).
+    if (options.prevDecision !== undefined
+        && options.prevDecision !== null
+        && options.prevDecision.elementId !== element.elementId) {
+      policy.stampTransition(lesson.goalId, options.prevDecision.elementId,
+                             options.prevDecision.situation, lesson.goalId,
+                             element.elementId, this.imprintAmount,
+                             options.timeEpoch ?? 0);
+    }
+    return { stamped: true, situation };
   }
 
-  /** What the instructor's resting hands teach: held pressures, or
-   *  hold-all only when every control rests at the cruise trim. */
-  private static heldPressures(positions: ArrayLike<number>): Int32Array {
-    const actions = new Int32Array(4).fill(HOLD);
+  /** What the instructor's resting hands teach: the HELD STOP of every
+   *  lever parked at a stop away from its trim's stop — the student's
+   *  own stick springs toward trim, so "hold" only means hold when the
+   *  hand re-commands the stop (a turn's back-pressure, a held spin
+   *  correction). A lever resting AT its trim's stop teaches nothing:
+   *  hands-off is the spring's own job. */
+  static heldLevels(positions: ArrayLike<number>): Int32Array {
+    const actions = new Int32Array(4).fill(ACTION_HOLD);
     let holding = false;
     for (let surface = 0; surface < 4; surface++) {
-      const parked = positions[surface];
-      const trim = TRIM_COMMAND[surface];
-      if (Math.abs(parked - trim) > 0.05) {
-        actions[surface] = parked > trim ? PUSH : EASE_OFF;
+      const parkedLevel = levelOf(surface, positions[surface]);
+      const trimLevel = levelOf(surface, TRIM_COMMAND[surface]);
+      if (parkedLevel !== trimLevel) {
+        actions[surface] = parkedLevel;
         holding = true;
       }
     }
     if (!holding) {
-      return new Int32Array(4).fill(HOLD);   // hold-all
+      return new Int32Array(4).fill(ACTION_HOLD);   // hold-all
     }
     return actions;
   }
 
-  /** Instructor deflections -> the student's push/ease/hold decisions. */
-  private static translateTargets(targets: Float64Array,
-                                  positions: ArrayLike<number>): Int32Array {
-    const actions = new Int32Array(4).fill(HOLD);
+  /** Instructor deflections -> the lever stops the hand is driving
+   *  TOWARD, in the command vocabulary itself: a lever is MOVING while
+   *  its destination reads at a different stop than the lever does —
+   *  the stamp is the DESTINATION stop (at motion onset the lever is
+   *  still back at the trim, and stamping "stay here" would teach the
+   *  student to park). The student drives toward the same stop at the
+   *  same hand speed and crosses the same panels on the way. */
+  static movingLevels(targets: Float64Array,
+                              positions: ArrayLike<number>): Int32Array {
+    const actions = new Int32Array(4).fill(ACTION_HOLD);
     for (let surface = 0; surface < 4; surface++) {
-      const delta = targets[surface] - positions[surface];
-      if (delta > 0.04) {
-        actions[surface] = PUSH;
-      } else if (delta < -0.04) {
-        actions[surface] = EASE_OFF;
+      const destination = levelOf(surface, targets[surface]);
+      if (destination !== levelOf(surface, positions[surface])) {
+        actions[surface] = destination;
       }
     }
     return actions;
@@ -1770,7 +2141,6 @@ export class FlightSchool {
    */
   private prepareLesson(lesson: Lesson): {
     phaseTicks: number[];
-    handoff: HandoffState | null;
   } {
     const cached = this.prepared.get(lesson.name);
     if (cached !== undefined) {
@@ -1778,59 +2148,23 @@ export class FlightSchool {
     }
     const flight = new DemoFlight(this, lesson, new ServoPolicy());
     const phaseTicks = lesson.phases.map(() => 0);
-    let handoff: HandoffState | null = null;
-    if (lesson.repeatFrom === 0) {
-      handoff = null;
-    }
     while (flight.step()) {
       if (flight.tick % DECISION_EVERY === 0) {
         const index = Math.min(flight.cursor.index, lesson.phases.length - 1);
         phaseTicks[index] += 1;
-        if (handoff === null && lesson.repeatFrom > 0
-            && index === lesson.repeatFrom) {
-          handoff = {
-            position: flight.body.position,
-            velocity: flight.body.velocity,
-            attitude: flight.body.attitude,
-            rateP: flight.body.rateP,
-            rateQ: flight.body.rateQ,
-            rateR: flight.body.rateR,
-            commands: Float64Array.from(flight.commands),
-            phaseIndex: lesson.repeatFrom,
-          };
-        }
       }
     }
-    const result = { phaseTicks, handoff };
+    const result = { phaseTicks };
     this.prepared.set(lesson.name, result);
     return result;
   }
 
-  /**
-   * The start of a student's repeat: null when it flies the maneuver from
-   * its spawn, or a fresh aircraft built from the instructor's handoff at
-   * repeatFrom ("your controls").
-   */
-  preparedStart(lesson: Lesson): FlightStart | null {
-    if (lesson.repeatFrom === 0) {
-      return null;
-    }
-    const { handoff } = this.prepareLesson(lesson);
-    if (handoff === null) {
-      // The demonstration never reached the handoff phase (a broken
-      // phase procedure): fall back to the lesson's spawn.
-      return null;
-    }
-    const body = new RigidBody(handoff.position, handoff.velocity);
-    body.attitude = handoff.attitude;
-    body.rateP = handoff.rateP;
-    body.rateQ = handoff.rateQ;
-    body.rateR = handoff.rateR;
-    return {
-      body,
-      phaseIndex: handoff.phaseIndex,
-      commands: Float64Array.from(handoff.commands),
-    };
+  /** The demonstration's length in seconds — the basis of the headless
+   *  exam caps (a repeat gets a fair multiple of the demo's own time). */
+  demoSeconds(lesson: Lesson): number {
+    const { phaseTicks } = this.prepareLesson(lesson);
+    const decisions = phaseTicks.reduce((sum, n) => sum + n, 0);
+    return decisions * DECISION_EVERY * this.dt;
   }
 
   /** The lesson's known goals with their phase weights, in curriculum order. */
@@ -1843,7 +2177,7 @@ export class FlightSchool {
     const goals: ManeuverGoal[] = [];
     const phaseIndices: number[] = [];
     const nominal: number[] = [];
-    for (let i = lesson.repeatFrom; i < lesson.phases.length; i++) {
+    for (let i = 0; i < lesson.phases.length; i++) {
       const phase = lesson.phases[i];
       if (phase.goals === undefined) {
         continue;
@@ -1873,8 +2207,12 @@ export class FlightSchool {
     lessons?: readonly string[];
     bar?: number;
     maxAttempts?: number;
+    examCap?: number | "auto";
   } = {}): TeachReport {
-    const session = new SchoolSession(this, policy, options);
+    // The headless fast path bounds the student's repeats (a lost student
+    // must not fly forever in a script); the live classroom has no cap.
+    const session = new SchoolSession(this, policy,
+                                      { ...options, examCap: options.examCap ?? "auto" });
     session.runToCompletion();
     this.graduate = session.graduate;
     return {
@@ -1943,7 +2281,10 @@ export class SchoolSession {
   readonly maxAttempts: number;
   /** The endless classroom flag (see the constructor options). */
   readonly loop: boolean;
-  private readonly names: readonly string[];
+  /** The headless repeats' time cap, seconds (undefined = none). */
+  private readonly examCap: number | "auto" | undefined;
+  /** The classroom's lesson order (the boot terminal's table rows). */
+  readonly names: readonly string[];
   /** Demonstration stamps absorbed per lesson. */
   readonly counts = new Map<string, number>();
   /** The student's latest goal score per lesson, 0-6. */
@@ -1980,6 +2321,12 @@ export class SchoolSession {
     bar?: number;
     maxAttempts?: number;
     loop?: boolean;
+    /** A time cap on the student's repeats, seconds — an explicit
+     *  opt-in for the HEADLESS tools only (teach, the freeze). The live
+     *  classroom has NO timeout: a flight lives until the scenario's
+     *  element chain is complete or the wheels touch the ground.
+     *  "auto" = a fair multiple of each lesson's own demo length. */
+    examCap?: number | "auto";
   } = {}) {
     this.school = school;
     this.policy = policy;
@@ -1989,6 +2336,7 @@ export class SchoolSession {
      *  `done` never comes. runToCompletion()/teach() must not be used
      *  with it — they would not end. */
     this.loop = options.loop ?? false;
+    this.examCap = options.examCap;
     this.names = options.lessons ?? [...school.lessons.keys()];
     for (const name of this.names) {
       if (!school.lessons.has(name)) {
@@ -2007,6 +2355,13 @@ export class SchoolSession {
   nextFlight(): SchoolFlight | null {
     this.absorbPending();
     return this.advance();
+  }
+
+  /** Absorb the pending flight's result NOW — the live show's
+   *  direct-selection mode grades a finished flight without handing out
+   * the next one. */
+  absorbFlight(): void {
+    this.absorbPending();
   }
 
   /** Run every remaining flight headlessly (the teach() fast path). */
@@ -2046,6 +2401,13 @@ export class SchoolSession {
   /** The lesson the next flight will be about (for narration before it starts). */
   get currentLessonName(): string | null {
     return this.stage === "done" ? null : this.names[this.index] ?? null;
+  }
+
+  /** The current lesson's headless exam cap (undefined = live, no cap). */
+  private examCapFor(lesson: Lesson): number | undefined {
+    return this.examCap === "auto"
+      ? this.school.demoSeconds(lesson) * 2.2 + 5.0
+      : this.examCap;
   }
 
   private absorbPending(): void {
@@ -2119,7 +2481,8 @@ export class SchoolSession {
                                       this.demoEpoch++),
                        lesson, "demo", attempt);
     }
-    return this.hand(new ExamFlight(this.school, lesson, this.policy, this.rng),
+    return this.hand(new ExamFlight(this.school, lesson, this.policy, this.rng,
+                                    this.examCapFor(lesson)),
                      lesson, "repeat", this.attempts.get(name)!);
   }
 

@@ -26,14 +26,15 @@
  * each filtered at the minor width).
  *
  * THE LANDSCAPE: the LandUse layer (src/app/land.ts) plans the world —
- * which squares are grass, which dry yellow, which rock, which forest —
- * and this texture paints it. Each biome owns its own base palette
- * pair (cloned up the pyramid with the same x1.12 brightening), the
- * FOREST and ROCK tiles carry a mottled detail overlay (the canopy and
- * scree texture) that fades out with the pixel footprint, the ROADS
- * are painted as asphalt strips along the map's grid lines, and the
- * runway is painted over everything with its markings, slab edges
- * box-filtered by coverage.
+ * a procedural 512x512 land-use texture (16 m texels, tiling every 8 km)
+ * that decides what each square IS: grass, dry, rock, forest, or WATER
+ * (lakes and rivers). Each biome owns its own base palette pair (cloned
+ * up the pyramid with the same x1.12 brightening), the FOREST and ROCK
+ * texels carry a mottled detail overlay (the canopy and scree texture)
+ * that fades out with the pixel footprint, the ROADS are painted as
+ * asphalt strips along the map's grid lines (ending at every shore),
+ * and the runway is painted over everything with its markings, slab
+ * edges box-filtered by coverage.
  *
  * Flat for now: the surface is the z = 0 plane, so the ray intersection
  * is analytic. The query surface — heightAt, intersectRay, sample — is
@@ -47,12 +48,13 @@ type RGB = readonly [number, number, number];
 
 /** The base checker pair per biome — SUBTLE contrasts around each biome's
  *  mean: the grassy green default, the dry yellow-brown, the grey rock,
- *  the deep forest. */
+ *  the deep forest, the lake water. */
 const PAIRS: Readonly<Record<Biome, readonly [RGB, RGB]>> = {
   [Biome.Grass]: [[58, 86, 42], [74, 106, 56]],
   [Biome.Dry]: [[68, 50, 32], [84, 62, 40]],
   [Biome.Rocky]: [[96, 96, 90], [112, 112, 104]],
   [Biome.Forest]: [[40, 66, 34], [52, 82, 42]],
+  [Biome.Water]: [[30, 62, 92], [42, 84, 122]],
 };
 
 /** The manual mip pyramid: 6 levels, each a copy of the base map,
@@ -135,6 +137,7 @@ const PYRAMIDS: Readonly<Record<Biome, readonly MipLevel[]>> = {
   [Biome.Dry]: pyramidFor(PAIRS[Biome.Dry][0], PAIRS[Biome.Dry][1]),
   [Biome.Rocky]: pyramidFor(PAIRS[Biome.Rocky][0], PAIRS[Biome.Rocky][1]),
   [Biome.Forest]: pyramidFor(PAIRS[Biome.Forest][0], PAIRS[Biome.Forest][1]),
+  [Biome.Water]: pyramidFor(PAIRS[Biome.Water][0], PAIRS[Biome.Water][1]),
 };
 
 /** The world's ground surface: flat today, a height field tomorrow. */
@@ -327,6 +330,9 @@ export class Ground {
     const cov = Math.max(covX, covY);
     if (cov <= 0.0) {
       return field;
+    }
+    if (this.land.biomeAt(u, v) === Biome.Water) {
+      return field;          // roads end at the shore — no asphalt on water
     }
     // the nearer road family: its length coordinate and lateral offset
     const alongX = covX >= covY;             // x-family roads run along y

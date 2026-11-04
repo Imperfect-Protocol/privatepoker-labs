@@ -90,11 +90,13 @@ export class Flock {
                 rate: number, fraction?: number): void {
     const share = fraction === undefined ? this.teachFraction : fraction;
     const pairs: Array<[PulseNeuron, PulseNeuron]> = [
-      [recipient.goalNeuron, donor.goalNeuron],
-      [recipient.flightNeuron, donor.flightNeuron],
-      [recipient.engineNeuron, donor.engineNeuron],
-      [recipient.controlsNeuron, donor.controlsNeuron],
-      [recipient.servoNeuron, donor.servoNeuron],
+      [recipient.locationTensor, donor.locationTensor],
+      [recipient.energyTensor, donor.energyTensor],
+      [recipient.flightTensor, donor.flightTensor],
+      [recipient.controlsTensor, donor.controlsTensor],
+      [recipient.skillTensor, donor.skillTensor],
+      [recipient.goalTensor, donor.goalTensor],
+      [recipient.servoTensor, donor.servoTensor],
     ];
     for (const [recipientNeuron, donorNeuron] of pairs) {
       // Insertion order, like the Python dict.

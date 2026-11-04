@@ -162,6 +162,27 @@ export class PulseNeuron {
   }
 
   /**
+   * IMPOSE a prior: raise the freshest layer to AT LEAST `value` —
+   * a floor, never a ceiling, so a cell training itself above the
+   * prior keeps its training — and refresh the epoch (a prior nobody
+   * re-fires must not die to the forgetting law). Idempotent: the
+   * same prior imposed twice leaves the same weight.
+   */
+  impose(key: readonly number[], value: number, epoch: number): void {
+    const index = this.keyIndex(key);
+    let layers = this.values.get(index);
+    if (layers === undefined) {
+      layers = new Float32Array(NEURON_LAYERS + 1).fill(this.baseline);
+      this.values.set(index, layers);
+      this.epochs.set(index, new Int32Array(NEURON_LAYERS + 1).fill(-1));
+    }
+    if (layers[0] < value) {
+      layers[0] = Math.min(this.maxWeight, Math.max(this.minWeight, value));
+    }
+    this.epochs.get(index)![0] = Math.trunc(epoch);
+  }
+
+  /**
    * The EMA-mixed recall: the freshest layer counts fully, older layers
    * by ema^depth — the time-decay dimension of the tensor — and the
    * static tail store counts in full, because it already carries its
@@ -221,6 +242,32 @@ export class PulseNeuron {
   }
 
   private readonly axisShapes: number[] = [];
+
+  /**
+   * THE FORGETTING LAW: drop every key nobody has re-fired within the
+   * span — the endless classroom's memory bound. Nothing else ever
+   * shrinks the sparse map (untouched keys keep their values
+   * forever), and the school deals cycle after cycle forever, so the
+   * keys that no lesson re-uses must eventually die. Returns how many
+   * died.
+   */
+  prune(beforeEpoch: number): number {
+    let removed = 0;
+    for (const [index, layerEpochs] of this.epochs) {
+      let newest = -1;
+      for (let layer = 0; layer < layerEpochs.length; layer++) {
+        if (layerEpochs[layer] > newest) {
+          newest = layerEpochs[layer];
+        }
+      }
+      if (newest < beforeEpoch) {
+        this.values.delete(index);
+        this.epochs.delete(index);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
 
   snapshot(): { values: Map<number, Float32Array>; epochs: Map<number, Int32Array> } {
     const values = new Map<number, Float32Array>();

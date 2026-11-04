@@ -34,9 +34,12 @@ import {
 } from "./cockpit.js";
 import { FlightSchoolShow } from "./school-show.js";
 import { WavesShow } from "./waves-show.js";
+import { BootTrainer } from "./boot-train.js";
 import { FlightSchool } from "../learning/school.js";
 import { FlightInstruments } from "../learning/instruments.js";
 import { TRIM_SPEED } from "../learning/flight.js";
+import { drawBrainView, tensorCounts } from "./boot-brain.js";
+import { ServoPolicy } from "../learning/servo-tensor.js";
 import type { Scene, SceneAircraft } from "./scene.js";
 
 interface GoldenLesson {
@@ -69,6 +72,12 @@ const els = {
   cockpitFoot: document.getElementById("cockpit-foot")!,
   cockpitCanvas: document.getElementById("cockpitCanvas") as HTMLCanvasElement,
   controlsCanvas: document.getElementById("controlsCanvas") as HTMLCanvasElement,
+  boot: document.getElementById("boot") as HTMLElement,
+  bootFill: document.getElementById("bootFill") as HTMLElement,
+  bootLog: document.getElementById("bootLog") as HTMLElement,
+  bootBrain: document.getElementById("bootBrain") as HTMLCanvasElement,
+  bootExpand: document.getElementById("bootExpand") as HTMLButtonElement,
+  bootDone: document.getElementById("bootDone") as HTMLButtonElement,
 };
 
 /** The scenario ids: every lesson name, then the drone attack waves. */
@@ -79,6 +88,9 @@ const state = {
   school: null as FlightSchoolShow | null,
   /** The drone attack waves (or null). */
   waves: null as WavesShow | null,
+  /** The boot-trained brain — transplanted into the student and every
+   *  newborn drone. */
+  brain: null as ServoPolicy | null,
   /** Which scenario is running. */
   scenario: "" as string,
   /** The frozen classroom reference (per-maneuver golden scores). */
@@ -154,7 +166,7 @@ function layoutSidebar(): void {
   // comes off the panels' budget, whatever the markup grows into.
   const panels = [els.cockpitCanvas, els.controlsCanvas];
   const others = [...aside.children].filter(
-    (child) => !(child instanceof HTMLCanvasElement));
+    (child): child is HTMLElement => !(child instanceof HTMLCanvasElement));
   const used = others.reduce((sum, child) => sum + child.offsetHeight, 0.0);
   const gaps = gap * (others.length + panels.length - 1);
   const avail = aside.clientHeight - padY;
@@ -404,15 +416,19 @@ function renderNarration(): void {
   els.narration.textContent = moment.narration;
   els.narration.className = `narration stage-${moment.stage}`;
   const attempt = moment.attempt > 1 ? ` \u00b7 attempt ${moment.attempt}` : "";
-  const score = school.session.scores.get(moment.lessonName);
-  const scoreText = score === undefined ? "" : ` \u00b7 last repeat ${score.toFixed(2)}/6`;
-  const lapText = school.session.laps > 0 ? ` \u00b7 lap ${school.session.laps + 1}` : "";
+  const score = school.scores.get(moment.lessonName);
+  const scoreText = score === undefined ? "" : ` \u00b7 last flight ${score.toFixed(2)}/6`;
   const intent = ` \u00b7 goal: ${moment.goalName} \u00b7 element: ${moment.elementName}`;
+  const finishedText = moment.finished ? " \u00b7 flight finished" : "";
+  const whoText = moment.bothFlying
+    ? "both flying \u2014 student 10 s behind"
+    : moment.stage === "demo"
+      ? `student launches in ${moment.countdown.toFixed(0)} s`
+      : "student at the controls";
   els.status.textContent =
     `maneuver ${moment.lessonIndex}/${moment.lessonCount} \u00b7 ${moment.lessonName}` +
-    `${attempt}${scoreText}${lapText}${intent} \u00b7 t ${moment.seconds.toFixed(1)}s \u00b7 ` +
-    `${moment.stage === "demo" ? "instructor at the controls"
-      : "student at the controls"}`;
+    `${attempt}${scoreText}${intent}${finishedText} \u00b7 t ${moment.seconds.toFixed(1)}s \u00b7 ` +
+    whoText;
   els.results.hidden = false;
   refreshSchoolTable();
 }
@@ -424,7 +440,7 @@ function refreshSchoolTable(): void {
   }
   const moment = school.moment;
   const key = `${moment.lessonIndex}|${moment.lessonName}|` +
-    `${moment.attempt}|${school.session.scores.size}|${school.session.goalReports.size}`;
+    `${moment.attempt}|${school.scores.size}|${school.goalReports.size}`;
   if (key === state.reportKey) {
     return;
   }
@@ -521,7 +537,9 @@ function frame(ts: number): void {
 // --- scenario plumbing ----------------------------------------------------------------
 
 /** Switch the running scenario. The classroom's ONE student and the
- *  waves each keep living across switches — resuming is not restarting. */
+ *  waves each keep living across switches — resuming is not restarting.
+ *  The chosen maneuver begins: the instructor demonstrates and the
+ *  student launches 10 s behind it. */
 function setScenario(id: string): void {
   state.scenario = id;
   els.scenario.value = id;
@@ -530,28 +548,58 @@ function setScenario(id: string): void {
   state.camera.tracking = true;   // a fresh world: the view follows the action
   if (id === WAVES_SCENARIO) {
     if (state.waves === null && state.seed !== null) {
-      state.waves = new WavesShow(state.seed);
-    }
-  } else if (state.school === null) {
-    state.school = FlightSchoolShow.withFreshPolicy();
-    if (state.school.lessonNames[0] !== id) {
-      state.school.switchToManeuver(id);   // a fresh student, into the chosen lesson
+      state.waves = new WavesShow(state.seed, state.brain ?? undefined);
     }
   } else {
-    state.school.switchToManeuver(id);     // the SAME student, into the chosen lesson
+    state.school?.switchToManeuver(id);     // the SAME student, into the chosen lesson
   }
   state.acc = 0.0;
   state.playing = true;
   els.play.textContent = "\u23f8 pause";
 }
 
-/** The restart button: the one sanctioned fresh start of everything. */
+/** The developer's fast path: ?boot=skip — no offline pre-learning,
+ *  a fresh untrained brain, straight into the live world (the classroom's
+ *  student and every newborn drone fly on beginner's luck). */
+const BOOT_SKIP =
+  new URLSearchParams(location.search).get("boot") === "skip";
+
+/** Skip mode's world: a new classroom around a beginner's brain — the
+ *  same world shape bootTraining lands, minus the training. */
+function startUntrainedWorld(): void {
+  const curriculum = new FlightSchool(new FlightInstruments(TRIM_SPEED));
+  state.brain = null;
+  state.golden = [];
+  state.school = new FlightSchoolShow(curriculum, new ServoPolicy());
+  populateScenarioDropdown([...curriculum.lessons.keys()]);
+  els.boot.classList.add("hidden");
+  setScenario(els.scenario.value || "takeoff");
+  if (!frameRunning) {
+    frameRunning = true;
+    requestAnimationFrame((ts) => {
+      lastTs = ts;
+      requestAnimationFrame(frame);
+    });
+  }
+}
+
+/** The restart button: the one sanctioned fresh start of everything —
+ *  the old student dies, the boot pre-learning runs again, and a new
+ *  trained student is born (skip mode: just a fresh untrained world). */
 function restart(): void {
   state.school = null;
   state.waves = null;
+  state.brain = null;
   state.pinned = false;
   state.reportKey = "";
-  setScenario(els.scenario.value);
+  if (BOOT_SKIP) {
+    startUntrainedWorld();
+    return;
+  }
+  els.boot.classList.remove("hidden");
+  bootTraining().catch((error) => {
+    els.status.textContent = `boot failed: ${error}`;
+  });
 }
 
 function populateScenarioDropdown(lessons: readonly string[]): void {
@@ -667,23 +715,97 @@ async function fetchJson(url: string): Promise<any> {
   return response.json();
 }
 
+/** The boot terminal's lesson table — one row per lesson, live:
+ *  attempts, the EMA score, and the pass mark. Rendered after each chunk. */
+function renderBootTable(rows: ReadonlyArray<{
+  lesson: string; attempts: number; score: number | null;
+  status: "training" | "done";
+}>): void {
+  const width = 26;
+  const lines = rows.map((row) => {
+    const name = row.lesson.padEnd(width).slice(0, width - 1);
+    const score = row.score === null ? "     \u2013"
+      : `${row.score.toFixed(2)}`.padStart(5) + "/6";
+    const mark = row.status === "done" ? " done" : " \u00b7\u00b7\u00b7";
+    return `${name}${String(row.attempts).padStart(2)}  ${score} ${mark}`;
+  });
+  els.bootLog.textContent =
+    ["lesson".padEnd(width) + "demo   ema",
+     "-".repeat(width + 17), ...lines].join("\n");
+  // shrunk mode: keep the LAST line in view — the table scrolls to the
+  // bottom (where the classroom currently is)
+  if (!els.bootExpand.closest(".boot-dialog")?.classList.contains("expanded")) {
+    els.bootLog.scrollTop = els.bootLog.scrollHeight;
+  }
+}
+
+/** The boot dialog's expand button: the terminal grows to the full
+ *  dialog, replacing the cubes; pressing it again brings them back. */
+els.bootExpand.addEventListener("click", () => {
+  const dialog = els.bootExpand.closest(".boot-dialog")!;
+  const expanded = dialog.classList.toggle("expanded");
+  els.bootExpand.textContent = expanded ? "\u29c9" : "\u29ca";
+});
+
+let frameRunning = false;
+
+/**
+ * THE OFFLINE PRE-LEARNING: the flight school trains the tensors before
+ * the main scene ever appears — the boot dialog's terminal streams the
+ * training and the bar fills left to right. When the classroom
+ * completes, the dialog vanishes and the TRAINED BRAIN is transplanted
+ * into the live world: the classroom's student AND every newborn drone.
+ */
+async function bootTraining(): Promise<void> {
+  els.bootLog.textContent = "skynerd genesis \u2014 offline pre-learning\n";
+  els.bootFill.style.width = "0%";
+  const trainer = new BootTrainer();
+  // THE DONE BUTTON: the classroom is ENDLESS — once every lesson has
+  // had its repetitions the schedule deals another cycle and keeps
+  // sharpening the tensors. Only the person's press stops it; the
+  // graduate is whatever the brain has become by then.
+  els.bootDone.disabled = false;
+  els.bootDone.onclick = () => { trainer.finishNow(); };
+  let done = false;
+  const t0 = performance.now();
+  while (!done) {
+    // Chunked: the browser keeps painting the dialog between chunks —
+    // the cubes rotate and the synapses pulse while the tensors fill.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const progress = trainer.runChunk(14.0);
+    renderBootTable(progress.rows);
+    els.bootFill.style.width = `${(progress.fraction * 100.0).toFixed(1)}%`;
+    drawBrainView(els.bootBrain, (performance.now() - t0) / 1000.0,
+                  tensorCounts(trainer.policy));
+    done = progress.done;
+  }
+  // THE BRAIN TRANSPLANT: separate copies of the trained tensors for the
+  // classroom's student and for the swarm's newborns.
+  state.brain = trainer.graduate;
+  state.golden = trainer.golden();
+  state.school = new FlightSchoolShow(trainer.school, trainer.graduate);
+  populateScenarioDropdown([...trainer.school.lessons.keys()]);
+  els.boot.classList.add("hidden");
+  setScenario(els.scenario.value || "takeoff");
+  if (!frameRunning) {
+    frameRunning = true;
+    requestAnimationFrame((ts) => {
+      lastTs = ts;
+      requestAnimationFrame(frame);
+    });
+  }
+}
+
 async function boot(): Promise<void> {
-  const [rngRef, c172] = await Promise.all([
-    fetchJson("/reference/rng-ref.json"),
-    fetchJson("/reference/c172-frozen.json").catch(() => null),
-  ]);
+  const rngRef = await fetchJson("/reference/rng-ref.json");
   // The waves' master dice: the reference seed stream (seed 42).
   const seed42 = rngRef.seeds.find((s: { seed: number }) => s.seed === 42);
   state.seed = seed42 ?? rngRef.seeds[0];
-  // The frozen classroom reference (per-maneuver golden scores) — the
-  // report card compares the LIVE student against it as it learns.
-  state.golden = c172?.lessons ?? [];
-  const curriculum = new FlightSchool(new FlightInstruments(TRIM_SPEED));
-  populateScenarioDropdown([...curriculum.lessons.keys()]);
-  setScenario("takeoff");  requestAnimationFrame((ts) => {
-    lastTs = ts;
-    requestAnimationFrame(frame);
-  });
+  if (BOOT_SKIP) {
+    startUntrainedWorld();
+    return;
+  }
+  await bootTraining();
 }
 
 boot().catch((error) => {

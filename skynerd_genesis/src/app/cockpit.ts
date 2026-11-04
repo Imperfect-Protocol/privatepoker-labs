@@ -2,8 +2,9 @@
  * The cockpit view: the selected drone's own instruments and controls.
  * Pure rendering from a DroneView snapshot — the app builds a view per
  * frame (live sim state or playback sample) and this module draws it: a
- * 3D world (sky, textured ground plane, runway with markings and a control
- * tower) filling the whole square under an MFD-style HUD — HDG tape on
+ * 3D world (a gradient sky with the sun, its glare and drifting clouds;
+ * textured ground plane; runway with markings and a control tower)
+ * filling the whole square under an MFD-style HUD — HDG tape on
  * top, ASI tape on the left edge, ALT tape on the right edge with the VSI
  * segment beside it — plus the controls square (yoke, rudder pedals,
  * throttle can with green-to-red bars and the RPM readout). Over the world
@@ -28,8 +29,9 @@
  */
 import { mphOf, vsHundredsOf, altFtOf, rpmOf } from "./units.js";
 import { Ground } from "./ground.js";
-import { Flora, type TreeSpot, type HouseSpot } from "./land.js";
+import { Flora, hash01, type TreeSpot, type HouseSpot, type CloudSpot } from "./land.js";
 import type { SceneAircraft } from "./scene.js";
+import { levelOf } from "../learning/instruments.js";
 
 /** One aircraft's instantaneous reading, for the cockpit and controls. */
 export interface DroneView {
@@ -50,15 +52,17 @@ export interface DroneView {
   rud: number;
   alive: boolean;
   /**
-   * THE HAND'S INPUTS — what the pilot (instructor or student) is
-   * commanding, as distinct from what the airframe's surfaces are doing:
-   *  - handCommands: the 4 raw commanded targets;
-   *  - handChoices: the student's last per-channel decision, PUSH (+1),
-   *    ease (−1), hold (0) per channel — null while the instructor's
-   *    hand eases (no decisions happen);
+   * THE PILOT'S DECISIONS — the overlay on top of the machine's state:
+   *  - handChoices: the student's last per-channel decision, the
+   *    commanded lever LEVEL (a stop, or -1 for hold) — null while the
+   *    instructor's hand eases (no decisions happen);
    *  - handFresh: a decision window just opened — the 5 Hz brain beat.
+   *
+   * The CONTROLS themselves (yoke, pedals, throttle, the surfaces) are
+   * the machine's own state: ail / elev / rud / throttle below, read
+   * through the aircraft's sealed getters — what the selected aircraft
+   * is actually holding, not what a hand asked for.
    */
-  handCommands: readonly number[];
   handChoices: readonly number[] | null;
   handFresh: boolean;
 }
@@ -73,16 +77,17 @@ export function droneViewOf(entry: SceneAircraft): DroneView {
   const body = machine.body;
   const [fwdX, fwdY] = machine.forward;
   const choices = entry.hand.choices;
-  const hand = machine.handCommands;
   return {
     x: body.position.x, y: body.position.y, z: body.position.z,
     fwdX, fwdY,
     pitch: machine.pitch, bank: machine.bank,
     speed: machine.asi, vs: machine.vsi,
     velX: body.velocity.x, velY: body.velocity.y,
-    throttle: hand[3],
+    // The state of controls — the machine's own, via its sealed
+    // getters: the yoke, the pedals, and the throttle lever as the
+    // selected aircraft actually holds them.
+    throttle: machine.throttle,
     ail: machine.aileron, elev: machine.elevator, rud: machine.rudder,
-    handCommands: [hand[0], hand[1], hand[2], hand[3]],
     handChoices: choices === null
       ? null : [choices[0], choices[1], choices[2], choices[3]],
     handFresh: entry.hand.fresh,
@@ -91,7 +96,22 @@ export function droneViewOf(entry: SceneAircraft): DroneView {
 }
 
 const FOV_H = (90 * Math.PI) / 180; // the windshield's horizontal field of view
-const SKY: readonly [number, number, number] = [36, 51, 86];  // #243356
+/** The sky's gradient: pale haze at the horizon, deep blue overhead —
+ *  and the ground's far haze fades INTO the same fog colour, so earth
+ *  and sky melt together far away instead of meeting at a line. */
+const SKY_ZENITH: readonly [number, number, number] = [30, 46, 84];
+const SKY_FOG: readonly [number, number, number] = [184, 200, 214];
+const SKY_GRAD_SIN = 0.35;         // sin(elevation) where the sky is fully zenith
+/** The sun's fixed world direction — the same light the shadows obey
+ *  (they fall toward +x/+y): azimuth ~200°, elevation ~20°. */
+const SUN_DIR: readonly [number, number, number] = (() => {
+  const v = [-0.88, -0.32, 0.35];
+  const l = Math.hypot(v[0], v[1], v[2]);
+  return [v[0] / l, v[1] / l, v[2] / l];
+})();
+const SUN_ANG = 0.035;             // the disc's angular radius, rad (~2°)
+const SUN_GLOW = 9.0;              // the glow's radius, in discs
+const GLARE_STRENGTH = 0.42;       // the veil's peak alpha, facing the sun
 const WORLD_SCALE = 1;               // the world renders at full resolution
 
 function fitCanvas(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
@@ -266,6 +286,7 @@ function drawWorld(ctx: CanvasRenderingContext2D, cam: Camera): void {
   // Ground sample mips/trilinear-filters/aniso-taps the checker over it.
   for (let py = 0; py < h; py++) {
     const row = py * w;
+    const b = (cam.cy - (py + 0.5) * step) / cam.f;   // the ray's up component
     for (let px = 0; px < w; px++) {
       const i = row + px;
       let r: number;
@@ -300,13 +321,19 @@ function drawWorld(ctx: CanvasRenderingContext2D, cam: Camera): void {
                                 stepYU, stepYV, hitT[i],
                                 cam.pz - ground.heightAt(cam.px, cam.py));
         const mix = Math.min(1.0, Math.max(0.0, (hitT[i] - hazeFrom) / hazeSpan));
-        r = c[0] + (SKY[0] - c[0]) * mix;
-        g = c[1] + (SKY[1] - c[1]) * mix;
-        bl = c[2] + (SKY[2] - c[2]) * mix;
+        r = c[0] + (SKY_FOG[0] - c[0]) * mix;
+        g = c[1] + (SKY_FOG[1] - c[1]) * mix;
+        bl = c[2] + (SKY_FOG[2] - c[2]) * mix;
       } else {
-        r = SKY[0];
-        g = SKY[1];
-        bl = SKY[2];
+        // the sky's gradient: fog at the horizon, deepening with elevation
+        const sx = (px + 0.5) * step;
+        const a = (sx - cam.cx) / cam.f;
+        const invL = 1.0 / Math.sqrt(1.0 + a * a + b * b);
+        const dz = (cam.fz + a * cam.rz + b * cam.uz) * invL;
+        const t = Math.min(1.0, Math.max(0.0, dz / SKY_GRAD_SIN));
+        r = SKY_FOG[0] + (SKY_ZENITH[0] - SKY_FOG[0]) * t;
+        g = SKY_FOG[1] + (SKY_ZENITH[1] - SKY_FOG[1]) * t;
+        bl = SKY_FOG[2] + (SKY_ZENITH[2] - SKY_FOG[2]) * t;
       }
       const o = i * 4;
       data[o] = r;
@@ -404,7 +431,13 @@ function pushTree(objects: WorldObject[], cam: Camera, t: TreeSpot): void {
   if (cr < 0.8) {
     return;                                  // sub-pixel: the texture carries
   }
-  const pT = projectPoint(cam, t.x, t.y, t.h)!;   // same depth as the base
+  // The top can clip behind the near plane while the base does not when
+  // the camera is pitched hard (the stall-recovery dive): the projection
+  // returns null and the tree is simply not drawn.
+  const pT = projectPoint(cam, t.x, t.y, t.h);
+  if (pT === null) {
+    return;
+  }
   const mX = 40.0 + cr * 2.0;
   if (Math.min(pB[0], pT[0]) < -mX || Math.max(pB[0], pT[0]) > cam.W + mX
       || Math.min(pB[1], pT[1]) < -mX || Math.max(pB[1], pT[1]) > cam.H + mX) {
@@ -539,6 +572,119 @@ function pushHouse(objects: WorldObject[], cam: Camera, h: HouseSpot): void {
 /** Collect and draw the landscape's objects: the tower, the trees within
  *  700 m, the hamlet houses within 2.5 km — shadows first (ground
  *  decals), then far to near. */
+/** The sun's screen position when it stands in front of the camera,
+ *  else null. */
+function sunScreen(cam: Camera): [number, number] | null {
+  return projectDir(cam, SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]);
+}
+
+/** How directly the camera faces the sun, 0 (away) to 1 (dead ahead). */
+function sunAlign(cam: Camera): number {
+  return Math.max(0.0, cam.fx * SUN_DIR[0] + cam.fy * SUN_DIR[1]
+                           + cam.fz * SUN_DIR[2]);
+}
+
+/** The sun: a hot disc with a soft additive glow, at its fixed world
+ *  direction — behind the clouds and the landscape's objects. */
+function drawSun(ctx: CanvasRenderingContext2D, cam: Camera): void {
+  const at = sunScreen(cam);
+  if (at === null) {
+    return;                                // the sun is behind us
+  }
+  const [sx, sy] = at;
+  const disc = cam.f * Math.tan(SUN_ANG);
+  const glow = disc * SUN_GLOW;
+  const grad = ctx.createRadialGradient(sx, sy, disc, sx, sy, glow);
+  grad.addColorStop(0.0, "rgba(255,250,225,0.55)");
+  grad.addColorStop(0.3, "rgba(255,244,205,0.24)");
+  grad.addColorStop(1.0, "rgba(255,240,200,0)");
+  ctx.globalCompositeOperation = "lighter";
+  ctx.fillStyle = grad;
+  ctx.fillRect(sx - glow, sy - glow, glow * 2.0, glow * 2.0);
+  ctx.fillStyle = "rgba(255,253,242,0.97)";  // the disc itself
+  ctx.beginPath();
+  ctx.arc(sx, sy, disc, 0.0, 2.0 * Math.PI);
+  ctx.fill();
+  ctx.globalCompositeOperation = "source-over";
+}
+
+/** The sun's glare: a wide soft veil over the whole scene, blooming as
+ *  the camera swings toward the sun — the lens flare of the eye. */
+function drawSunGlare(ctx: CanvasRenderingContext2D, cam: Camera): void {
+  const at = sunScreen(cam);
+  if (at === null) {
+    return;
+  }
+  const align = sunAlign(cam);
+  if (align <= 0.05) {
+    return;                                // facing away: no glare
+  }
+  const a = GLARE_STRENGTH * align ** 3;
+  const [sx, sy] = at;
+  const R = Math.hypot(cam.W, cam.H);
+  const grad = ctx.createRadialGradient(sx, sy, 0.0, sx, sy, R);
+  grad.addColorStop(0.0, `rgba(255,246,220,${a.toFixed(3)})`);
+  grad.addColorStop(0.35, `rgba(255,246,220,${(a * 0.45).toFixed(3)})`);
+  grad.addColorStop(1.0, "rgba(255,246,220,0)");
+  ctx.globalCompositeOperation = "lighter";
+  ctx.fillStyle = grad;
+  ctx.fillRect(0.0, 0.0, cam.W, cam.H);
+  ctx.globalCompositeOperation = "source-over";
+}
+
+/** One cloud: a cluster of soft puffs at its fixed world spot, its flat
+ *  grey base shaded — 80% TRANSPARENT (a faint veil, not a whiteout) and
+ *  three times the cluster radius, drawn behind anything nearer. */
+function pushCloud(objects: WorldObject[], cam: Camera, c: CloudSpot): void {
+  const dist = Math.hypot(c.x - cam.px, c.y - cam.py, c.alt - cam.pz);
+  const cr = (c.r * cam.f) / dist;          // the cluster's projected radius
+  if (cr < 2.0) {
+    return;                                  // sub-pixel fluff
+  }
+  const p = projectPoint(cam, c.x, c.y, c.alt);
+  if (p === null) {
+    return;
+  }
+  if (p[0] < -cr * 3.0 || p[0] > cam.W + cr * 3.0
+      || p[1] < -cr * 3.0 || p[1] > cam.H + cr * 3.0) {
+    return;                                  // off the windshield
+  }
+  const fade = Math.max(0.0, 1.0 - dist / 16000.0);   // melts into the haze
+  if (fade <= 0.02) {
+    return;
+  }
+  objects.push({
+    depth: dist,
+    draw: (ctx) => {
+      // the puff layout: along the wind axis, deterministic per cloud
+      const wind = hash01(c.seedX, c.seedY, 41) * Math.PI;
+      const ax = Math.cos(wind);
+      const ay = Math.sin(wind);
+      for (let k = 0; k < 4; k++) {
+        const off = (k - 1.5) * 0.42;                 // along the wind
+        const jitterY = (hash01(c.seedX + k, c.seedY, 42) - 0.5) * 0.5;
+        const jitterR = 0.45 + 0.20 * hash01(c.seedX, c.seedY + k, 43);
+        const bx = p[0] + ax * off * cr;
+        const by = p[1] + ay * off * cr * 0.4 + jitterY * cr * 0.3;
+        const br = cr * jitterR;
+        const grad = ctx.createRadialGradient(bx, by - br * 0.15, 0.0,
+                                              bx, by, br);
+        grad.addColorStop(0.0, `rgba(250,252,255,${(0.15 * fade).toFixed(3)})`);
+        grad.addColorStop(1.0, "rgba(250,252,255,0)");
+        ctx.fillStyle = grad;
+        ctx.fillRect(bx - br, by - br, br * 2.0, br * 2.0);
+      }
+      // the flat grey base — the cloud's own shadow on itself
+      const grad = ctx.createRadialGradient(p[0], p[1] + cr * 0.22, 0.0,
+                                            p[0], p[1] + cr * 0.22, cr * 0.9);
+      grad.addColorStop(0.0, `rgba(198,210,224,${(0.06 * fade).toFixed(3)})`);
+      grad.addColorStop(1.0, "rgba(198,210,224,0)");
+      ctx.fillStyle = grad;
+      ctx.fillRect(p[0] - cr, p[1] - cr * 0.7, cr * 2.0, cr * 1.8);
+    },
+  });
+}
+
 function drawWorldObjects(ctx: CanvasRenderingContext2D, cam: Camera): void {
   const objects: WorldObject[] = [];
   pushTower(objects, cam);
@@ -553,6 +699,12 @@ function drawWorldObjects(ctx: CanvasRenderingContext2D, cam: Camera): void {
                    cam.px + 2500.0, cam.py + 2500.0, houses);
   for (const h of houses) {
     pushHouse(objects, cam, h);
+  }
+  const clouds: CloudSpot[] = [];
+  flora.cloudsNear(cam.px - 8000.0, cam.py - 8000.0,
+                   cam.px + 8000.0, cam.py + 8000.0, clouds);
+  for (const c of clouds) {
+    pushCloud(objects, cam, c);
   }
   for (const o of objects) {
     if (o.shadow !== undefined) {
@@ -781,6 +933,8 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
   // the windshield: the 3D world fills the WHOLE square — sky above the
   // horizon, the ground's textured squares below, one ray per pixel
   drawWorld(ctx, cam);
+  // the sun: a hot disc with its glow, at its fixed world direction
+  drawSun(ctx, cam);
 
   // world overlays, projected through the same camera
   ctx.save();
@@ -802,22 +956,9 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
     }
     return [pl[0], pl[1], pr[0], pr[1]];
   };
-  // the horizon line, extended across the viewport
-  const hz = horizon(0.0, 0.6);
-  if (hz !== null) {
-    const ex = hz[2] - hz[0];
-    const ey = hz[3] - hz[1];
-    const el = Math.hypot(ex, ey);
-    if (el > 1e-6) {
-      const k = Math.hypot(W, H) / el;
-      ctx.strokeStyle = "#f2f5fa";
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(hz[0] - ex * k, hz[1] - ey * k);
-      ctx.lineTo(hz[0] + ex * k, hz[1] + ey * k);
-      ctx.stroke();
-    }
-  }
+  // no horizon line is drawn: the ground's far haze and the sky's fog
+  // band are the SAME pale colour, so the world melts at the horizon —
+  // the pitch ladder below is the attitude reference
   // pitch ladder: the world's elevation rungs, at ±10° and ±20°
   ctx.strokeStyle = "rgba(226,232,244,0.55)";
   ctx.fillStyle = "rgba(226,232,244,0.75)";
@@ -847,8 +988,10 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
     ctx.stroke();
     ctx.fillText(String(d), midX + ux * (half + 4), midY + uy * (half + 4) + 3);
   }
-  // the landscape's objects: tower, trees, houses, depth-sorted
+  // the landscape's objects: tower, trees, houses, clouds, depth-sorted
   drawWorldObjects(ctx, cam);
+  // the sun's glare: a soft veil over the whole scene when facing it
+  drawSunGlare(ctx, cam);
   // traffic: other drones in the forward view
   ctx.font = "8px ui-monospace, monospace";
   for (const other of others) {
@@ -984,10 +1127,12 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   // THE HAND'S INPUTS drive this panel — what the pilot at the controls
   // is commanding right now (the student's own inputs while it flies),
   // not merely where the airframe's surfaces happen to be.
-  const inAil = s.handCommands[0];
-  const inElev = s.handCommands[1];
-  const inRud = s.handCommands[2];
-  const inThr = Math.max(0.0, Math.min(1.0, s.handCommands[3]));
+  // The controls as the SELECTED AIRCRAFT actually holds them — the
+  // machine's own state, read through its sealed getters.
+  const inAil = s.ail;
+  const inElev = s.elev;
+  const inRud = s.rud;
+  const inThr = Math.max(0.0, Math.min(1.0, s.throttle));
 
   // THE LAYOUT: the AERT decision strip sits NORTH of the yoke — dead
   // above it, on the yoke's own column — with the rudder below and the
@@ -1006,9 +1151,10 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   // --- AERT decisions (directly above the yoke) -----------------------------
   // The four control channels and the pilot's decision on each, at every
   // 0.2 s decision window: A aileron, E elevator, R rudder, T throttle —
-  // ▲ push (+0.05), ▼ ease (−0.05), · hold. The beat dot pulses when a
-  // decision window just opened. While the instructor demonstrates there
-  // are no discrete decisions — its hand eases smoothly — the strip rests.
+  // ▲ driving the lever up a level, ▼ down a level, · hold. The beat dot
+  // pulses when a decision window just opened. While the instructor
+  // demonstrates there are no discrete decisions — its hand eases
+  // smoothly — the strip rests.
   ctx.fillStyle = "#5b6878";
   ctx.fillText("AERT DECISIONS", yx - 52, 18);
   ctx.fillStyle = s.handFresh ? "#ff8c3a" : "#2a3242";
@@ -1028,15 +1174,23 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
       ctx.fillText("\u2014", bx + 8, 40);
       continue;
     }
-    if (choice[i] === 2) {                   // PUSH
-      ctx.fillStyle = "#ff8c3a";
-      ctx.fillText("\u25b2", bx + 7, 40);
-    } else if (choice[i] === 0) {            // ease
-      ctx.fillStyle = "#9fd8ff";
-      ctx.fillText("\u25bc", bx + 7, 41);
-    } else {                                 // hold
+    const level = choice[i];
+    if (level < 0) {                        // hold: the hand rests
       ctx.fillStyle = "#5b6878";
       ctx.fillText("\u00b7", bx + 10, 39);
+    } else {                                // a commanded level (a stop)
+      const now = [inAil, inElev, inRud, inThr][i];
+      const nowLevel = levelOf(i, now);   // the stop the lever is at
+      if (level > nowLevel) {               // driving the lever up
+        ctx.fillStyle = "#ff8c3a";
+        ctx.fillText("\u25b2", bx + 7, 40);
+      } else if (level < nowLevel) {         // driving the lever down
+        ctx.fillStyle = "#9fd8ff";
+        ctx.fillText("\u25bc", bx + 7, 41);
+      } else {                               // already at the level
+        ctx.fillStyle = "#5b6878";
+        ctx.fillText("\u00b7", bx + 10, 39);
+      }
     }
   }
   // the channel legend: what each letter commands
@@ -1144,18 +1298,15 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   ctx.font = "bold 13px ui-monospace, monospace";
   ctx.fillText(rpmOf(inThr).toFixed(0), tx + 20, tyTop + 20);
 
-  // surface readouts, bottom right — the HAND (inputs) above the
-  // AIRFRAME (surfaces), so the student's inputs are always readable
+  // the control state readout, bottom right — what the selected
+  // aircraft is actually holding (the machine's own truth)
   ctx.textAlign = "right";
-  ctx.fillStyle = "#ff8c3a";
-  ctx.font = "9px ui-monospace, monospace";
-  ctx.fillText(`HAND A ${inAil >= 0 ? "+" : ""}${inAil.toFixed(2)}` +
-              ` E ${inElev >= 0 ? "+" : ""}${inElev.toFixed(2)}` +
-              ` R ${inRud >= 0 ? "+" : ""}${inRud.toFixed(2)}`, W - 10, H - 34);
   ctx.fillStyle = "#8b96ab";
-  ctx.fillText(`SRF  A ${s.ail >= 0 ? "+" : ""}${s.ail.toFixed(2)}` +
-              ` E ${s.elev >= 0 ? "+" : ""}${s.elev.toFixed(2)}` +
-              ` R ${s.rud >= 0 ? "+" : ""}${s.rud.toFixed(2)}`, W - 10, H - 22);
+  ctx.font = "9px ui-monospace, monospace";
+  ctx.fillText(`CTL A ${inAil >= 0 ? "+" : ""}${inAil.toFixed(2)}` +
+              ` E ${inElev >= 0 ? "+" : ""}${inElev.toFixed(2)}` +
+              ` R ${inRud >= 0 ? "+" : ""}${inRud.toFixed(2)}` +
+              ` T ${inThr.toFixed(2)}`, W - 10, H - 22);
   ctx.textAlign = "left";
 
   if (!s.alive) {

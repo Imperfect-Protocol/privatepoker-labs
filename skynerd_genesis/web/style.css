@@ -40,12 +40,17 @@ body {
 #bar {
   grid-area: toolbar;
   display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.bar-row {
+  display: flex;
   gap: 12px;
   align-items: center;
   flex-wrap: wrap;
-  padding: 10px 14px;
-  background: var(--panel);
-  border-bottom: 1px solid var(--line);
 }
 .brand {
   color: var(--accent);
@@ -168,3 +173,144 @@ td .ok { color: var(--good); }
 td .bad { color: var(--bad); }
 td .na { color: var(--dim); }
 #school td:nth-child(2) { color: var(--dim); }
+
+/* --- boot pre-learning dialog ----------------------------------------------
+ * Black screen, the terminal dialog in the middle: the training log
+ * streams while the bar fills left to right. Vanishes when the tensors
+ * are trained. */
+#boot {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#boot.hidden { display: none; }
+.boot-dialog {
+  width: min(860px, 94vw);
+  height: min(660px, 88vh);
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line, #26314a);
+  background: #0a0e18;
+  border-radius: 8px;
+  padding: 22px 24px 18px;
+  box-shadow: 0 0 60px rgba(60, 130, 255, 0.15);
+}
+.boot-dialog h1 {
+  margin: 0;
+  font-size: 17px;
+  letter-spacing: 0.18em;
+  font-weight: 600;
+  color: #e8ecf4;
+}
+/* The head: the title, the endless classroom's progress bar, and the
+ * DONE button — the only stop. The bar and the button share a row. */
+.boot-head {
+  margin-bottom: 12px;
+}
+.boot-bar {
+  height: 10px;
+  border: 1px solid var(--line, #26314a);
+  border-radius: 5px;
+  overflow: hidden;
+  margin-top: 8px;
+  flex: 1;
+}
+.head-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+#bootDone {
+  flex: none;
+  padding: 6px 18px;
+  border: 1px solid #2e6f4e;
+  border-radius: 6px;
+  background: #0d1a14;
+  color: #57d9a3;
+  font: 600 12px ui-monospace, monospace;
+  letter-spacing: 0.14em;
+  cursor: pointer;
+  transition: color 120ms, border-color 120ms, background 120ms;
+}
+#bootDone:hover {
+  color: #8bf0bb;
+  border-color: #57d9a3;
+  background: #12241b;
+  box-shadow: 0 0 10px rgba(87, 217, 163, 0.25);
+}
+#bootFill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #3c82ff, #57d9a3);
+  transition: width 120ms linear;
+}
+/* The content: the cubes at FIXED size in a scrollable panel (they scroll
+ * if the dialog is too narrow, they never shrink). */
+#bootContent {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--line, #26314a);
+  border-radius: 6px;
+  background: #060910;
+}
+#bootBrain {
+  display: block;
+  width: 760px;
+  height: 440px;
+}
+/* The footer: the 3-line terminal, and the expand icon to its right. */
+.boot-foot {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  margin-top: 8px;
+  min-height: 0;
+}
+#bootLog {
+  margin: 0;
+  flex: 1;
+  min-height: 0;
+  height: 51px;             /* three lines, scrollable — nothing is lost */
+  overflow-y: auto;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #9fb0cc;
+  white-space: pre-wrap;
+  border: 1px solid var(--line, #26314a);
+  border-radius: 6px;
+  background: #060910;
+  padding: 6px 10px;
+  scrollbar-width: thin;
+}
+#bootExpand {
+  /* fixed square, pretty: the terminal's height, framed like a panel */
+  border: 1px solid var(--line, #26314a);
+  border-radius: 6px;
+  background: #0a0e18;
+  color: var(--dim, #8b96ab);
+  font: 15px/1 ui-monospace, monospace;
+  width: 51px;
+  height: 51px;
+  flex: 0 0 auto;
+  align-self: flex-end;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 120ms, border-color 120ms, background 120ms;
+}
+#bootExpand:hover {
+  color: #e8ecf4;
+  border-color: #3c82ff;
+  background: #101726;
+}
+/* EXPANDED: the terminal takes the whole content, the cubes step aside. */
+.boot-dialog.expanded #bootContent { display: none; }
+.boot-dialog.expanded .boot-foot { flex: 1; margin-top: 0; }
+.boot-dialog.expanded #bootLog { height: auto; flex: 1; overflow-y: auto; }
+.boot-dialog.expanded #bootExpand { height: auto; align-self: stretch; }
