@@ -35,6 +35,8 @@ function recCtx(ops) {
     createImageData(w, h) {
       return { width: w, height: h, data: new Uint8ClampedArray(w * h * 4) };
     },
+    createRadialGradient() { return { addColorStop() {} }; },
+    createLinearGradient() { return { addColorStop() {} }; },
     putImageData(img) { ops.push(["put", img]); },
     drawImage() {},
   };
@@ -87,7 +89,7 @@ for (const [name, v] of cases) {
     if (world !== null) {
       const d = world.data;
       for (let i = 0; i < d.length; i += 4) {
-        if (d[i] === 36 && d[i + 1] === 51 && d[i + 2] === 86) { sky++; }
+        if (d[i + 2] > d[i + 1] + 12) { sky++; }   // gradient sky / fog / water
         else { ground++; }
       }
     }
@@ -112,8 +114,8 @@ const g = new GroundCls();
   const lvl0Bright = [74, 106, 56];
   // ON THE GROUND (eye 3 m): the base map — even a HUGE footprint reads
   // level 0, because the level comes from ALTITUDE, not footprint.
-  const tiny = g.sample(306.0, 208.0, 0.05, 0.05, 0.05, 0.05, 100.0, 3.0);
-  const huge = g.sample(5046.0, 5046.0, 4000.0, 0.0, 0.0, 4000.0, 100.0, 3.0);
+  const tiny = g.sample(306.0, 210.0, 0.05, 0.05, 0.05, 0.05, 100.0, 3.0);
+  const huge = g.sample(306.0, 210.0, 4000.0, 0.0, 0.0, 4000.0, 100.0, 3.0);
   const both0 = Math.abs(tiny[0] - lvl0Bright[0]) < 2
     && Math.abs(huge[0] - lvl0Bright[0]) < 2;
   console.log(`\nfilter probe (level = ALTITUDE):`);
@@ -122,8 +124,9 @@ const g = new GroundCls();
               ` — both the base map ${lvl0Bright.join(",")}` +
               `${both0 ? "  ✓ footprint never walks the pyramid" : "  ✗"}`);
   // AT 4000 ft: the TOP map — the same checker, same apparent size, brighter
-  // (u = 4032: the centre of the 384 m bright cell [3840, 4224])
-  const top = g.sample(4032.0, 4032.0, 4000.0, 0.0, 0.0, 4000.0, 100.0, 4000 * FTm);
+  // ((960, 192): a bright 384 m cell centre of the top map, on the
+  //  airfield's carved grass)
+  const top = g.sample(960.0, 192.0, 4000.0, 0.0, 0.0, 4000.0, 100.0, 4000 * FTm);
   const topOk = Math.abs(top[0] - 130) < 6;
   console.log(`  4000 ft: rgb(${top.map((c) => c.toFixed(0)).join(",")})` +
               ` — the top map, crisp ${[130, 187, 99].join(",")}` +
@@ -137,7 +140,7 @@ const g = new GroundCls();
   let maxJump = 0.0;
   let prev = null;
   for (let hgt = 1.0; hgt <= 2500.0; hgt += 1.0) {
-    const c = g.sample(5046.0, 5046.0, 3.0, 0.0, 0.0, 3.0, 100.0, hgt);
+    const c = g.sample(306.0, 210.0, 3.0, 0.0, 0.0, 3.0, 100.0, hgt);
     if (prev !== null) {
       maxJump = Math.max(maxJump, Math.abs(c[0] - prev));
     }
@@ -148,8 +151,8 @@ const g = new GroundCls();
 
   // ANISOTROPIC at ground level: the taps read the alternating pattern
   // along the stretch; the clamped square keeps full contrast too.
-  const stretch = g.sample(6.0, 5000.0, 30.0, 0.0, 0.0, 3.0, 100.0, 3.0);
-  const square = g.sample(6.0, 5000.0, 30.0, 0.0, 0.0, 30.0, 100.0, 3.0);
+  const stretch = g.sample(306.0, 210.0, 30.0, 0.0, 0.0, 3.0, 100.0, 3.0);
+  const square = g.sample(306.0, 210.0, 30.0, 0.0, 0.0, 30.0, 100.0, 3.0);
   console.log(`  anisotropic at ground: stretch norm ${norm(stretch).toFixed(3)}` +
               ` (structure along the stretch), square norm ${norm(square).toFixed(3)}` +
               `${Math.abs(norm(square)) > 0.1 ? "  ✓ full-contrast, never a flat mean" : "  ✗"}`);

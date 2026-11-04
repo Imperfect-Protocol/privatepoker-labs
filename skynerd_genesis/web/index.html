@@ -10,32 +10,36 @@
 <body>
   <div id="app">
     <div id="bar">
-      <span class="brand">SKYNERD <span class="tag">genesis</span></span>
-      <button id="play" title="space">&#9208; pause</button>
-      <label>speed
-        <select id="speed">
-          <option value="0.2">0.2x</option>
-          <option value="0.3">0.3x</option>
-          <option value="0.5">0.5x</option>
-          <option value="1" selected>1x</option>
-          <option value="2">2x</option>
-          <option value="3">3x</option>
-          <option value="5">5x</option>
-          <option value="10">10x</option>
-        </select>
-      </label>
-      <label>scenario
-        <select id="scenario"></select>
-      </label>
-      <label>aircraft
-        <select id="aircraft"></select>
-      </label>
-      <button id="next" title="N — next maneuver">&#9654; next maneuver</button>
-      <button id="restart" title="R — restart">&#8635; restart</button>
-      <button id="zoomIn" title="zoom in">+</button>
-      <button id="zoomOut" title="zoom out">&minus;</button>
-      <button id="zoomReset" title="reset view">reset</button>
-      <span id="badge"></span>
+      <div class="bar-row">
+        <span class="brand">SKYNERD <span class="tag">genesis</span></span>
+        <label>scenario
+          <select id="scenario"></select>
+        </label>
+        <label>aircraft
+          <select id="aircraft"></select>
+        </label>
+        <button id="next" title="N — next maneuver">&#9654; next maneuver</button>
+        <button id="restart" title="R — restart">&#8635; restart</button>
+        <span id="badge"></span>
+      </div>
+      <div class="bar-row">
+        <button id="play" title="space">&#9208; pause</button>
+        <label>speed
+          <select id="speed">
+            <option value="0.2">0.2x</option>
+            <option value="0.3">0.3x</option>
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option>
+            <option value="2">2x</option>
+            <option value="3">3x</option>
+            <option value="5">5x</option>
+            <option value="10">10x</option>
+          </select>
+        </label>
+        <button id="zoomIn" title="zoom in">+</button>
+        <button id="zoomOut" title="zoom out">&minus;</button>
+        <button id="zoomReset" title="reset view">reset</button>
+      </div>
     </div>
 
     <div id="stage">
@@ -60,6 +64,25 @@
         </thead>
         <tbody></tbody>
       </table>
+    </div>
+  </div>
+
+  <div id="boot">
+    <div class="boot-dialog">
+      <div class="boot-head">
+        <h1>SKYNERD FLIGHT SCHOOL</h1>
+        <div class="head-row">
+          <div class="boot-bar"><div id="bootFill"></div></div>
+          <button id="bootDone" title="stop the endless classroom and fly">DONE</button>
+        </div>
+      </div>
+      <div id="bootContent">
+        <canvas id="bootBrain" width="760" height="440"></canvas>
+      </div>
+      <div class="boot-foot">
+        <pre id="bootLog"></pre>
+        <button id="bootExpand" title="expand the terminal">&#10530;</button>
+      </div>
     </div>
   </div>
 

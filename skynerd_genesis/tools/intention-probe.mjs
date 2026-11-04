@@ -21,7 +21,8 @@ const rng = new NumpyPcg64(RNG0_STATE, RNG0_INC);
 const demo = new DemoFlight(school, lesson, policy, 0);
 while (demo.step()) { /* teach */ }
 
-const exam = new ExamFlight(school, lesson, policy, rng);
+const exam = new ExamFlight(school, lesson, policy, rng,
+                             school.demoSeconds(lesson) * 2.2 + 5.0);
 let n = 0;
 while (exam.step() && n < 400) {
   if (exam.tick % DECISION_EVERY === 0) {

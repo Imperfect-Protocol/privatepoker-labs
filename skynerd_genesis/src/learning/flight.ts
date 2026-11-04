@@ -18,8 +18,8 @@ import { Quaternion } from "../core/quaternion.js";
 import {
   DenseReward, EpisodeOutcome, FlightInstruments, classifyOutcome,
 } from "./instruments.js";
-import { ServoPolicy } from "./servo-tensor.js";
-import { ELEMENT_FREE_FLIGHT } from "./servo-tensor.js";
+import { ServoPolicy, TensorNetwork, GOAL_FREE_FLIGHT,
+         ELEMENT_FREE_FLIGHT } from "./servo-tensor.js";
 
 export const TRIM_SPEED = 38.0;       // m/s — 85 mph, the C172 economy cruise
 export const HORIZON = 20.0;
@@ -77,6 +77,11 @@ export interface EpisodeOptions {
   /** An existing machine to fly (its body must already be positioned);
    *  by default the episode builds its own. */
   aircraft?: Aircraft;
+  /** The episode's horizon, seconds — how long the DRONE SIDE of the
+   *  library flies before calling the episode survived. Infinity means
+   *  NO expiry: the flight lives until it crashes, stalls, or leaves
+   *  the world. (Default: HORIZON, the old 20 s.) */
+  horizon?: number;
 }
 
 export class LiveEpisode {
@@ -91,7 +96,13 @@ export class LiveEpisode {
   private readonly instruments: FlightInstruments;
   private readonly epoch: number;
   private readonly rng: NumpyPcg64;
-  private readonly recent: Array<[number[], Int32Array]> = [];
+  /** The drone's tensor network: the seven tensors as dispatcher
+   *  nodes on the shared queue — stun on input, fire on relaxation,
+   *  message the law's thresholded projection. Free flight has no
+   *  maneuver chain; the sensors' codes and the skill's coherence
+   *  are the servo's whole input. */
+  private readonly network: TensorNetwork;
+  private readonly recent: Array<[readonly number[], Int32Array]> = [];
   private pendingReward = 0.0;
   private readonly decisionEvery = 10;
   private readonly steps: number;
@@ -123,9 +134,10 @@ export class LiveEpisode {
       body.velocity = new Vec3(14.0, 0.0, -4.0);
     }
     this.aircraft = options.aircraft ?? new Aircraft(body);
+    this.network = new TensorNetwork(policy, ELEMENT_FREE_FLIGHT, rng);
     this.dense = new DenseReward(instruments, 5.0);
     this.dense.reset(this.aircraft.body);
-    this.steps = Math.floor(HORIZON / DT);
+    this.steps = Math.floor((options.horizon ?? HORIZON) / DT);
     if (options.epsilonOverride !== undefined
         && options.epsilonOverride !== null) {
       policy.epsilon = options.epsilonOverride;
@@ -142,8 +154,10 @@ export class LiveEpisode {
     return this.outcome;
   }
 
-  /** The hand's current commands — the controller's own state (the
-   *  aircraft's recorded commands are the panel's display copy). */
+  /** The hand's current commands — the controller's own write state.
+   *  Reading the machine is a different path: the aircraft's own
+   *  getters (handCommands, surfacePositions, the instruments) are the
+   *  sealed truth of what the machine holds and does. */
   get handCommands(): Float64Array {
     return this.commands;
   }
@@ -169,15 +183,24 @@ export class LiveEpisode {
         this.policy.reinforce(this.recent, this.pendingReward, this.epoch);
       }
       this.pendingReward = 0.0;
+      // The drone reads the MACHINE, not its own hand: the panel comes
+      // from the aircraft's current instruments (the body's physical
+      // truth and the surface positions the actuators actually hold) —
+      // the same reading the classroom's students get.
       const sense = this.instruments.senseReading(this.aircraft.body,
-                                                  this.commands);
-      const actions = this.policy.choose(ELEMENT_FREE_FLIGHT, sense, this.rng);
-      this.commands = this.policy.commandFrom(this.commands, actions);
-      this.lastChoices = actions;
-      this.recent.push([[ELEMENT_FREE_FLIGHT, ...sense.flight,
-                         ...sense.controls], actions]);
-      if (this.recent.length > 10) {
-        this.recent.shift();
+                                                  this.aircraft.surfacePositions);
+      const decision = this.network.decide(GOAL_FREE_FLIGHT, sense,
+                                            null, this.rng);
+      this.commands = this.policy.commandFrom(this.commands, decision.actions);
+      this.lastChoices = decision.actions;
+      // The reinforcement key is the servo tensor's observation prefix:
+      // the skill's forward. Only FIRED decisions earn credit — a hold
+      // (no news from the skill) has no key to credit.
+      if (decision.acted) {
+        this.recent.push([decision.key, decision.actions]);
+        if (this.recent.length > 10) {
+          this.recent.shift();
+        }
       }
     }
     this.aircraft.command(this.commands, DT);
@@ -214,11 +237,12 @@ export function flyEpisode(policy: ServoPolicy, instruments: FlightInstruments,
                            options: EpisodeOptions = {}): EpisodeResult {
   const episode = new LiveEpisode(policy, instruments, epoch, rng, options);
   while (episode.step()) { /* fly to completion */ }
+  // The record is the MACHINE's, read through its sealed getters.
   return {
     survival: episode.survival,
     outcome: episode.episodeOutcome!,
     finalStateKey: instruments.stateKey(episode.aircraft.body,
-                                        episode.handCommands[3]),
-    finalCommands: Float64Array.from(episode.handCommands),
+                                        episode.aircraft.surfacePositions[THROTTLE]),
+    finalCommands: episode.aircraft.handCommands,
   };
 }

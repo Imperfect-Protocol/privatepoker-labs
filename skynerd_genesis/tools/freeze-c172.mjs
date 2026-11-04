@@ -14,7 +14,7 @@ import { writeFileSync } from "node:fs";
 
 function runClassroom() {
   const school = new FlightSchool(new FlightInstruments(TRIM_SPEED));
-  const session = new SchoolSession(school, new ServoPolicy());
+  const session = new SchoolSession(school, new ServoPolicy(), { examCap: "auto" });
   session.runToCompletion();
   // The report card grades like the browser does: a fresh exam per lesson
   // at the FINAL tensor state (stored passing scores go stale as later
