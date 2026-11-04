@@ -3,7 +3,7 @@
  * (build-web/src/app/main.js) under a minimal DOM stub with ?boot=skip
  * (no offline pre-learning — a fast, untrained world), then drives the
  * frame clock through the LIVE flight school — narration milestones, the
- * report card, restart, the speed control, the next-maneuver button, and
+ * scenario wiki, restart, the speed control, the next-maneuver button, and
  * the scenario switch to the live drone attack waves. No browser needed.
  */
 import fs from "node:fs";
@@ -67,6 +67,8 @@ function makeElement(id) {
     disabled: false,
     className: "",
     style: {},
+    dataset: {},
+    onclick: null,
     scrollTop: 0,
     clientWidth: 100,
     clientHeight: 100,
@@ -136,11 +138,15 @@ elements["bootFill"] = makeElement("bootFill");
 elements["bootLog"] = makeElement("bootLog");
 elements["bootExpand"] = makeElement("bootExpand");
 elements["bootBrain"] = Object.assign(makeElement("bootBrain"), makeCanvas());
+elements["bootDone"] = makeElement("bootDone");
+elements["tabWiki"] = makeElement("tabWiki");
+elements["tabAi"] = makeElement("tabAi");
 
 globalThis.document = {
   getElementById: (id) => elements[id] ?? null,
   querySelector: (selector) =>
     String(selector).includes("#school") ? elements.schoolTbody : elements.tbody,
+  querySelectorAll: () => [],
   createElement: () => makeCanvas(),
   body: { dataset: {} },
 };
@@ -186,9 +192,7 @@ console.log("== boot (flight school, live)");
 // the curriculum's lesson count: every scenario option except the waves
 const lessonCount =
   (elements.scenario.innerHTML.match(/<option/g) ?? []).length - 1;
-// the report card renders the TRAINED CURRICULUM's lessons — the
-// boot trainer's own golden, one row per lesson
-const goldenCount = lessonCount;
+const goldenCount = lessonCount;   // the status checks read the curriculum count
 check("boots into the flight school",
       elements.narration.textContent.startsWith("Instructor demonstrates takeoff"),
       elements.narration.textContent);
@@ -215,13 +219,12 @@ for (let i = 0; i < 4000 && !sawStudentFly; i++) {
 check("the student launches and flies the maneuver", sawStudentFly,
       elements.narration.textContent);
 
-// the report card and the badge (the maneuvers' golden exactness is gated
-// by the frozen-reference tests and the classroom probes, not here)
-console.log("== the report card and the golden badge");
-const reportRows = elements.schoolTbody.innerHTML;
-check("report card lists every graded lesson",
-      (reportRows.match(/<tr>/g) ?? []).length === goldenCount,
-      `${(reportRows.match(/<tr>/g) ?? []).length} rows, ${goldenCount} graded`);
+// the results panel: the scenario wiki + the golden badge (the
+// maneuvers' golden exactness is gated by the classroom probes, not here)
+console.log("== the scenario wiki and the golden badge");
+check("the wiki tab describes the running maneuver",
+      elements["tabWiki"].innerHTML.includes("<h3>"),
+      elements["tabWiki"].innerHTML.slice(0, 90));
 check("no golden verdict without training (skip mode)",
       elements.badge.textContent === "",
       elements.badge.textContent);

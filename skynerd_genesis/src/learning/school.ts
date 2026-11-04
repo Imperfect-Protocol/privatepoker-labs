@@ -146,7 +146,7 @@ import { Aircraft } from "../physics/aircraft.js";
 import { FlightInstruments, type SenseReading } from "./instruments.js";
 import {
   ServoPolicy, TensorNetwork, TensorContext, PULSE_EVERY,
-  ACTION_HOLD, ACTION_DELTA,
+  ACTION_HOLD, ACTION_DELTA, type TensorStateView,
 } from "./servo-tensor.js";
 import { levelOf } from "./instruments.js";
 import { TRIM_SPEED, TRIM_COMMAND, springStickTowardNeutral } from "./flight.js";
@@ -399,6 +399,12 @@ export type ElementName = typeof ELEMENT_VOCABULARY[number];
 /** The element axis bin a vocabulary word sits at. */
 export function elementIdOf(name: ElementName): number {
   return ELEMENT_VOCABULARY.indexOf(name);
+}
+
+/** The vocabulary word at an element axis bin (the UI's element names). */
+export function elementNameOf(id: number): string {
+  return ELEMENT_VOCABULARY[Math.min(Math.max(id, 0),
+                                     ELEMENT_VOCABULARY.length - 1)];
 }
 
 /** The control law an element flies: which channels it commands, and how. */
@@ -1632,6 +1638,12 @@ export class ExamFlight extends ClassroomFlight {
                                        this.lesson.phases.length - 1)];
   }
 
+  /** THE UI's STATE VIEW — the AI state log's snapshot of this
+   *  flight's tensor network. */
+  stateView(): TensorStateView {
+    return this.network.stateView();
+  }
+
   /** The goal score this repeat earned, 0-6. */
   get goalScore(): number {
     let earned = 0.0;
@@ -2005,12 +2017,12 @@ export class FlightSchool {
     ], { startKind: "cruise3000",
          goalId: nextGoalId() }]);
 
-    // --- SPIN RECOVERY: from the standard 3000 ft / 80 mph start, the
+    // --- SPIN RECOVERY, LEFT: from the standard 3000 ft / 80 mph start, the
     // instructor spins it (LEFT) and recovers: opposite rudder to the
     // stop, dive to 60 mph, climb at 15°, back to 3000 ft level. The
     // student repeats the WHOLE maneuver from the same start. The ENTRY
     // is never taught. The spin is LEFT. -------------------------------
-    lessons.push(["spin_recovery", DESIRE_RECOVER, [0.0, 0.0, 1.0], [
+    lessons.push(["spin_recovery_left", DESIRE_RECOVER, [0.0, 0.0, 1.0], [
       new StallEntryElement(),
       new StallWaitElement(),
       new DropWingElement(-1.0),

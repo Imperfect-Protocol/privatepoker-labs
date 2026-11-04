@@ -35,7 +35,9 @@ import {
 import { FlightSchoolShow } from "./school-show.js";
 import { WavesShow } from "./waves-show.js";
 import { BootTrainer } from "./boot-train.js";
-import { FlightSchool } from "../learning/school.js";
+import { FlightSchool, elementNameOf } from "../learning/school.js";
+import type { TensorStateView } from "../learning/servo-tensor.js";
+import type { HudDelta } from "./hud-delta.js";
 import { FlightInstruments } from "../learning/instruments.js";
 import { TRIM_SPEED } from "../learning/flight.js";
 import { drawBrainView, tensorCounts } from "./boot-brain.js";
@@ -65,7 +67,8 @@ const els = {
   zoomOut: document.getElementById("zoomOut") as HTMLButtonElement,
   zoomReset: document.getElementById("zoomReset") as HTMLButtonElement,
   badge: document.getElementById("badge")!,
-  schoolTbody: document.querySelector("#school tbody") as HTMLElement,
+  tabWiki: document.getElementById("tabWiki")!,
+  tabAi: document.getElementById("tabAi")!,
   results: document.getElementById("results") as HTMLElement,
   cockpit: document.getElementById("cockpit") as HTMLElement,
   cockpitTitle: document.getElementById("cockpit-title")!,
@@ -133,10 +136,17 @@ function followTarget(): SceneAircraft | null {
     return world.current;
   }
   const school = state.school;
-  return school === null ? null : school.flyingEntry;
-}
-
-/** Keep the scene's selection honest: follow the action unless pinned. */
+  if (school === null) {
+    return null;
+  }
+  // NO MID-DEMO SWITCH TO THE STUDENT: the view stays on the
+  // instructor while it demonstrates — the demo is the action to
+  // watch. The student becomes the subject only once the instructor
+  // is done (the only one left flying), and a manual dropdown pick
+  // pins whichever aircraft the person chose.
+  return school.instructorEntry.flying ? school.instructorEntry
+                                       : school.studentEntry;
+}/** Keep the scene's selection honest: follow the action unless pinned. */
 function autoSelect(): void {
   const world = scene();
   if (world === null || state.pinned) {
@@ -191,9 +201,9 @@ function fitCanvas(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
 
 function altitudeTint(z: number): string {
   const t = Math.max(0.0, Math.min(1.0, z / 180.0));
-  const r = Math.round(255 + (87 - 255) * t);
-  const g = Math.round(122 + (212 - 122) * t);
-  const b = Math.round(74 + (255 - 74) * t);
+  const r = Math.round(30 + (140 - 30) * t);
+  const g = Math.round(110 + (235 - 110) * t);
+  const b = Math.round(150 + (255 - 150) * t);
   return `rgb(${r},${g},${b})`;
 }
 
@@ -244,7 +254,7 @@ function drawSky(): void {
   const sy = (x: number) => H / 2 - (x - cx) * scale;
 
   // world grid, fixed to the ground
-  ctx.strokeStyle = "#161c2a";
+  ctx.strokeStyle = "#0c2334";
   ctx.lineWidth = 1;
   for (let gy = Math.floor((cy - span / 2) / 50) * 50;
        gy <= cy + span / 2; gy += 50) {
@@ -279,7 +289,7 @@ function drawSchoolSky(ctx: CanvasRenderingContext2D,
   // the demonstration path, ghosted behind the repeat
   const ghost = instructor.trail;
   if (school.moment.stage === "repeat" && ghost.length > 1) {
-    ctx.strokeStyle = "rgba(139,150,171,0.30)";
+    ctx.strokeStyle = "rgba(70,115,140,0.40)";
     ctx.lineWidth = 1.2;
     ctx.setLineDash([5, 6]);
     ctx.beginPath();
@@ -403,7 +413,7 @@ function renderNarration(): void {
       `${waves.aliveCount} flying \u00b7 ${waves.births} born \u00b7 ` +
       `${waves.obituaries} screams heard \u00b7 flock ${waves.flockSize}` +
       ` \u00b7 links ${waves.links().length}`;
-    els.results.hidden = true;
+    els.results.hidden = false;
     els.badge.textContent = "";
     els.badge.className = "";
     return;
@@ -430,35 +440,234 @@ function renderNarration(): void {
     `${attempt}${scoreText}${intent}${finishedText} \u00b7 t ${moment.seconds.toFixed(1)}s \u00b7 ` +
     whoText;
   els.results.hidden = false;
-  refreshSchoolTable();
+  updateBadge();
 }
 
-function refreshSchoolTable(): void {
+// --- the bottom panel's TAB GROUP --------------------------------------------
+// Tab 1: the scenario's wiki-style description. Tab 2: the live AI state
+// log — one row per decision window of the selected AI, newest on top.
+
+const tabButtons =
+  [...document.querySelectorAll<HTMLButtonElement>(".tab")];
+
+/** How many decision rows the live log keeps (newest first). */
+const AI_LOG_ROWS = 20;
+
+const tabs = {
+  active: "wiki" as "wiki" | "ai",
+  wikiKey: "",
+  /** Which AI the log belongs to (a new subject clears the log). */
+  aiKey: "",
+  aiLastDecision: -1,
+  rows: [] as AiLogRow[],
+};
+
+/** One row of the live log. The same state held over many decision
+ *  windows collapses into ONE row: firstTick is where it began,
+ *  lastTick is where it is now (the tick cell shows both). */
+interface AiLogRow {
+  firstTick: number;
+  lastTick: number;
+  /** What makes this row THIS row — labels only, the drifting
+ *      shares and the live delta never take part in the identity. */
+  key: string;
+  /** The row's <td> cells after the tick cell. */
+  cells: string;
+}
+
+for (const button of tabButtons) {
+  button.addEventListener("click", () => {
+    tabs.active = button.dataset.tab as "wiki" | "ai";
+    for (const other of tabButtons) {
+      other.classList.toggle("active", other === button);
+    }
+    els.tabWiki.hidden = tabs.active !== "wiki";
+    els.tabAi.hidden = tabs.active !== "ai";
+  });
+}
+
+/** The selected AI's state, per scenario: the classroom's student, or
+ *  the drone the aircraft dropdown holds. */
+function aiSubject(): {
+  view: TensorStateView | null;
+  goalName: string;
+  delta: HudDelta | null;
+  key: string;
+  note: string;
+} {
+  if (state.scenario === WAVES_SCENARIO && state.waves !== null) {
+    const waves = state.waves;
+    const label = waves.scene.current?.label ?? "";
+    return {
+      view: waves.selectedStateView,
+      goalName: "free flight",
+      delta: waves.carpetDelta,
+      key: `waves|${label}`,
+      note: "select a flying drone in the aircraft dropdown",
+    };
+  }
   const school = state.school;
   if (school === null) {
-    return;
+    return { view: null, goalName: "", delta: null, key: "", note: "" };
   }
   const moment = school.moment;
-  const key = `${moment.lessonIndex}|${moment.lessonName}|` +
-    `${moment.attempt}|${school.scores.size}|${school.goalReports.size}`;
-  if (key === state.reportKey) {
-    return;
+  return {
+    view: school.studentStateView,
+    goalName: moment.goalName,
+    delta: school.instructorDelta,
+    key: `school|${moment.lessonName}|${moment.attempt}`,
+    note: `the student launches in ${moment.countdown.toFixed(0)} s`,
+  };
+}
+
+/** A class label split for display: the text, and the parenthetical
+ *  detail that belongs on the grey row below it ("accelerating
+ *  descent" / "(gaining speed, losing altitude)"). */
+function splitLabel(label: string): { main: string; detail: string } {
+  const at = label.indexOf(" (");
+  if (at < 0) {
+    return { main: label, detail: "" };
   }
-  state.reportKey = key;
-  const rows = school.reportRows(state.golden ?? []);
-  const body = rows.map((row) => {
-    const score = row.score === null ? "\u2026"
-      : `${row.score.toFixed(2)} (${row.grade ?? ""})`;
-    const mark = row.exact === null
-      ? `<span class="na">\u2026</span>`
-      : row.exact ? `<span class="ok">\u2713 exact</span>`
-        : `<span class="bad">\u2717 mismatch</span>`;
-    return `<tr><td>${row.lesson.replace(/_/g, " ")}</td>` +
-      `<td>${row.attempts}</td><td>${score}</td>` +
-      `<td class="goals">${row.goals}</td><td>${mark}</td></tr>`;
-  });
-  els.schoolTbody.innerHTML = body.join("");
-  updateBadge();
+  return { main: label.slice(0, at), detail: label.slice(at + 1) };
+}
+
+/** The grey detail line (empty when the label has no parenthetical). */
+function detailLine(detail: string): string {
+  return detail === "" ? "" : `<div class="dom">${detail}</div>`;
+}
+
+/** One tensor cell: the fired classification, then the 5 dominant ones
+ *  with their % belonging. */
+function tensorCell(className: string, share: number,
+                    dominant: readonly { label: string; share: number }[]): string {
+  const fired = splitLabel(className);
+  const firedShare = share > 0.0
+    ? ` <span class="dom">${Math.round(share * 100)}%</span>` : "";
+  const domLines = dominant.slice(1).map((d) => {
+    const entry = splitLabel(d.label);
+    return `<div>${entry.main} ${Math.round(d.share * 100)}%</div>` +
+           detailLine(entry.detail);
+  }).join("");
+  return `<td><div class="cls">${fired.main}${firedShare}</div>` +
+         detailLine(fired.detail) +
+         `<div class="dom">${domLines}</div></td>`;
+}
+
+/** The log's header (the requested columns, one per tensor). */
+const AI_TABLE_HEAD =
+  "<thead><tr><th>tick</th><th>goal</th><th>element</th><th>situation</th>" +
+  "<th>LocationTensor</th><th>FlightTensor</th><th>EnergyTensor</th>" +
+  "<th>ControlsTensor</th><th>&Delta;</th><th>ServoTensor</th></tr></thead>";
+
+/** One log row for one decision window of the AI: every cell but the
+ *  tick (the tick cell is rendered from the row's tick span). */
+function aiRowCells(view: TensorStateView, goalName: string,
+                    delta: HudDelta | null): string {
+  const sensors = view.sensors;
+  const servoDom = view.servo.dominant.slice(1).map((d) => {
+    const entry = splitLabel(d.label);
+    return `<div>${entry.main} ${Math.round(d.share * 100)}%</div>` +
+           detailLine(entry.detail);
+  }).join("");
+  return `<td>${goalName}</td>` +
+    `<td>${elementNameOf(view.elementId)}</td>` +
+    `<td>${view.situation}</td>` +
+    tensorCell(sensors[0].className, sensors[0].share, sensors[0].dominant) +
+    tensorCell(sensors[1].className, sensors[1].share, sensors[1].dominant) +
+    tensorCell(sensors[2].className, sensors[2].share, sensors[2].dominant) +
+    tensorCell(sensors[3].className, sensors[3].share, sensors[3].dominant) +
+    `<td>${delta === null ? "" :
+      `<div>${delta.currentLine}</div>` +
+      `<div class="dom">(${delta.deltaLine})</div>`}</td>` +
+    `<td><div class="cls">${view.servo.command}${view.acted ? "" :
+      " <span class=\"dom\">(stunned)</span>"}</div>` +
+    `<div class="dom">${servoDom}</div></td>`;
+}
+
+/** The row's identity: the qualitative state — goal, element, situation,
+ *  the fired and dominant LABELS, the servo command. Shares and the
+ *  live delta drift every window and never make a new row. */
+function rowKeyOf(view: TensorStateView, goalName: string): string {
+  const sensorKeys = view.sensors.map((s) =>
+    `${s.className}:${s.dominant.map((d) => d.label).join(",")}`).join("|");
+  const servoKey =
+    `${view.servo.command}:${view.servo.dominant.map((d) => d.label).join(",")}`;
+  return `${goalName}#${view.elementId}#${view.situation}` +
+         `#${view.acted}#${sensorKeys}#${servoKey}`;
+}
+
+/** The tick cell: the current tick, and — once the row has spanned more
+ *  than one window — the first tick it held this state, in braces. */
+function tickCellOf(row: AiLogRow): string {
+  const origin = row.lastTick === row.firstTick ? "" :
+    `<br><span class="dom">(${row.firstTick})</span>`;
+  return `<td>${row.lastTick}${origin}</td>`;
+}
+
+/** Render both tabs (cheap guards: only redraw on real change). */
+function renderTabs(): void {
+  // TAB 1 — the wiki.
+  let wiki: { title: string; goal: string; elements: readonly string[];
+              goals: readonly string[] } | null = null;
+  if (state.scenario === WAVES_SCENARIO && state.waves !== null) {
+    wiki = state.waves.wiki;
+  } else if (state.school !== null) {
+    wiki = state.school.wiki;
+  }
+  if (wiki !== null) {
+    const key = `${wiki.title}|${wiki.elements.join(">")}`;
+    if (key !== tabs.wikiKey) {
+      tabs.wikiKey = key;
+      els.tabWiki.innerHTML =
+        `<h3>${wiki.title}</h3>` +
+        `<p>${wiki.goal}</p>` +
+        `<p class="chain">elements: ${wiki.elements.join(" \u2192 ")}</p>` +
+        `<p>known goals:</p>` +
+        `<ul>${wiki.goals.map((g) => {
+          const entry = splitLabel(g);
+          return `<li>${entry.main}${detailLine(entry.detail)}</li>`;
+        }).join("")}</ul>`;
+    }
+  }
+  // TAB 2 — the live AI state log.
+  const subject = aiSubject();
+  if (subject.key !== tabs.aiKey) {
+    tabs.aiKey = subject.key;
+    tabs.rows.length = 0;
+    tabs.aiLastDecision = -1;
+  }
+  const view = subject.view;
+  if (view !== null && view.decisionCount !== tabs.aiLastDecision) {
+    tabs.aiLastDecision = view.decisionCount;
+    const key = rowKeyOf(view, subject.goalName);
+    const head = tabs.rows[0];
+    if (head !== undefined && head.key === key) {
+      // the SAME state, held another window: no new row, the span grows
+      head.lastTick = view.decisionCount;
+      head.cells = aiRowCells(view, subject.goalName, subject.delta);
+    } else {
+      tabs.rows.unshift({
+        firstTick: view.decisionCount,
+        lastTick: view.decisionCount,
+        key,
+        cells: aiRowCells(view, subject.goalName, subject.delta),
+      });
+      if (tabs.rows.length > AI_LOG_ROWS) {
+        tabs.rows.length = AI_LOG_ROWS;
+      }
+    }
+  }
+  const bodyHtml = tabs.rows.length > 0
+    ? `<table>${AI_TABLE_HEAD}<tbody>` +
+      `${tabs.rows.map((r) => `<tr>${tickCellOf(r)}${r.cells}</tr>`).join("")}` +
+      `</tbody></table>`
+    : `<p class="chain">${subject.note}</p>`;
+  const bodyKey = `${tabs.rows.length}|${tabs.aiLastDecision}|${subject.note}|` +
+                  `${tabs.rows[0]?.lastTick ?? -1}`;
+  if (els.tabAi.dataset.key !== bodyKey) {
+    els.tabAi.dataset.key = bodyKey;
+    els.tabAi.innerHTML = bodyHtml;
+  }
 }
 
 function updateBadge(): void {
@@ -530,6 +739,7 @@ function frame(ts: number): void {
   drawSky();
   drawPanel();
   renderNarration();
+  renderTabs();
   refreshAircraftDropdown();
   requestAnimationFrame(frame);
 }
@@ -583,23 +793,23 @@ function startUntrainedWorld(): void {
   }
 }
 
-/** The restart button: the one sanctioned fresh start of everything —
- *  the old student dies, the boot pre-learning runs again, and a new
- *  trained student is born (skip mode: just a fresh untrained world). */
+/** The restart button: start the CURRENT SCENARIO over — and only
+ *  it. The student's trained brain, the golden reference, and the
+ *  waves all stay alive; the chosen maneuver (or the drone waves)
+ *  simply begins again from its start. A full world reset (new brain,
+ *  new boot) is the scenario dropdown's job, not this button's. */
 function restart(): void {
-  state.school = null;
-  state.waves = null;
-  state.brain = null;
-  state.pinned = false;
   state.reportKey = "";
-  if (BOOT_SKIP) {
-    startUntrainedWorld();
+  state.camera.tracking = true;
+  if (state.scenario === WAVES_SCENARIO) {
+    if (state.seed !== null) {
+      state.waves = new WavesShow(state.seed, state.brain ?? undefined);
+    }
     return;
   }
-  els.boot.classList.remove("hidden");
-  bootTraining().catch((error) => {
-    els.status.textContent = `boot failed: ${error}`;
-  });
+  if (state.school !== null && state.scenario !== "") {
+    state.school.switchToManeuver(state.scenario);
+  }
 }
 
 function populateScenarioDropdown(lessons: readonly string[]): void {
