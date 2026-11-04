@@ -2,11 +2,15 @@
  * The drone attack, LIVE: the swarm's sortie as a conveyor of PAIRS.
  *
  * Drones do NOT appear from nowhere: every PAIR LIFTS OFF FROM THE
- * RUNWAY — two drones abreast — and the next pair rolls five seconds
- * behind it, pair after pair, forever, no waves. Each drone flies the
- * attack mission (learning/mission.ts): the orbit climb to 3000 ft,
- * the split onto HSI ±45° (the left seat the left flank, the right
- * seat the right flank), the level moment in the flank, the ATTACK —
+ * RUNWAY — both drones ON the lane, the runway's width split into two
+ * halves, each seat at the centre of its own half — and the next pair
+ * rolls five seconds behind it from the same threshold, pair after
+ * pair, forever, no waves. Each drone flies the
+ * attack mission (learning/mission.ts): the instructor's own
+ * departure (roll, rotate, the straight climb out of ground effect),
+ * the split ON THE CLIMB onto HSI ±45° (the left seat the left
+ * flank, the right seat the right flank), the climb-out in the flank
+ * to 3000 ft, the level moment in the flank, the ATTACK —
  * the converging steep descending turns down to 500 ft onto the tank
  * below — the rally's climbing turns up to 1500 ft, the spin own side
  * and recover, and then THE WILL DECIDES: the drone's own brain takes
@@ -42,17 +46,24 @@ import {
   hudDelta, readoutOf, meanReadoutOf, type HudDelta,
 } from "./hud-delta.js";
 import type { ControlMode } from "../learning/guardian.js";
+import { RUNWAY } from "./land.js";
 
 /** The sky holds at most this many living drones: a new pair lifts off
  * only when the sky has room for both of its seats (40 alive —
  * nothing lifts off; 39 — the pair waits for a drone to die). */
 export const DRONE_CAP = 40;
 export const PAIR_EPSILON = 0.05;
-/** The two seats of one pair, metres apart on the runway. */
-const PAIR_GAP = 40.0;
-/** Successive pairs in trail down the runway, metres — the pairs take
- *  off one behind the other, five seconds apart. */
-const PAIR_TRAIL = 90.0;
+/** THE RUNWAY SEATS: both drones of a pair start ON the runway — the
+ *  lane's width is split into two halves and each seat sits at the
+ *  CENTRE of its half (the left seat the left half's centre, the
+ *  right seat the right half's). land.ts's RUNWAY is the one source
+ *  of truth for the lane's geometry: the seats follow whatever the
+ *  runway is. */
+export const PAIR_SEAT_Y = 0.5;
+/** Every pair starts at the SAME threshold — the five-second launch
+ *  interval IS the trail (real runway ops: the pair before is rolling
+ *  or flying by the time the next one lines up). */
+const LAUNCH_X = RUNWAY.near + 50.0;
 /** The pair launch cadence, seconds — the first pair lifts off at
  *  once, the next rolls five seconds behind it, pair after pair. */
 export const PAIR_LAUNCH_EVERY = 5.0;
@@ -250,9 +261,11 @@ export class WavesShow {
                 "opposite rudder", "dive",
                 "cruise (level, then the will decides)"],
       goals: ["take off from the runway in pairs, five seconds apart",
-              "climb to 3000 ft and level off",
-              "split: the left column onto HSI-45, the right onto HSI+45",
-              "fly level at 3000 ft in the flank",
+              "climb out of ground effect, wings level",
+              "split on the climb: the left column onto HSI-45, the " +
+              "right onto HSI+45",
+              "climb out in the flank to 3000 ft and level off",
+              "fly level at 3000 ft — the moment in the flank",
               "attack: the left flank's steep descending turn right, " +
               "the right flank's steep descending turn left, down to " +
               "500 ft",
@@ -375,10 +388,11 @@ export class WavesShow {
       // exploration is its own, deterministic and replayable.
       const state = this.rng.draw64();
       const inc = this.rng.draw64();
-      // THE PAIR SEAT: abreast within the pair, in trail down the
-      // runway — parked on the gear at 100 ft, waiting for the roll.
-      const position = new Vec3(-pair * PAIR_TRAIL,
-        flankSign * PAIR_GAP / 2.0, SYLLABUS.runwayM);
+      // THE PAIR SEAT: both drones ON the runway — the lane split into
+      // two halves, each seat at the centre of its own half, both at
+      // the same threshold (the launch interval is the trail).
+      const position = new Vec3(LAUNCH_X,
+        flankSign * RUNWAY.half * PAIR_SEAT_Y, SYLLABUS.runwayM);
       const flight = new MissionFlight(policy, this.instruments, pair,
                                        new NumpyPcg64(state, inc), {
         flankSign,

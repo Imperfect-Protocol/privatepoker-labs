@@ -690,6 +690,13 @@ class IrisAdaptation {
  *  windshield and the side viewports share its exposure. */
 const iris = new IrisAdaptation();
 
+/** THE WINDSHIELD'S SHARED LIGHT — computed ONCE per frame from the
+ *  CENTRE pane's camera: the sun-align that drives the glare veil and
+ *  the flare strength, and the aperture the iris settled at. The side
+ *  panes REUSE these numbers exactly (only their PROJECTION differs —
+ *  where the sun lands on each pane); one environment, three windows. */
+const sharedLight = { align: 0.0, exposure: 1.0 };
+
 /** THE HOUR'S GRADE — the controls strip's filter: the instruments
  *  wear the mood's colour over their ink (noon's white grade tints
  *  nothing), so the panel belongs to its hour. The veil draws
@@ -809,7 +816,10 @@ function drawSunGlare(ctx: CanvasRenderingContext2D, cam: Camera): void {
   if (at === null) {
     return;
   }
-  const align = sunAlign(cam);
+  // THE SHARED LIGHT: the veil's strength is the CENTRE pane's align
+  // (one environment, three windows) — the POSITION is this pane's own
+  // projection of the sun
+  const align = sharedLight.align;
   if (align <= 0.05) {
     return;                                // facing away: no glare
   }
@@ -853,7 +863,10 @@ function drawLensFlare(ctx: CanvasRenderingContext2D, cam: Camera): void {
   if (at === null) {
     return;
   }
-  const align = sunAlign(cam);
+  // THE SHARED LIGHT: the flare's strength is the CENTRE pane's align
+  // (one environment, three windows) — the POSITION is this pane's own
+  // projection of the sun
+  const align = sharedLight.align;
   if (align <= 0.05) {
     return;                                 // facing away
   }
@@ -1313,6 +1326,8 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
   // (the GPU uniform's extras.y; the CPU compose and the light ink
   // read the same number)
   iris.update(sunAlign(cam));
+  sharedLight.align = sunAlign(cam);
+  sharedLight.exposure = iris.exposure;
 
   // THE LIGHT LAYER: sun, flare and glare ink — drawn on the light
   // canvas (composited ADDITIVE/plus-lighter between the world and
@@ -1581,23 +1596,31 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
  *  right, at the SAME shared focal (the windshield's own
  *  px-per-degree, so the pane continues the centre view's projection
  *  with no zoom jump at the seam). The GPU world renders through the
- *  yawed camera (the panes are GPU-only: the CPU per-pixel path is
- *  the reference view, the centre pane keeps it). One canvas, one
- *  context: the pane canvas IS the renderer's webgpu context, so no
- *  2D ink rides here — the sky shader's own sun disc and glow are
- *  the pane's light. No HUD instruments either: the panes are
- *  peripheral vision. */
+ *  yawed camera onto its webgpu canvas, and the pane's INK canvas
+ *  (its own additive layer, plus-lighter like the centre's light
+ *  canvas) carries the SAME light laws as the centre pane: the sun's
+ *  disc and glow, the glare veil, the lens flare, and the world
+ *  objects the GPU does not instance (the tower, the houses, the
+ *  CLOUDS) — so all three panes wear one shade, one sky. No HUD
+ *  instruments: the panes are peripheral vision. */
 export function drawSideViewport(canvas: HTMLCanvasElement | null,
+                                 inkCanvas: HTMLCanvasElement | null,
                                  view: DroneView,
                                  world: WorldRenderer | null,
                                  deg: number,
                                  focal: number): void {
   if (canvas === null || world === null || !world.ready) {
+    if (inkCanvas !== null) {
+      hideInk(inkCanvas);
+    }
     return;
   }
   const W = canvas.clientWidth;
   const H = canvas.clientHeight;
   if (W < 8 || H < 8) {
+    if (inkCanvas !== null) {
+      hideInk(inkCanvas);
+    }
     return;                          // the pane is hidden: nothing to do
   }
   const cam = yawedCameraOf(view, W, H, deg);
@@ -1606,6 +1629,51 @@ export function drawSideViewport(canvas: HTMLCanvasElement | null,
   world.setExposure(iris.exposure);
   const eyeHeight = cam.pz - ground.heightAt(cam.px, cam.py);
   world.renderFrame(cam, eyeHeight);
+  // THE PANE'S INK: one additive layer above the pane's world canvas,
+  // carrying the centre pane's own light — the shade parity law
+  if (inkCanvas === null) {
+    return;
+  }
+  const ink = fitCanvas(inkCanvas);
+  ink.clearRect(0, 0, inkCanvas.clientWidth, inkCanvas.clientHeight);
+  ink.globalCompositeOperation = "lighter";
+  drawSun(ink, cam);
+  drawLensFlare(ink, cam);
+  if (world.featuresOf.glare) {
+    drawSunGlare(ink, cam);
+  }
+  ink.globalCompositeOperation = "source-over";
+  drawWorldObjects(ink, cam, false);   // the tower, houses, clouds
+}
+
+/** Rest one pane's ink canvas: clear it, nothing lingers. */
+function hideInk(canvas: HTMLCanvasElement): void {
+  if (canvas.clientWidth < 2) {
+    return;                            // not laid out: already blank
+  }
+  const ctx = canvas.getContext("2d");
+  if (ctx !== null) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }
+}
+
+/** THE DASHBOARD'S SHAPE — a real plane console, not a rectangle:
+ *  rounded top corners (the glareshield's shoulders), straight
+ *  vertical sides, and a straight bottom flush with the canvas's
+ *  bottom edge — the console sits on the cockpit floor. The canvas is
+ *  the bounding box; this path is the panel. */
+function dashboardPath(ctx: CanvasRenderingContext2D,
+                       W: number, H: number): void {
+  const r = Math.min(H * 0.45, W * 0.055);   // the shoulders' round
+  ctx.beginPath();
+  ctx.moveTo(r, 0.0);
+  ctx.lineTo(W - r, 0.0);
+  ctx.quadraticCurveTo(W, 0.0, W, r);       // top-right shoulder
+  ctx.lineTo(W, H);                         // straight right side
+  ctx.lineTo(0.0, H);                       // straight bottom, flush
+  ctx.lineTo(0.0, r);
+  ctx.quadraticCurveTo(0.0, 0.0, r, 0.0);   // top-left shoulder
+  ctx.closePath();
 }
 
 export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): void {
@@ -1613,6 +1681,17 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   const W = canvas.clientWidth;
   const H = canvas.clientHeight;
   ctx.clearRect(0, 0, W, H);
+  // the panel's own body, clipped to the dashboard's shape: the
+  // glareshield's lit lip at the top, the console's deep body below
+  dashboardPath(ctx, W, H);
+  ctx.save();
+  ctx.clip();
+  const body = ctx.createLinearGradient(0.0, 0.0, 0.0, H);
+  body.addColorStop(0.0, "#0d1622");
+  body.addColorStop(0.10, "#060c14");
+  body.addColorStop(1.0, "#03060b");
+  ctx.fillStyle = body;
+  ctx.fillRect(0.0, 0.0, W, H);
   const s = view;
   const SURF_MAX = 0.35;    // mechanical limit, rad
 
@@ -1803,5 +1882,12 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
     ctx.font = "bold 13px Rajdhani, 'SF Mono', monospace";
     ctx.fillText("CONTROLS FROZEN", W / 2, midY + H * 0.32);
   }
+  ctx.restore();                 // the dashboard's shape ends here
+  // the console's lit edge: a thin highlight along the whole sill,
+  // so the panel reads as a physical slab against the world
+  dashboardPath(ctx, W, H);
+  ctx.strokeStyle = "rgba(130,170,200,0.30)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
   ctx.textAlign = "left";
 }
