@@ -1133,7 +1133,21 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
   void foot;
 }
 
-/** The controls square: yoke, rudder pedals, throttle lever. */
+/** The controls square: one NARROW HORIZONTAL STRIP —
+ *        LEFT RUDDER | YOKE | RIGHT RUDDER | A E R T | the RPM bar —
+ * with every label riding the strip's BOTTOM EDGE.
+ *
+ * THE HAND'S INPUTS drive this panel — what the pilot at the controls is
+ * commanding right now (the student's own inputs while it flies), not
+ * merely where the airframe's surfaces happen to be. The A E R T strip
+ * carries the four channels' decisions (A aileron, E elevator, R rudder,
+ * T throttle — ▲ driving the lever up a level, ▼ down a level, · hold;
+ * the beat dot pulses when a decision window just opened; while the
+ * instructor demonstrates there are no discrete decisions — its hand
+ * eases smoothly — the strip rests). The RPM bar reads the engine:
+ * idle at the RIGHT edge, INCREASING LEFTWARDS to full — green at
+ * idle, red at the redline.
+ */
 export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): void {
   const ctx = fitCanvas(canvas);
   const W = canvas.clientWidth;
@@ -1142,198 +1156,188 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   const s = view;
   const SURF_MAX = 0.35;    // mechanical limit, rad
 
-  // THE HAND'S INPUTS drive this panel — what the pilot at the controls
-  // is commanding right now (the student's own inputs while it flies),
-  // not merely where the airframe's surfaces happen to be.
-  // The controls as the SELECTED AIRCRAFT actually holds them — the
-  // machine's own state, read through its sealed getters.
+  // the controls as the SELECTED AIRCRAFT actually holds them — the
+  // machine's own state, read through its sealed getters
   const inAil = s.ail;
   const inElev = s.elev;
   const inRud = s.rud;
   const inThr = Math.max(0.0, Math.min(1.0, s.throttle));
 
-  // THE LAYOUT: the AERT decision strip sits NORTH of the yoke — dead
-  // above it, on the yoke's own column — with the rudder below and the
-  // throttle lever to the east.
-  const yx = W * 0.32;            // the yoke column
-  const yy = H * 0.53;            // the yoke centre
-  const rx = yx;                  // the rudder rides the yoke column
-  const ry = H * 0.85;
-  const tx = W * 0.80;            // the throttle lever, east side
-  const tyTop = H * 0.18;
-  const tyBot = H * 0.62;
+  // THE STRIP: left rudder pedal, yoke, right rudder pedal, the A E R T
+  // decision boxes, the RPM bar — all centred on one row, labels below
+  const textY = H - 8;              // the bottom text band's baseline
+  const midY = (H - 26) / 2 + 4;    // the content row's centre
+  const pl = W * 0.08;              // the left pedal's centre
+  const yk = W * 0.21;              // the yoke's centre
+  const pr = W * 0.355;             // the right pedal's centre
+  const aert0 = W * 0.44;           // the A E R T boxes' left edge
+  const rpmL = W * 0.66;            // the RPM bar's LEFT edge (full)
+  const rpmR = W - 16;              // the RPM bar's RIGHT edge (idle)
 
-  ctx.textAlign = "left";
   ctx.font = "11px Rajdhani, 'SF Mono', monospace";
 
-  // --- AERT decisions (directly above the yoke) -----------------------------
-  // The four control channels and the pilot's decision on each, at every
-  // 0.2 s decision window: A aileron, E elevator, R rudder, T throttle —
-  // ▲ driving the lever up a level, ▼ down a level, · hold. The beat dot
-  // pulses when a decision window just opened. While the instructor
-  // demonstrates there are no discrete decisions — its hand eases
-  // smoothly — the strip rests.
-  ctx.fillStyle = "#3d5a70";
-  ctx.fillText("AERT DECISIONS", yx - 52, 18);
+  // --- the rudder pedals: left of the yoke, right of the yoke --------------
+  const press = (inRud / SURF_MAX) * H * 0.10;   // one forward, one back
+  const pedalH = H * 0.34;
+  for (const side of [-1, 1]) {
+    const cx = side < 0 ? pl : pr;
+    const forward = (inRud > 0 && side > 0) || (inRud < 0 && side < 0);
+    const disp = inRud === 0 ? 0.0 : forward ? -press : press * 0.35;
+    const engaged = inRud !== 0 && forward;
+    // the rest reference: a dashed tick at the pedal's neutral height
+    ctx.strokeStyle = "#232b3d";
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(cx - 11, midY);
+    ctx.lineTo(cx + 11, midY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = engaged ? "#ff8c3a" : "#14283a";
+    ctx.fillRect(cx - 7, midY + disp - pedalH / 2, 14, pedalH);
+  }
+
+  // --- the yoke: aileron rotates the wheel, elevator pushes/pulls it ------
+  const pull = (inElev / SURF_MAX) * H * 0.08;    // nose up = pull = toward pilot
+  const wheelAngle = (inAil / SURF_MAX) * 1.15;   // rad of visual rotation
+  const hw = Math.min(30.0, H * 0.26);            // the horn half-spacing
+  const hornUp = Math.min(18.0, H * 0.16);
+  const dip = Math.min(9.0, H * 0.08);           // the lower bar's depth
+
+  // the neutral cross reference
+  ctx.strokeStyle = "#232b3d";
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(yk - hw - 10, midY);
+  ctx.lineTo(yk + hw + 10, midY);
+  ctx.moveTo(yk, midY - hornUp - 12);
+  ctx.lineTo(yk, midY + dip + 8);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.save();
+  ctx.translate(yk, midY + pull);
+  ctx.rotate(wheelAngle);
+  // the W: two horns, the shallow bar between them
+  ctx.strokeStyle = s.alive ? "#d0ecff" : "#3d5a70";
+  ctx.lineWidth = Math.max(3.0, H * 0.045);
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(-hw, 0);
+  ctx.lineTo(-hw, -hornUp);
+  ctx.moveTo(-hw * 0.55, 0);
+  ctx.lineTo(-hw * 0.55, dip);
+  ctx.lineTo(hw * 0.55, dip);
+  ctx.lineTo(hw * 0.55, 0);
+  ctx.moveTo(hw, 0);
+  ctx.lineTo(hw, -hornUp);
+  ctx.stroke();
+  ctx.fillStyle = s.alive ? "#35586b" : "#3d4658";   // the horn grips
+  for (const hx of [-hw, hw]) {
+    ctx.beginPath();
+    ctx.arc(hx, -hornUp - 2, Math.max(3.5, H * 0.04), 0, 2 * Math.PI);
+    ctx.fill();
+  }
+  ctx.fillStyle = "#ff8c3a";                         // the centre hub
+  ctx.beginPath();
+  ctx.arc(0, 0, 3, 0, 2 * Math.PI);
+  ctx.fill();
+  ctx.restore();
+  ctx.lineCap = "butt";
+
+  // --- A E R T: the four channels' decision boxes --------------------------
+  // ▲ driving the lever up a level, ▼ down a level, · hold/already there;
+  // the beat dot pulses when a decision window just opened. While the
+  // instructor demonstrates (no discrete decisions) the boxes rest.
+  const BOX = Math.max(10.0, Math.min(18.0, H * 0.16));
+  const CHANNEL_LABELS = ["A", "E", "R", "T"];
   ctx.fillStyle = s.handFresh ? "#ff8c3a" : "#0c1a26";
   ctx.beginPath();
-  ctx.arc(yx + 58, 15, 2.5, 0, 2 * Math.PI);
+  ctx.arc(aert0 - 9, midY, 2.5, 0, 2 * Math.PI);
   ctx.fill();
-  const CHANNEL_LABELS = ["A", "E", "R", "T"];
+  ctx.textAlign = "center";
   for (let i = 0; i < 4; i++) {
-    const bx = yx - 52 + i * 26;
+    const bx = aert0 + i * (BOX + 7);
     ctx.strokeStyle = "#14283a";
-    ctx.strokeRect(bx + 0.5, 24.5, 22, 22);
+    ctx.strokeRect(bx + 0.5, midY - BOX / 2 + 0.5, BOX, BOX);
     ctx.fillStyle = "#3d5a70";
-    ctx.fillText(CHANNEL_LABELS[i], bx + 8, 57);
+    ctx.fillText(CHANNEL_LABELS[i], bx + BOX / 2, textY);
     const choice = s.handChoices;
     if (choice === null) {
-      ctx.fillStyle = "#14283a";            // the instructor eases: no decisions
-      ctx.fillText("\u2014", bx + 8, 40);
+      ctx.fillStyle = "#14283a";            // the instructor eases: rest
+      ctx.fillText("\u2014", bx + BOX / 2, midY + 3.5);
       continue;
     }
     const level = choice[i];
     if (level < 0) {                        // hold: the hand rests
       ctx.fillStyle = "#3d5a70";
-      ctx.fillText("\u00b7", bx + 10, 39);
-    } else {                                // a commanded level (a stop)
-      const now = [inAil, inElev, inRud, inThr][i];
-      const nowLevel = levelOf(i, now);   // the stop the lever is at
-      if (level > nowLevel) {               // driving the lever up
-        ctx.fillStyle = "#ff8c3a";
-        ctx.fillText("\u25b2", bx + 7, 40);
-      } else if (level < nowLevel) {         // driving the lever down
-        ctx.fillStyle = "#9fd8ff";
-        ctx.fillText("\u25bc", bx + 7, 41);
-      } else {                               // already at the level
-        ctx.fillStyle = "#3d5a70";
-        ctx.fillText("\u00b7", bx + 10, 39);
-      }
+      ctx.fillText("\u00b7", bx + BOX / 2, midY + 3.5);
+      continue;
+    }
+    const now = [inAil, inElev, inRud, inThr][i];
+    const nowLevel = levelOf(i, now);       // the stop the lever is at
+    if (level > nowLevel) {                 // driving the lever up
+      ctx.fillStyle = "#ff8c3a";
+      ctx.fillText("\u25b2", bx + BOX / 2, midY + 3.5);
+    } else if (level < nowLevel) {          // driving the lever down
+      ctx.fillStyle = "#9fd8ff";
+      ctx.fillText("\u25bc", bx + BOX / 2, midY + 4.5);
+    } else {                                // already at the level
+      ctx.fillStyle = "#3d5a70";
+      ctx.fillText("\u00b7", bx + BOX / 2, midY + 3.5);
     }
   }
-  // the channel legend: what each letter commands
-  ctx.fillStyle = "#3d4658";
-  ctx.fillText("A aileron \u00b7 E elevator", yx - 52, 72);
-  ctx.fillText("R rudder \u00b7 T throttle", yx - 52, 84);
 
-  // --- yoke (aileron rotates the wheel, elevator pushes/pulls it) -----------
-  const travel = 15;                    // px of push/pull travel
-  const pull = (inElev / SURF_MAX) * travel;    // nose up = pull = yoke toward pilot
-  const wheelAngle = (inAil / SURF_MAX) * 1.15; // rad of visual wheel rotation
-
-  // neutral cross reference
-  ctx.strokeStyle = "#232b3d";
-  ctx.setLineDash([4, 4]);
-  ctx.beginPath();
-  ctx.moveTo(yx - 70, yy); ctx.lineTo(yx + 70, yy);
-  ctx.moveTo(yx, yy - 44); ctx.lineTo(yx, yy + 44);
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  ctx.save();
-  ctx.translate(yx, yy + pull);
-  ctx.rotate(wheelAngle);
-  // the W: wheel bar with two horns
-  ctx.strokeStyle = s.alive ? "#d0ecff" : "#3d5a70";
-  ctx.lineWidth = 5;
-  ctx.lineCap = "round";
-  ctx.beginPath();
-  ctx.moveTo(-46, 0);
-  ctx.lineTo(-46, -26);
-  ctx.moveTo(-24, 0);
-  ctx.lineTo(-24, 10);
-  ctx.lineTo(24, 10);
-  ctx.lineTo(24, 0);
-  ctx.moveTo(46, 0);
-  ctx.lineTo(46, -26);
-  ctx.stroke();
-  ctx.fillStyle = s.alive ? "#35586b" : "#3d4658";
-  for (const hx of [-46, 46]) {
-    ctx.beginPath();
-    ctx.arc(hx, -28, 5, 0, 2 * Math.PI);
-    ctx.fill();
-  }
-  // center hub
-  ctx.fillStyle = "#ff8c3a";
-  ctx.beginPath();
-  ctx.arc(0, 0, 4, 0, 2 * Math.PI);
-  ctx.fill();
-  ctx.restore();
-  ctx.lineCap = "butt";
-  ctx.fillStyle = "#3d5a70";
-  ctx.fillText("YOKE", yx - 14, yy + 58);
-  ctx.fillText(inElev >= 0 ? "PULL" : "PUSH", yx + 26, yy + pull - 4);
-
-  // --- rudder pedals ---------------------------------------------------------
-  const press = (inRud / SURF_MAX) * 9;      // one pedal forward, one back
-  for (const side of [-1, 1]) {
-    const forward = (inRud > 0 && side > 0) || (inRud < 0 && side < 0);
-    const disp = forward ? -press : (inRud !== 0 ? press * 0.35 : 0);
-    const engaged = (inRud > 0 && side > 0) || (inRud < 0 && side < 0);
-    ctx.fillStyle = engaged ? "#ff8c3a" : "#14283a";
-    ctx.fillRect(rx + side * 34 - 9, ry + disp - 16, 18, 30);
-  }
-  ctx.strokeStyle = "#232b3d";
-  ctx.setLineDash([4, 4]);
-  ctx.beginPath();
-  ctx.moveTo(rx - 62, ry); ctx.lineTo(rx + 62, ry);
-  ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.fillStyle = "#3d5a70";
-  ctx.fillText("L", rx - 66, ry + 3);
-  ctx.fillText("R", rx + 62, ry + 3);
-  ctx.fillText("RUDDER", rx - 21, ry + 28);
-
-  // --- throttle can: horizontal bars from green (idle) to red (full) ------
-  const th = Math.max(0.0, Math.min(1.0, inThr));
-  const canW = 26;
-  const canH = tyBot - tyTop;
-  ctx.fillStyle = "#1a2030";
-  ctx.fillRect(tx - canW / 2, tyTop, canW, canH);
-  const BARS = 12;
-  const barH = (canH - 4) / BARS;
-  for (let i = 0; i < BARS; i++) {
-    const lit = (i + 0.5) / BARS <= th;      // bars up to the throttle level
-    const t = i / (BARS - 1);                // green at the bottom to red at the top
+  // --- the engine: a horizontal RPM bar, INCREASING LEFTWARDS ---------------
+  // Idle at the right edge, full at the left; green at idle, red at the
+  // redline — the segment ramp runs right (idle) to left (full), lit
+  // from the right edge as the revs rise.
+  const rpm = rpmOf(inThr);
+  const maxRpm = rpmOf(1.0);
+  const revs = Math.max(0.0, Math.min(1.0, rpm / maxRpm));
+  const barH = Math.max(10.0, Math.min(22.0, H * 0.30));
+  const barY = midY - barH / 2;
+  const SEGS = 14;
+  const segW = (rpmR - rpmL) / SEGS;
+  for (let i = 0; i < SEGS; i++) {
+    const xR = rpmR - i * segW;             // i counts leftwards from idle
+    const t = i / (SEGS - 1);               // 0 at idle, 1 at full
     const r = Math.round(70 + (255 - 70) * t);
     const g = Math.round(210 + (70 - 210) * t);
     const b = Math.round(90 + (60 - 90) * t);
+    const lit = (i + 0.5) / SEGS <= revs;
     ctx.fillStyle = lit ? `rgb(${r},${g},${b})` : "#0c1a26";
-    ctx.fillRect(tx - canW / 2 + 2, tyTop + canH - 2 - (i + 1) * barH + 1,
-                 canW - 4, Math.max(1.0, barH - 1.5));
+    ctx.fillRect(xR - segW + 1.5, barY, segW - 3, barH);
   }
   ctx.strokeStyle = "#14283a";
-  ctx.strokeRect(tx - canW / 2 + 0.5, tyTop + 0.5, canW - 1, canH - 1);
-  ctx.fillStyle = "#3d5a70";
-  ctx.fillText("THROTTLE", tx - 27, tyBot + 16);
-  ctx.fillStyle = "#d0ecff";
-  ctx.fillText(`${Math.round(th * 100)}%`, tx - 10, tyBot + 28);
-
-  // --- engine: the RPM lives here, beside the throttle can ---------------
-  ctx.fillStyle = "#35586b";
-  ctx.fillText("RPM", tx + 20, tyTop + 6);
-  ctx.fillStyle = rpmOf(inThr) > 2450 ? "#ff6a5a" : "#35d0ff";
-  ctx.font = "bold 15px Rajdhani, 'SF Mono', monospace";
-  ctx.fillText(rpmOf(inThr).toFixed(0), tx + 20, tyTop + 20);
-
-  // the control state readout, bottom right — what the selected
-  // aircraft is actually holding (the machine's own truth)
-  ctx.textAlign = "right";
-  ctx.fillStyle = "#35586b";
+  ctx.strokeRect(rpmL + 0.5, barY + 0.5, rpmR - rpmL - 1, barH - 1);
+  // ticks every 500 rpm along the scale
+  ctx.beginPath();
+  for (let tick = 500; tick < maxRpm; tick += 500) {
+    const x = rpmR - (tick / maxRpm) * (rpmR - rpmL);
+    ctx.moveTo(x, barY + barH);
+    ctx.lineTo(x, barY + barH + 3);
+  }
+  ctx.stroke();
+  // the number, bottom edge, under the bar's right end
+  ctx.font = "bold 12px Rajdhani, 'SF Mono', monospace";
+  ctx.fillStyle = rpm > 2450 ? "#ff6a5a" : "#35d0ff";
+  ctx.fillText(`RPM ${rpm.toFixed(0)} \u00b7 THR ${Math.round(inThr * 100)}%`,
+              (rpmL + rpmR) / 2, textY);
   ctx.font = "11px Rajdhani, 'SF Mono', monospace";
-  ctx.fillText(`CTL A ${inAil >= 0 ? "+" : ""}${inAil.toFixed(2)}` +
-              ` E ${inElev >= 0 ? "+" : ""}${inElev.toFixed(2)}` +
-              ` R ${inRud >= 0 ? "+" : ""}${inRud.toFixed(2)}` +
-              ` T ${inThr.toFixed(2)}`, W - 10, H - 22);
-  ctx.textAlign = "left";
+
+  // --- the labels: every text rides the BOTTOM EDGE ------------------------
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#3d5a70";
+  ctx.fillText("LEFT RUDDER", pl, textY);
+  ctx.fillText("YOKE", yk, textY);
+  ctx.fillText("RIGHT RUDDER", pr, textY);
 
   if (!s.alive) {
     ctx.fillStyle = "rgba(255,58,48,0.16)";
     ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = "#ff4a3a";
     ctx.font = "bold 13px Rajdhani, 'SF Mono', monospace";
-    ctx.textAlign = "center";
-    ctx.fillText("CONTROLS FROZEN", W / 2, H - 10);
-    ctx.textAlign = "left";
+    ctx.fillText("CONTROLS FROZEN", W / 2, midY + H * 0.32);
   }
+  ctx.textAlign = "left";
 }

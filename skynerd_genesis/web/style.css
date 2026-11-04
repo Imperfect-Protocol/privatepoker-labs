@@ -29,20 +29,22 @@ body {
 
 /* --- the app shell: full width, four regions -------------------------------
  *   toolbar across the top edge;
- *   the instrument sidebar down the right edge, below the toolbar;
+ *   the instrument sidebar down the right edge, below the toolbar,
+ *     ending ABOVE the bottom panel;
  *   the main view filling the rest;
- *   the results panel along the bottom edge, ending at the sidebar's
- *   left edge.
+ *   the results panel along the bottom edge, FULL WIDTH.
  */
 #app {
   height: 100%;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  /* the main view and the bottom panel hold a fixed 70:30 split of the
+   * space below the toolbar, whatever the window's height */
+  grid-template-rows: auto minmax(0, 70fr) minmax(0, 30fr);
   grid-template-areas:
     "toolbar toolbar"
     "main sidebar"
-    "bottom sidebar";
+    "bottom bottom";
 }
 
 /* --- toolbar (top edge, full width) --------------------------------------- */
@@ -157,16 +159,16 @@ label select { text-transform: none; }
   background: #03060b;
   border: 1px solid var(--line);
   border-radius: 0;
-  /* pixel width/height are set by layoutSidebar(): each panel 3:2,
-   * both the same size, together filling the sidebar's full height */
+  /* pixel width/height are set by layoutSidebar(): the view holds
+   * 16:9, the controls square is a narrow horizontal strip of the same
+   * width — together filling the sidebar's height */
 }
 #cockpit-foot { color: var(--dim); font-size: 10px; letter-spacing: 0.05em; min-height: 13px; }
 
 /* --- results panel (bottom edge, ending at the sidebar's left edge) -------- */
 #results {
   grid-area: bottom;
-  max-height: 30vh;
-  overflow: auto;
+  overflow: auto;          /* the row's height IS the panel's height */
   padding: 8px 12px;
   background: var(--panel);
   border-top: 1px solid var(--line);
