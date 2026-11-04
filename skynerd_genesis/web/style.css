@@ -360,13 +360,61 @@ td .na { color: var(--dim); }
   cursor: pointer;           /* the whole poster is the skip button */
   opacity: 1.0;
   transition: opacity 0.7s ease;
-  background: #05070c;
+  background: #140d04;        /* the Sahara dusk under the poster */
   background-image:
     url("/splash.png"),
     url("/public/splash.png");
   background-position: center;
   background-repeat: no-repeat;
   background-size: cover;
+  display: grid;
+  place-items: center;
+  isolation: isolate;
+}
+/* the poster dimmed under the title — not black: SAHARA GOLD DARKNESS,
+   the warm dust the sun sets through. A vertical fade into the deep
+   amber dark + the gold sun's own glow behind the title block */
+#splash::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background:
+    linear-gradient(180deg, rgba(31, 19, 6, 0.10), #1a1106 96%),
+    radial-gradient(circle, rgba(240, 178, 66, 0.22), transparent 34rem);
+}
+#splash .splash-content {
+  width: min(92vw, 760px);
+  padding: 48px 24px;
+  text-align: center;
+}
+#splash h1 {
+  margin: 0;
+  color: #faf3e2;
+  font-family: "Inter Display", Inter, ui-sans-serif, system-ui,
+               -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: clamp(3.2rem, 12vw, 8.5rem);
+  font-weight: 700;
+  line-height: 0.94;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  text-shadow: 0 0 34px rgba(240, 178, 66, 0.55);
+}
+#splash .splash-rule {
+  width: min(380px, 70vw);
+  height: 1px;
+  margin: 26px auto 16px;
+  background: linear-gradient(90deg, transparent, #f0b242, transparent);
+}
+#splash .splash-status {
+  margin: 0;
+  color: #c9b28a;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono",
+               monospace;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
 }
 #splash.fading { opacity: 0.0; pointer-events: none; }
 #splash.gone { display: none; }

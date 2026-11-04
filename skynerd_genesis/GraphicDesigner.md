@@ -699,3 +699,30 @@ POSTER (luminance mean 78, stdev 49 — a flat #05070c screen reads
 under ?boot=skip it is `gone` at once. Both tsconfigs clean; npm
 test 9 suites green; restart-check unchanged (the 2 waves FAILs are
 the concurrent session's wave→pair refactor).
+
+## §20 the splash's gold sun
+
+**THE TITLE'S OWN TYPE** (the user's law): "SKYNERD" rides Inter
+Display — NOT the Heavy weight. index.html's font link gained
+family=Inter+Display:wght@400;700 (Google Fonts), and #splash h1
+now sets font-family "Inter Display" at weight 700 with a touch of
+letterspacing (0.02em) and a softer line-height (0.94). Verified
+in-browser: document.fonts.check('700 64px "Inter Display"') is
+true and the computed style reads the family + weight.
+
+**THE GOLD SUN** (the user: gold sun theme, not green teal): every
+cyan accent went Sahara gold. The title's ink is warm ivory
+#faf3e2 under a gold glow text-shadow rgba(240,178,66,0.55); the
+rule is transparent → #f0b242 → transparent; the radial behind the
+title block is rgba(240,178,66,0.22).
+
+**SAHARA GOLD DARKNESS** (the user: dim with it, not black): the
+wash is warm through and through — the vertical fade runs
+rgba(31,19,6,0.10) → #1a1106 (deep amber dark, the splash's own
+base now #140d04), and the subtitle wears a sand tone #c9b28a.
+Pixel-verified: the wash corners read (26,17,6) — warm, r>b — the
+glow band above the title (120,64,27), the title ink (250,243,226),
+the rule's gold pixels r > b+35.
+
+The lifecycle re-verified after the concurrent session's edits
+settled: fade-on-clock and ?boot=skip both hold.
