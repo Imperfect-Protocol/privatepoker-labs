@@ -1,33 +1,27 @@
 /**
- * The Flight School show: the classroom loop run live, one tick at a time.
- *
- * This is view wiring, not protocol: a SchoolSession (the teach() state
- * machine) hands out flights and the show steps them at the sim's fixed
- * 50 Hz. Narration follows the classroom loop exactly as it runs:
- * "Instructor demonstrates turn left" → "Student repeats turn left" →
- * the goal grade — pass and the next maneuver's demonstration begins,
- * fail and the instructor demonstrates the same maneuver again.
- *
- * EVERYTHING RUNS IN REAL TIME: one 50 Hz tick per frame tick, every
- * demonstration and every repeat rendered as it flies. The classroom
- * is endless (loop: true) — the curriculum wraps lap after lap and the
- * show-and-repeat loop never stops; skipToNextManeuver() is the
- * next-maneuver button, switchToManeuver() the scenario dropdown.
- *
- * THE SCENE holds the classroom's two aircraft — the instructor's and
- * the student's, the same ONE Aircraft class both fly. The panel shows
- * whichever is selected; the flying one is selected automatically. The
- * instructor's trail stays on its entry — it is the ghost path behind
- * the student's repeat.
+ * THE FLIGHT SCHOOL SHOW — the classroom's ONE aircraft, whose levers
+ * belong to whoever the CONTROLS DROPDOWN says (sticky per aircraft,
+ * switchable any tick): the AI, the instructor, or a both-mode (the
+ * AI suggests and learns while the instructor flies, or the AI flies
+ * under the instructor's guardian). The instructor's ideal path flies
+ * invisibly beside — the delta column's reference and the error
+ * wave's teaching source. Attempts repeat endlessly: a flight ends,
+ * the result holds a moment, and the next attempt begins.
  */
 import {
-  FlightSchool, SchoolSession, SchoolFlight, gradeName, currentElementName,
+  FlightSchool, SoloFlight, InstructorTwin, gradeName,
+  type Lesson, type GoalReportRow, RNG0_STATE, RNG0_INC,
 } from "../learning/school.js";
 import { FlightInstruments } from "../learning/instruments.js";
 import { ServoPolicy } from "../learning/servo-tensor.js";
+import type { TensorStateView } from "../learning/servo-tensor.js";
 import { TRIM_SPEED } from "../learning/flight.js";
+import { NumpyPcg64 } from "../core/rng.js";
 import { Aircraft } from "../physics/aircraft.js";
 import { Scene, type SceneAircraft } from "./scene.js";
+import { hudDelta, readoutOf, type HudDelta } from "./hud-delta.js";
+import type { ControlMode } from "../learning/guardian.js";
+import { controlModeLabel } from "../learning/guardian.js";
 
 const TRAIL_CAP = 1200;
 
@@ -35,12 +29,24 @@ const TRAIL_CAP = 1200;
 export const LESSON_PHRASES: Record<string, string> = {
   takeoff: "takeoff",
   level_cruise: "level cruise",
+  climb_to_5000: "climb to 5000 ft",
+  descend_to_1000: "descend to 1000 ft",
   turn_left_180: "turn left",
   turn_right_180: "turn right",
+  climbing_turn_left_180: "climbing turn left",
+  climbing_turn_right_180: "climbing turn right",
+  descending_turn_left_180: "descending turn left",
+  descending_turn_right_180: "descending turn right",
   steep_turn_left_180: "steep turn left",
   steep_turn_right_180: "steep turn right",
+  steep_climbing_turn_left_180: "steep climbing turn left",
+  steep_climbing_turn_right_180: "steep climbing turn right",
+  steep_descending_turn_left_180: "steep descending turn left",
+  steep_descending_turn_right_180: "steep descending turn right",
   stall_recovery: "stall recovery",
-  spin_recovery: "spin recovery",
+  spin_recovery_left: "spin recovery left",
+  spin_recovery_right: "spin recovery right",
+  comprehensive: "the comprehensive flight",
 };
 
 /**
@@ -50,15 +56,34 @@ export const LESSON_PHRASES: Record<string, string> = {
 export const GOAL_PHRASES: Record<string, string> = {
   takeoff: "take off from the runway",
   level_cruise: "hold level cruise",
+  climb_to_5000: "climb to 5000 ft",
+  descend_to_1000: "descend to 1000 ft",
   turn_left_180: "turn left 180\u00b0",
   turn_right_180: "turn right 180\u00b0",
+  climbing_turn_left_180: "turn left 180\u00b0 while climbing",
+  climbing_turn_right_180: "turn right 180\u00b0 while climbing",
+  descending_turn_left_180: "turn left 180\u00b0 while descending",
+  descending_turn_right_180: "turn right 180\u00b0 while descending",
   steep_turn_left_180: "steep turn left 180\u00b0",
   steep_turn_right_180: "steep turn right 180\u00b0",
+  steep_climbing_turn_left_180: "steep turn left 180\u00b0 while climbing",
+  steep_climbing_turn_right_180: "steep turn right 180\u00b0 while climbing",
+  steep_descending_turn_left_180: "steep turn left 180\u00b0 while descending",
+  steep_descending_turn_right_180: "steep turn right 180\u00b0 while descending",
   stall_recovery: "recover from the stall",
-  spin_recovery: "recover from the spin",
+  spin_recovery_left: "recover from the spin",
+  spin_recovery_right: "recover from the right spin",
+  comprehensive: "fly the whole flight: takeoff, climb, turns, steeps, stall, and both spins",
 };
 
-export type ShowStage = "demo" | "repeat";
+/** What the classroom is doing right now: flying the attempt, or
+ * holding the finished result before the next one. */
+export type ShowStage = "flight" | "hold";
+
+const DT = 1.0 / 50.0;
+/** Once a flight is done, the result shows this long before the next
+ * attempt begins. */
+const HOLD_S = 3.0;
 
 export interface SchoolMoment {
   stage: ShowStage;
@@ -66,51 +91,68 @@ export interface SchoolMoment {
   lessonName: string;
   lessonIndex: number;      // 1-based, within the curriculum
   lessonCount: number;      // the curriculum size
-  attempt: number;          // which demonstration of this maneuver (1 = first)
-  seconds: number;          // seconds into the current flight
+  attempt: number;          // which attempt of this maneuver (1 = first)
+  seconds: number;          // seconds into the current attempt
   /** The higher-level goal being realized ("take off from the runway"). */
   goalName: string;
-  /** The element being flown now — the instructor's, or the student's
-   *  chosen one ("roll", "climb", "level off"…). */
+  /** The element being flown now — the AI's chosen one. */
   elementName: string;
+  /** The attempt is over (the result shows until the next one). */
+  finished: boolean;
+  /** The attempt's goal score, once it finished (0-6). */
+  score: number | null;
+  /** The last attempt was the instructor's hands (shown, not graded). */
+  scoreByInstructor: boolean;
+  /** The machine is in the air right now. */
+  flying: boolean;
+  /** Whose hands the controls dropdown put on the levers. */
+  controlsMode: ControlMode;
+  /** The instructor's hand is on the levers right now (a takeover in
+   *  the guarded mode included). */
+  instructorAtControls: boolean;
 }
 
 /**
- * Drives one classroom loop run: demonstrations, the student's repeats,
- * and the re-demonstrations a failed repeat earns — the two aircraft
- * living in the scene the whole time.
+ * The flight school show: ONE aircraft, one controls dropdown choice.
  */
 export class FlightSchoolShow {
-  readonly session: SchoolSession;
   readonly lessonNames: readonly string[];
-  /** The classroom's world: the instructor's and the student's aircraft. */
+  /** The classroom's world: the ONE aircraft. */
   readonly scene = new Scene();
-  private active: SchoolFlight | null = null;
-  private stage: ShowStage = "demo";
-  private lastAttempt = 1;
-  private instructor: SceneAircraft;
-  private student: SceneAircraft;
-  /** The lesson the student's scene entry currently mirrors. */
-  private studentLesson = "";
+  /** The report card's live bookkeeping: the AI's own results (the
+   *  instructor's attempts are shown but never graded). */
+  readonly scores = new Map<string, number>();
+  readonly goalReports = new Map<string, GoalReportRow[]>();
+  readonly attempts = new Map<string, number>();
+  private flight: SoloFlight | null = null;
+  /** Ticks the finished result holds before the next attempt. */
+  private hold = 0;
+  private lesson: Lesson;
+  private entry: SceneAircraft;
+  private lastScore: number | null = null;
+  private lastScoreByInstructor = false;
+  /** The school's monotonic epoch — each attempt's teach pulses land
+   * in the next epoch, keeping the memory time-ordered. */
+  private demoEpoch = 0;
+  /** The classroom's dice, shared by the attempts. */
+  private readonly rng = new NumpyPcg64(RNG0_STATE, RNG0_INC);
+  /** THE CONTROLS DROPDOWN's sticky choice — one aircraft, one mode,
+   *  carried across attempts. The classroom's default is the
+   *  INSTRUCTOR: a fresh scenario demonstrates first (the old
+   *  demo-first pedagogy), and the person hands the aircraft to the
+   *  AI with the dropdown when they want the student's attempt. */
+  controlsMode: ControlMode = "instructor";
 
-  constructor(readonly school: FlightSchool, policy: ServoPolicy) {
-    // Endless: the classroom never closes — the curriculum wraps lap
-    // after lap and the show-and-repeat loop keeps running forever.
-    this.session = new SchoolSession(school, policy, { loop: true });
+  constructor(readonly school: FlightSchool, readonly policy: ServoPolicy) {
     this.lessonNames = [...school.lessons.keys()];
-    this.instructor = this.scene.add({
-      label: "Instructor's Aircraft",
-      aircraft: new Aircraft(school.lessons.values().next().value!.spawn()),
+    this.lesson = school.lessons.values().next().value!;
+    this.entry = this.scene.add({
+      label: "Aircraft",
+      aircraft: new Aircraft(this.lesson.spawn()),
       hand: { choices: null, fresh: false },
       trail: [], flying: false, dead: false,
     });
-    this.student = this.scene.add({
-      label: "Student's Aircraft",
-      aircraft: new Aircraft(school.lessons.values().next().value!.spawn()),
-      hand: { choices: null, fresh: false },
-      trail: [], flying: false, dead: false,
-    });
-    this.beginFlight();
+    this.startFlight();
   }
 
   static withFreshPolicy(): FlightSchoolShow {
@@ -118,162 +160,203 @@ export class FlightSchoolShow {
     return new FlightSchoolShow(school, new ServoPolicy());
   }
 
-  get moment(): SchoolMoment {
-    const active = this.active;
-    const lesson = active?.lesson;
-    const phrase = lesson ? LESSON_PHRASES[lesson.name] ?? lesson.name : "";
-    const element = active === null ? "" : currentElementName(active);
-    const elementText = element === "" ? "" : ` — element: ${element}`;
-    let narration: string;
-    if (this.stage === "demo") {
-      narration = (active?.attempt ?? 1) > 1
-        ? `Instructor demonstrates ${phrase} again${elementText}`
-        : `Instructor demonstrates ${phrase}${elementText}`;
-    } else {
-      narration = `Student repeats ${phrase}${elementText}`;
+  /** Begin the next attempt of the chosen maneuver, from its start
+   * (the lesson's spawn: the runway for takeoff, level flight at
+   * 3000 ft / 80 mph for everything else), in the controls mode the
+   * dropdown last chose. */
+  private startFlight(): void {
+    const twin = new InstructorTwin(this.lesson);
+    this.flight = new SoloFlight(this.school, this.lesson, this.policy,
+                                 this.rng, this.demoEpoch++,
+                                 this.controlsMode, twin);
+    this.entry = this.scene.replace(this.entry, {
+      label: "Aircraft",
+      aircraft: this.flight.aircraft,
+      hand: { choices: null, fresh: false },
+      trail: [], flying: true, dead: false,
+    });
+  }
+
+  /**
+   * Fly the chosen maneuver from its beginning: a fresh attempt, in
+   * the controls mode the dropdown holds.
+   */
+  flyLesson(name: string): void {
+    const lesson = this.school.lessons.get(name);
+    if (lesson === undefined) {
+      throw new Error(`unknown lesson: ${name}`);
     }
-    const lessonIndex = lesson === undefined
-      ? this.lessonNames.length
-      : this.lessonNames.indexOf(lesson.name) + 1;
+    this.flight?.release();
+    this.flight = null;
+    this.hold = 0;
+    this.lesson = lesson;
+    this.lastScore = null;
+    this.lastScoreByInstructor = false;
+    this.startFlight();
+  }
+
+  /** The next-maneuver button: fly the next maneuver from its
+   *  beginning (the curriculum wraps at the end). */
+  skipToNextManeuver(): void {
+    const index = this.lessonNames.indexOf(this.lesson.name);
+    this.flyLesson(this.lessonNames[(index + 1) % this.lessonNames.length]);
+  }
+
+  /** The scenario dropdown: the chosen maneuver, flown from the
+   *  beginning. */
+  switchToManeuver(name: string): void {
+    this.flyLesson(name);
+  }
+
+  /** The controls dropdown: whose hands are on the ONE aircraft's
+   * levers. Sticky — it survives every attempt and every switch. */
+  setControlsMode(mode: ControlMode): void {
+    this.controlsMode = mode;
+    if (this.flight !== null) {
+      this.flight.controlsMode = mode;
+    }
+  }
+
+  /** The machine's scene entry (its aircraft + flight trail). */
+  get aircraftEntry(): SceneAircraft {
+    return this.entry;
+  }
+
+  /** THE AI STATE LOG's subject: the machine's tensor network view
+   *  (null while the result holds between attempts). */
+  get aircraftStateView(): TensorStateView | null {
+    return this.flight === null ? null : this.flight.stateView();
+  }
+
+  /** The AI log's delta column: the machine against the instructor's
+   *  ideal path beside it, in pilot's units (null between attempts). */
+  get instructorDelta(): HudDelta | null {
+    if (this.flight === null) {
+      return null;
+    }
+    return hudDelta(readoutOf(this.entry.aircraft),
+                    readoutOf(this.flight.twinAircraft));
+  }
+
+  /** The wiki tab's scenario description: the current lesson's title,
+   *  its higher-level goal, its element chain, and its known goals. */
+  get wiki(): {
+    title: string; goal: string;
+    elements: readonly string[]; goals: readonly string[];
+  } {
+    const spec = this.school.goalSpec(this.lesson);
     return {
-      stage: this.stage,
+      title: LESSON_PHRASES[this.lesson.name] ?? this.lesson.name,
+      goal: GOAL_PHRASES[this.lesson.name] ?? this.lesson.name,
+      elements: this.lesson.phases.map((phase) => phase.name),
+      goals: spec.goals.map((goal) => goal.label),
+    };
+  }
+
+  /** The entry to follow: the ONE aircraft, on the ground or in the
+   *  air — it is all the classroom has. */
+  get flyingEntry(): SceneAircraft {
+    return this.entry;
+  }
+
+  get moment(): SchoolMoment {
+    const phrase = LESSON_PHRASES[this.lesson.name] ?? this.lesson.name;
+    const flying = this.flight !== null;
+    const finished = this.hold > 0;
+    const mode = this.flight?.controlsMode ?? this.controlsMode;
+    const instructorHolds = this.flight?.instructorHolds ?? false;
+    const element = this.flight !== null
+      ? this.flight.chosenElement.name : "";
+    const elementText = element === "" ? "" : ` \u2014 element: ${element}`;
+    const whoText = instructorHolds
+      ? "the instructor has the controls" : "the AI has the controls";
+    let narration: string;
+    if (finished) {
+      const by = this.lastScoreByInstructor ? " (the instructor's hands)" : "";
+      const scoreText = this.lastScore !== null
+        ? ` \u2014 score ${this.lastScore.toFixed(2)}/6${by}` : "";
+      narration = `${phrase} finished${scoreText}`;
+    } else if (flying) {
+      narration = `${phrase}${elementText} \u00b7 ${whoText}`;
+    } else {
+      narration = `${phrase} \u2014 ready`;
+    }
+    const lessonIndex = this.lessonNames.indexOf(this.lesson.name) + 1;
+    return {
+      stage: finished ? "hold" : "flight",
       narration,
-      lessonName: lesson?.name ?? "",
+      lessonName: this.lesson.name,
       lessonIndex: Math.max(1, lessonIndex),
       lessonCount: this.lessonNames.length,
-      attempt: active?.attempt ?? this.lastAttempt,
-      seconds: active === null ? 0.0 : active.flight.seconds,
-      goalName: lesson === undefined ? ""
-        : GOAL_PHRASES[lesson.name] ?? lesson.name,
+      attempt: (this.attempts.get(this.lesson.name) ?? 0) + 1,
+      seconds: this.flight?.seconds ?? 0.0,
+      goalName: GOAL_PHRASES[this.lesson.name] ?? this.lesson.name,
       elementName: element,
+      finished,
+      score: this.lastScore,
+      scoreByInstructor: this.lastScoreByInstructor,
+      flying,
+      controlsMode: mode,
+      instructorAtControls: instructorHolds,
     };
   }
 
   /**
-   * Advance the classroom by one 50 Hz tick — real time, every flight
-   * rendered as it flies, no shortcuts.
+   * Advance by one 50 Hz tick — real time, every flight rendered as it
+   * flies, no shortcuts. The attempt flies until the machine lands or
+   * its plan completes; the result holds a moment; the next attempt
+   * begins (endlessly — the classroom never stops).
    */
   step(): void {
-    if (this.active === null) {
+    if (this.flight !== null) {
+      const flight = this.flight;
+      if (!flight.step()) {
+        this.entry.flying = false;
+        this.entry.dead = this.school.grounded(flight.aircraft.body);
+        const byInstructor = flight.controlsMode === "instructor";
+        const score = flight.goalScore;
+        const name = this.lesson.name;
+        this.attempts.set(name, (this.attempts.get(name) ?? 0) + 1);
+        this.lastScore = score;
+        this.lastScoreByInstructor = byInstructor;
+        // The report card grades the AI's own hands only.
+        if (!byInstructor) {
+          this.scores.set(name, score);
+          this.goalReports.set(name, flight.goalVerdicts());
+        }
+        this.flight = null;
+        this.hold = Math.round(HOLD_S / DT);
+      } else {
+        this.refreshEntry(this.entry, flight);
+      }
       return;
     }
-    const flight = this.active;
-    const more = flight.flight.step();
-    this.refreshEntry(flight);
-    if (!more) {
-      this.finishFlight(flight);
+    if (this.hold > 0) {
+      this.hold -= 1;
+      if (this.hold === 0) {
+        this.skipToNextManeuver();   // the endless classroom's next turn
+      }
     }
   }
 
-  /** The next-maneuver button: leave the current flight where it stands
-   *  (whatever the demonstration already stamped stays learned) and move
-   *  the classroom on to the next maneuver right now. */
-  skipToNextManeuver(): void {
-    if (this.active === null) {
-      return;
-    }
-    this.session.skipLesson();
-    this.beginFlight();
-  }
-
-  /** The scenario dropdown: SAME student, SAME memory — every tensor and
-   *  weight carried over untouched — placed with the instructor into the
-   *  chosen scenario. The current flight is dropped where it stands and
-   *  the chosen maneuver's demonstration begins. */
-  switchToManeuver(name: string): void {
-    this.session.switchLesson(name);
-    this.beginFlight();
-  }
-
-  /** The instructor's scene entry (its aircraft + demonstration trail). */
-  get instructorEntry(): SceneAircraft {
-    return this.instructor;
-  }
-
-  /** The student's scene entry (its aircraft + repeat trail). */
-  get studentEntry(): SceneAircraft {
-    return this.student;
-  }
-
-  /** The entry whose flight is in the air right now (the instructor's
-   *  during a demonstration, the student's during a repeat). */
-  get flyingEntry(): SceneAircraft {
-    return this.stage === "demo" ? this.instructor : this.student;
-  }
-
-  /** Mirror the flying flight into its scene entry: the hand's decisions
-   *  and the path it is carving. */
-  private refreshEntry(flight: SchoolFlight): void {
-    const entry = flight.stage === "demo" ? this.instructor : this.student;
-    entry.hand = flight.flight.handInputs;
-    const position = flight.flight.aircraft.body.position;
+  /** Mirror the flying attempt into its scene entry: the hand's
+   *  decisions and the path it is carving. */
+  private refreshEntry(entry: SceneAircraft, flight: SoloFlight): void {
+    entry.hand = flight.handInputs;
+    const position = flight.aircraft.body.position;
     entry.trail.push({ x: position.x, y: position.y, z: position.z });
     if (entry.trail.length > TRAIL_CAP) {
       entry.trail.shift();
     }
   }
 
-  private beginFlight(): void {
-    const next = this.session.nextFlight();
-    if (next === null) {
-      // Unreachable in the endless classroom (loop: true) — kept for the
-      // type's honesty: the show always has a flight in the air.
-      this.active = null;
-      return;
-    }
-    this.active = next;
-    this.stage = next.stage === "demo" ? "demo" : "repeat";
-    this.lastAttempt = next.attempt;
-    if (next.stage === "demo") {
-      // The instructor's next machine; the student's entry will preview
-      // the start it will inherit for this lesson.
-      this.instructor = this.scene.replace(this.instructor, {
-        label: "Instructor's Aircraft",
-        aircraft: next.flight.aircraft,
-        hand: { choices: null, fresh: false },
-        trail: [], flying: true, dead: false,
-      });
-      if (this.studentLesson !== next.lesson.name) {
-        this.studentLesson = next.lesson.name;
-        this.student = this.scene.replace(this.student, {
-          label: "Student's Aircraft",
-          aircraft: new Aircraft(this.studentStartBody(next.lesson.name)),
-          hand: { choices: null, fresh: false },
-          trail: [], flying: false, dead: false,
-        });
-      }
-    } else {
-      this.student = this.scene.replace(this.student, {
-        label: "Student's Aircraft",
-        aircraft: next.flight.aircraft,
-        hand: { choices: null, fresh: false },
-        trail: [], flying: true, dead: false,
-      });
-    }
-  }
-
-  /** The machine the student will fly this lesson from: the instructor's
-   *  handoff state (a fresh copy of the same snapshot ExamFlight takes),
-   *  or the lesson's spawn. */
-  private studentStartBody(lessonName: string) {
-    const lesson = this.school.lessons.get(lessonName)!;
-    const start = this.school.preparedStart(lesson);
-    return start === null ? lesson.spawn() : start.body;
-  }
-
-  private finishFlight(flight: SchoolFlight): void {
-    const entry = flight.stage === "demo" ? this.instructor : this.student;
-    entry.flying = false;
-    entry.dead = flight.flight.finished && this.school.grounded(flight.flight.aircraft.body);
-    this.beginFlight();
-  }
-
   /**
    * The report card rows: attempts, score, grade, and EACH MANEUVER'S
-   * KNOWN GOALS — the goal list is printed up front (before the repeat)
-   * and each goal earns its verdict (✓/±/✗) once the student has
-   * repeated the maneuver. Rows cover the whole curriculum; when a
-   * golden reference is supplied its score is compared too.
+   * KNOWN GOALS — the goal list is printed up front (before the flight)
+   * and each goal earns its verdict (✓/±/✗) once the AI has flown the
+   * maneuver. Rows cover the whole curriculum; when a golden
+   * reference is supplied (the boot brain's own scores) each flight
+   * is compared against it.
    */
   reportRows(goldenLessons: readonly {
     lesson: string; attempts: number; score: number;
@@ -285,8 +368,6 @@ export class FlightSchoolShow {
   }> {
     const goldens = new Map(goldenLessons.map((g) => [g.lesson, g]));
     const rows: ReturnType<FlightSchoolShow["reportRows"]> = [];
-    // Every maneuver of the curriculum gets a row; golden first when the
-    // frozen reference is loaded, then any not covered by it.
     const names = goldenLessons.length > 0
       ? goldenLessons.map((g) => g.lesson)
       : [...this.school.lessons.keys()];
@@ -296,18 +377,18 @@ export class FlightSchoolShow {
         continue;
       }
       const golden = goldens.get(name);
-      const report = this.session.goalReports.get(name);
-      const score = this.session.scores.get(name) ?? null;
-      const attempts = this.session.attempts.get(name) ?? 0;
+      const report = this.goalReports.get(name);
+      const score = this.scores.get(name) ?? null;
+      const attempts = this.attempts.get(name) ?? 0;
       const goals = (report ?? this.school.goalSpec(lesson).goals.map((goal) => ({
         label: goal.label, fraction: -1.0,
       }))).map((goal) =>
         goal.fraction < 0.0
-          ? `– ${goal.label}`
-          : `${goal.fraction >= 1.0 ? "✓" : goal.fraction >= 0.5 ? "±" : "✗"} ${goal.label}`)
-        .join(" · ");
+          ? `\u2013 ${goal.label}`
+          : `${goal.fraction >= 1.0 ? "\u2713" : goal.fraction >= 0.5 ? "\u00b1" : "\u2717"} ${goal.label}`)
+        .join(" \u00b7 ");
       const exact = score !== null && golden !== undefined
-        ? Math.abs(score - golden.score) < 5e-4 && attempts === golden.attempts
+        ? Math.abs(score - golden.score) < 5e-4
         : null;
       rows.push({
         lesson: name,

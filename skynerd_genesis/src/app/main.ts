@@ -34,9 +34,16 @@ import {
 } from "./cockpit.js";
 import { FlightSchoolShow } from "./school-show.js";
 import { WavesShow } from "./waves-show.js";
-import { FlightSchool } from "../learning/school.js";
+import { BootTrainer } from "./boot-train.js";
+import { FlightSchool, elementNameOf } from "../learning/school.js";
+import type { TensorStateView } from "../learning/servo-tensor.js";
+import type { HudDelta } from "./hud-delta.js";
+import type { ControlMode } from "../learning/guardian.js";
+import { controlModeLabel } from "../learning/guardian.js";
 import { FlightInstruments } from "../learning/instruments.js";
 import { TRIM_SPEED } from "../learning/flight.js";
+import { drawBrainView, tensorCounts } from "./boot-brain.js";
+import { ServoPolicy } from "../learning/servo-tensor.js";
 import type { Scene, SceneAircraft } from "./scene.js";
 
 interface GoldenLesson {
@@ -49,6 +56,10 @@ interface GoldenLesson {
 const DT = 0.02;
 
 const els = {
+  app: document.getElementById("app")!,
+  bar: document.getElementById("bar")!,
+  sideGrip: document.getElementById("sideGrip")!,
+  bottomGrip: document.getElementById("bottomGrip")!,
   sky: document.getElementById("sky") as HTMLCanvasElement,
   status: document.getElementById("status")!,
   narration: document.getElementById("narration")!,
@@ -56,19 +67,27 @@ const els = {
   speed: document.getElementById("speed") as HTMLSelectElement,
   scenario: document.getElementById("scenario") as HTMLSelectElement,
   aircraft: document.getElementById("aircraft") as HTMLSelectElement,
+  controls: document.getElementById("controls") as HTMLSelectElement,
   next: document.getElementById("next") as HTMLButtonElement,
   restart: document.getElementById("restart") as HTMLButtonElement,
   zoomIn: document.getElementById("zoomIn") as HTMLButtonElement,
   zoomOut: document.getElementById("zoomOut") as HTMLButtonElement,
   zoomReset: document.getElementById("zoomReset") as HTMLButtonElement,
   badge: document.getElementById("badge")!,
-  schoolTbody: document.querySelector("#school tbody") as HTMLElement,
+  tabWiki: document.getElementById("tabWiki")!,
+  tabAi: document.getElementById("tabAi")!,
   results: document.getElementById("results") as HTMLElement,
   cockpit: document.getElementById("cockpit") as HTMLElement,
   cockpitTitle: document.getElementById("cockpit-title")!,
   cockpitFoot: document.getElementById("cockpit-foot")!,
   cockpitCanvas: document.getElementById("cockpitCanvas") as HTMLCanvasElement,
   controlsCanvas: document.getElementById("controlsCanvas") as HTMLCanvasElement,
+  boot: document.getElementById("boot") as HTMLElement,
+  bootFill: document.getElementById("bootFill") as HTMLElement,
+  bootLog: document.getElementById("bootLog") as HTMLElement,
+  bootBrain: document.getElementById("bootBrain") as HTMLCanvasElement,
+  bootExpand: document.getElementById("bootExpand") as HTMLButtonElement,
+  bootDone: document.getElementById("bootDone") as HTMLButtonElement,
 };
 
 /** The scenario ids: every lesson name, then the drone attack waves. */
@@ -79,6 +98,9 @@ const state = {
   school: null as FlightSchoolShow | null,
   /** The drone attack waves (or null). */
   waves: null as WavesShow | null,
+  /** The boot-trained brain — transplanted into the student and every
+   *  newborn drone. */
+  brain: null as ServoPolicy | null,
   /** Which scenario is running. */
   scenario: "" as string,
   /** The frozen classroom reference (per-maneuver golden scores). */
@@ -121,10 +143,14 @@ function followTarget(): SceneAircraft | null {
     return world.current;
   }
   const school = state.school;
-  return school === null ? null : school.flyingEntry;
-}
-
-/** Keep the scene's selection honest: follow the action unless pinned. */
+  if (school === null) {
+    return null;
+  }
+  // ONE aircraft: it is the classroom's whole sky — on the ground or
+  // in the air, whoever holds the levers. A manual dropdown pick pins
+  // whichever aircraft the person chose (here, always this one).
+  return school.flyingEntry;
+}/** Keep the scene's selection honest: follow the action unless pinned. */
 function autoSelect(): void {
   const world = scene();
   if (world === null || state.pinned) {
@@ -145,25 +171,41 @@ function autoSelect(): void {
  *  exactly 3:2, both the same size, the two of them filling the whole
  *  vertical area — so the sidebar (an auto grid column) is exactly as
  *  wide as the panels need and no space is left under the controls. */
+/** The sidebar's explicit width once the grip has dragged it (null: the
+ *  column sizes itself to its panels). */
+let sideWidth: number | null = null;
+
 function layoutSidebar(): void {
   const aside = els.cockpit;
   const style = getComputedStyle(aside);
   const padY = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+  const padX = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
   const gap = parseFloat(style.rowGap) || 8.0;
   // Everything in the column that is not a panel: its measured height
   // comes off the panels' budget, whatever the markup grows into.
   const panels = [els.cockpitCanvas, els.controlsCanvas];
   const others = [...aside.children].filter(
-    (child) => !(child instanceof HTMLCanvasElement));
+    (child): child is HTMLElement => !(child instanceof HTMLCanvasElement));
   const used = others.reduce((sum, child) => sum + child.offsetHeight, 0.0);
   const gaps = gap * (others.length + panels.length - 1);
   const avail = aside.clientHeight - padY;
-  const panelH = Math.max(120.0, (avail - used - gaps) / 2.0);
-  const panelW = Math.round(panelH * 1.5);
-  for (const canvas of panels) {
-    canvas.style.width = `${panelW}px`;
-    canvas.style.height = `${Math.round(panelH)}px`;
+  // The controls square is a NARROW horizontal strip; the view takes the
+  // rest and holds 16:9. The grip may have pinned the column narrower or
+  // wider than that: the view fits INSIDE the column (16:9 preserved),
+  // the strip stays proportional to the view.
+  let stripH = Math.max(60.0,
+    Math.min(140.0, (avail - used - gaps) * 0.22));
+  let viewH = Math.max(120.0, avail - used - gaps - stripH);
+  let viewW = Math.round(viewH * 16 / 9);
+  if (sideWidth !== null && viewW > sideWidth - padX) {
+    viewW = Math.max(120.0, Math.round(sideWidth - padX));
+    viewH = Math.round(viewW * 9 / 16);
+    stripH = Math.max(48.0, Math.min(140.0, Math.round(viewH * 0.30)));
   }
+  els.cockpitCanvas.style.width = `${viewW}px`;
+  els.cockpitCanvas.style.height = `${Math.round(viewH)}px`;
+  els.controlsCanvas.style.width = `${viewW}px`;
+  els.controlsCanvas.style.height = `${Math.round(stripH)}px`;
 }
 
 function fitCanvas(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
@@ -179,9 +221,9 @@ function fitCanvas(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
 
 function altitudeTint(z: number): string {
   const t = Math.max(0.0, Math.min(1.0, z / 180.0));
-  const r = Math.round(255 + (87 - 255) * t);
-  const g = Math.round(122 + (212 - 122) * t);
-  const b = Math.round(74 + (255 - 74) * t);
+  const r = Math.round(30 + (140 - 30) * t);
+  const g = Math.round(110 + (235 - 110) * t);
+  const b = Math.round(150 + (255 - 150) * t);
   return `rgb(${r},${g},${b})`;
 }
 
@@ -232,7 +274,7 @@ function drawSky(): void {
   const sy = (x: number) => H / 2 - (x - cx) * scale;
 
   // world grid, fixed to the ground
-  ctx.strokeStyle = "#161c2a";
+  ctx.strokeStyle = "#0c2334";
   ctx.lineWidth = 1;
   for (let gy = Math.floor((cy - span / 2) / 50) * 50;
        gy <= cy + span / 2; gy += 50) {
@@ -256,32 +298,14 @@ function drawSky(): void {
   drawSchoolSky(ctx, sx, sy);
 }
 
-/** The classroom's sky: the instructor's demonstration ghosted behind
- *  the student's repeat, both machines drawn. */
+/** The classroom's sky: the ONE aircraft's flight path. */
 function drawSchoolSky(ctx: CanvasRenderingContext2D,
                        sx: (y: number) => number,
                        sy: (x: number) => number): void {
   const school = state.school!;
-  const instructor = school.instructorEntry;
-  const student = school.studentEntry;
-  // the demonstration path, ghosted behind the repeat
-  const ghost = instructor.trail;
-  if (school.moment.stage === "repeat" && ghost.length > 1) {
-    ctx.strokeStyle = "rgba(139,150,171,0.30)";
-    ctx.lineWidth = 1.2;
-    ctx.setLineDash([5, 6]);
-    ctx.beginPath();
-    ctx.moveTo(sx(ghost[0].y), sy(ghost[0].x));
-    for (const p of ghost) {
-      ctx.lineTo(sx(p.y), sy(p.x));
-    }
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
-  for (const entry of [instructor, student]) {
-    drawTrail(ctx, entry, sx, sy);
-    drawAircraftTop(ctx, entry, sx, sy, 10);
-  }
+  const entry = school.aircraftEntry;
+  drawTrail(ctx, entry, sx, sy);
+  drawAircraftTop(ctx, entry, sx, sy, 10);
 }
 
 /** The waves' sky: every drone's trail, the swarm's connections, and
@@ -391,7 +415,7 @@ function renderNarration(): void {
       `${waves.aliveCount} flying \u00b7 ${waves.births} born \u00b7 ` +
       `${waves.obituaries} screams heard \u00b7 flock ${waves.flockSize}` +
       ` \u00b7 links ${waves.links().length}`;
-    els.results.hidden = true;
+    els.results.hidden = false;
     els.badge.textContent = "";
     els.badge.className = "";
     return;
@@ -404,45 +428,250 @@ function renderNarration(): void {
   els.narration.textContent = moment.narration;
   els.narration.className = `narration stage-${moment.stage}`;
   const attempt = moment.attempt > 1 ? ` \u00b7 attempt ${moment.attempt}` : "";
-  const score = school.session.scores.get(moment.lessonName);
-  const scoreText = score === undefined ? "" : ` \u00b7 last repeat ${score.toFixed(2)}/6`;
-  const lapText = school.session.laps > 0 ? ` \u00b7 lap ${school.session.laps + 1}` : "";
-  const intent = ` \u00b7 goal: ${moment.goalName} \u00b7 element: ${moment.elementName}`;
+  const score = school.scores.get(moment.lessonName);
+  const scoreText = score === undefined ? "" : ` \u00b7 last flight ${score.toFixed(2)}/6`;
+  const intent = moment.flying
+    ? ` \u00b7 goal: ${moment.goalName} \u00b7 element: ${moment.elementName}` : "";
+  const finishedText = moment.finished ? " \u00b7 flight finished" : "";
+  const byText = moment.scoreByInstructor ? " (the instructor's hands)" : "";
+  const whoText = moment.instructorAtControls
+    ? `\u2691 INSTRUCTOR AT THE CONTROLS (${controlModeLabel(moment.controlsMode)})`
+    : `${controlModeLabel(moment.controlsMode)} at the controls`;
   els.status.textContent =
     `maneuver ${moment.lessonIndex}/${moment.lessonCount} \u00b7 ${moment.lessonName}` +
-    `${attempt}${scoreText}${lapText}${intent} \u00b7 t ${moment.seconds.toFixed(1)}s \u00b7 ` +
-    `${moment.stage === "demo" ? "instructor at the controls"
-      : "student at the controls"}`;
+    `${attempt}${scoreText}${byText}${intent}${finishedText} \u00b7 t ${moment.seconds.toFixed(1)}s \u00b7 ` +
+    whoText;
   els.results.hidden = false;
-  refreshSchoolTable();
+  updateBadge();
 }
 
-function refreshSchoolTable(): void {
+// --- the bottom panel's TAB GROUP --------------------------------------------
+// Tab 1: the scenario's wiki-style description. Tab 2: the live AI state
+// log — one row per decision window of the selected AI, newest on top.
+
+const tabButtons =
+  [...document.querySelectorAll<HTMLButtonElement>(".tab")];
+
+/** How many decision rows the live log keeps (newest first). */
+const AI_LOG_ROWS = 20;
+
+const tabs = {
+  active: "wiki" as "wiki" | "ai",
+  wikiKey: "",
+  /** Which AI the log belongs to (a new subject clears the log). */
+  aiKey: "",
+  aiLastDecision: -1,
+  rows: [] as AiLogRow[],
+};
+
+/** One row of the live log. The same state held over many decision
+ *  windows collapses into ONE row: firstTick is where it began,
+ *  lastTick is where it is now (the tick cell shows both). */
+interface AiLogRow {
+  firstTick: number;
+  lastTick: number;
+  /** What makes this row THIS row — labels only, the drifting
+ *      shares and the live delta never take part in the identity. */
+  key: string;
+  /** The row's <td> cells after the tick cell. */
+  cells: string;
+}
+
+for (const button of tabButtons) {
+  button.addEventListener("click", () => {
+    tabs.active = button.dataset.tab as "wiki" | "ai";
+    for (const other of tabButtons) {
+      other.classList.toggle("active", other === button);
+    }
+    els.tabWiki.hidden = tabs.active !== "wiki";
+    els.tabAi.hidden = tabs.active !== "ai";
+  });
+}
+
+/** The selected AI's state, per scenario: the classroom's student, or
+ *  the drone the aircraft dropdown holds. */
+function aiSubject(): {
+  view: TensorStateView | null;
+  goalName: string;
+  delta: HudDelta | null;
+  key: string;
+  note: string;
+} {
+  if (state.scenario === WAVES_SCENARIO && state.waves !== null) {
+    const waves = state.waves;
+    const label = waves.scene.current?.label ?? "";
+    return {
+      view: waves.selectedStateView,
+      goalName: "free flight",
+      delta: waves.carpetDelta,
+      key: `waves|${label}`,
+      note: "select a flying drone in the aircraft dropdown",
+    };
+  }
   const school = state.school;
   if (school === null) {
-    return;
+    return { view: null, goalName: "", delta: null, key: "", note: "" };
   }
   const moment = school.moment;
-  const key = `${moment.lessonIndex}|${moment.lessonName}|` +
-    `${moment.attempt}|${school.session.scores.size}|${school.session.goalReports.size}`;
-  if (key === state.reportKey) {
-    return;
+  return {
+    view: school.aircraftStateView,
+    goalName: moment.goalName,
+    delta: school.instructorDelta,
+    key: `school|${moment.lessonName}|${moment.attempt}`,
+    note: moment.finished
+      ? `the result holds \u2014 the next attempt begins in a moment`
+      : "the aircraft is waiting to fly",
+  };
+}
+
+/** A class label split for display: the text, and the parenthetical
+ *  detail that belongs on the grey row below it ("accelerating
+ *  descent" / "(gaining speed, losing altitude)"). */
+function splitLabel(label: string): { main: string; detail: string } {
+  const at = label.indexOf(" (");
+  if (at < 0) {
+    return { main: label, detail: "" };
   }
-  state.reportKey = key;
-  const rows = school.reportRows(state.golden ?? []);
-  const body = rows.map((row) => {
-    const score = row.score === null ? "\u2026"
-      : `${row.score.toFixed(2)} (${row.grade ?? ""})`;
-    const mark = row.exact === null
-      ? `<span class="na">\u2026</span>`
-      : row.exact ? `<span class="ok">\u2713 exact</span>`
-        : `<span class="bad">\u2717 mismatch</span>`;
-    return `<tr><td>${row.lesson.replace(/_/g, " ")}</td>` +
-      `<td>${row.attempts}</td><td>${score}</td>` +
-      `<td class="goals">${row.goals}</td><td>${mark}</td></tr>`;
-  });
-  els.schoolTbody.innerHTML = body.join("");
-  updateBadge();
+  return { main: label.slice(0, at), detail: label.slice(at + 1) };
+}
+
+/** The grey detail line (empty when the label has no parenthetical). */
+function detailLine(detail: string): string {
+  return detail === "" ? "" : `<div class="dom">${detail}</div>`;
+}
+
+/** One tensor cell: the fired classification, then the 5 dominant ones
+ *  with their % belonging. */
+function tensorCell(className: string, share: number,
+                    dominant: readonly { label: string; share: number }[]): string {
+  const fired = splitLabel(className);
+  const firedShare = share > 0.0
+    ? ` <span class="dom">${Math.round(share * 100)}%</span>` : "";
+  const domLines = dominant.slice(1).map((d) => {
+    const entry = splitLabel(d.label);
+    return `<div>${entry.main} ${Math.round(d.share * 100)}%</div>` +
+           detailLine(entry.detail);
+  }).join("");
+  return `<td><div class="cls">${fired.main}${firedShare}</div>` +
+         detailLine(fired.detail) +
+         `<div class="dom">${domLines}</div></td>`;
+}
+
+/** The log's header (the requested columns, one per tensor). */
+const AI_TABLE_HEAD =
+  "<thead><tr><th>tick</th><th>goal</th><th>element</th><th>situation</th>" +
+  "<th>LocationTensor</th><th>FlightTensor</th><th>EnergyTensor</th>" +
+  "<th>ControlsTensor</th><th>&Delta;</th><th>ServoTensor</th></tr></thead>";
+
+/** One log row for one decision window of the AI: every cell but the
+ *  tick (the tick cell is rendered from the row's tick span). */
+function aiRowCells(view: TensorStateView, goalName: string,
+                    delta: HudDelta | null): string {
+  const sensors = view.sensors;
+  const servoDom = view.servo.dominant.slice(1).map((d) => {
+    const entry = splitLabel(d.label);
+    return `<div>${entry.main} ${Math.round(d.share * 100)}%</div>` +
+           detailLine(entry.detail);
+  }).join("");
+  return `<td>${goalName}</td>` +
+    `<td>${elementNameOf(view.elementId)}</td>` +
+    `<td>${view.situation}</td>` +
+    tensorCell(sensors[0].className, sensors[0].share, sensors[0].dominant) +
+    tensorCell(sensors[1].className, sensors[1].share, sensors[1].dominant) +
+    tensorCell(sensors[2].className, sensors[2].share, sensors[2].dominant) +
+    tensorCell(sensors[3].className, sensors[3].share, sensors[3].dominant) +
+    `<td>${delta === null ? "" :
+      `<div>${delta.currentLine}</div>` +
+      `<div class="dom">(${delta.deltaLine})</div>`}</td>` +
+    `<td><div class="cls">${view.servo.command}${view.acted ? "" :
+      " <span class=\"dom\">(stunned)</span>"}</div>` +
+    `<div class="dom">${servoDom}</div></td>`;
+}
+
+/** The row's identity: the qualitative state — goal, element, situation,
+ *  the fired and dominant LABELS, the servo command. Shares and the
+ *  live delta drift every window and never make a new row. */
+function rowKeyOf(view: TensorStateView, goalName: string): string {
+  const sensorKeys = view.sensors.map((s) =>
+    `${s.className}:${s.dominant.map((d) => d.label).join(",")}`).join("|");
+  const servoKey =
+    `${view.servo.command}:${view.servo.dominant.map((d) => d.label).join(",")}`;
+  return `${goalName}#${view.elementId}#${view.situation}` +
+         `#${view.acted}#${sensorKeys}#${servoKey}`;
+}
+
+/** The tick cell: the current tick, and — once the row has spanned more
+ *  than one window — the first tick it held this state, in braces. */
+function tickCellOf(row: AiLogRow): string {
+  const origin = row.lastTick === row.firstTick ? "" :
+    `<br><span class="dom">(${row.firstTick})</span>`;
+  return `<td>${row.lastTick}${origin}</td>`;
+}
+
+/** Render both tabs (cheap guards: only redraw on real change). */
+function renderTabs(): void {
+  // TAB 1 — the wiki.
+  let wiki: { title: string; goal: string; elements: readonly string[];
+              goals: readonly string[] } | null = null;
+  if (state.scenario === WAVES_SCENARIO && state.waves !== null) {
+    wiki = state.waves.wiki;
+  } else if (state.school !== null) {
+    wiki = state.school.wiki;
+  }
+  if (wiki !== null) {
+    const key = `${wiki.title}|${wiki.elements.join(">")}`;
+    if (key !== tabs.wikiKey) {
+      tabs.wikiKey = key;
+      els.tabWiki.innerHTML =
+        `<h3>${wiki.title}</h3>` +
+        `<p>${wiki.goal}</p>` +
+        `<p class="chain">elements: ${wiki.elements.join(" \u2192 ")}</p>` +
+        `<p>known goals:</p>` +
+        `<ul>${wiki.goals.map((g) => {
+          const entry = splitLabel(g);
+          return `<li>${entry.main}${detailLine(entry.detail)}</li>`;
+        }).join("")}</ul>`;
+    }
+  }
+  // TAB 2 — the live AI state log.
+  const subject = aiSubject();
+  if (subject.key !== tabs.aiKey) {
+    tabs.aiKey = subject.key;
+    tabs.rows.length = 0;
+    tabs.aiLastDecision = -1;
+  }
+  const view = subject.view;
+  if (view !== null && view.decisionCount !== tabs.aiLastDecision) {
+    tabs.aiLastDecision = view.decisionCount;
+    const key = rowKeyOf(view, subject.goalName);
+    const head = tabs.rows[0];
+    if (head !== undefined && head.key === key) {
+      // the SAME state, held another window: no new row, the span grows
+      head.lastTick = view.decisionCount;
+      head.cells = aiRowCells(view, subject.goalName, subject.delta);
+    } else {
+      tabs.rows.unshift({
+        firstTick: view.decisionCount,
+        lastTick: view.decisionCount,
+        key,
+        cells: aiRowCells(view, subject.goalName, subject.delta),
+      });
+      if (tabs.rows.length > AI_LOG_ROWS) {
+        tabs.rows.length = AI_LOG_ROWS;
+      }
+    }
+  }
+  const bodyHtml = tabs.rows.length > 0
+    ? `<table>${AI_TABLE_HEAD}<tbody>` +
+      `${tabs.rows.map((r) => `<tr>${tickCellOf(r)}${r.cells}</tr>`).join("")}` +
+      `</tbody></table>`
+    : `<p class="chain">${subject.note}</p>`;
+  const bodyKey = `${tabs.rows.length}|${tabs.aiLastDecision}|${subject.note}|` +
+                  `${tabs.rows[0]?.lastTick ?? -1}`;
+  if (els.tabAi.dataset.key !== bodyKey) {
+    els.tabAi.dataset.key = bodyKey;
+    els.tabAi.innerHTML = bodyHtml;
+  }
 }
 
 function updateBadge(): void {
@@ -511,17 +740,22 @@ function frame(ts: number): void {
   }
   autoSelect();
   layoutSidebar();
+  layoutBottom();
   drawSky();
   drawPanel();
   renderNarration();
+  renderTabs();
   refreshAircraftDropdown();
+  refreshControlsDropdown();
   requestAnimationFrame(frame);
 }
 
 // --- scenario plumbing ----------------------------------------------------------------
 
 /** Switch the running scenario. The classroom's ONE student and the
- *  waves each keep living across switches — resuming is not restarting. */
+ *  waves each keep living across switches — resuming is not restarting.
+ *  The chosen maneuver begins: the instructor demonstrates and the
+ *  student launches 10 s behind it. */
 function setScenario(id: string): void {
   state.scenario = id;
   els.scenario.value = id;
@@ -530,28 +764,58 @@ function setScenario(id: string): void {
   state.camera.tracking = true;   // a fresh world: the view follows the action
   if (id === WAVES_SCENARIO) {
     if (state.waves === null && state.seed !== null) {
-      state.waves = new WavesShow(state.seed);
-    }
-  } else if (state.school === null) {
-    state.school = FlightSchoolShow.withFreshPolicy();
-    if (state.school.lessonNames[0] !== id) {
-      state.school.switchToManeuver(id);   // a fresh student, into the chosen lesson
+      state.waves = new WavesShow(state.seed, state.brain ?? undefined);
     }
   } else {
-    state.school.switchToManeuver(id);     // the SAME student, into the chosen lesson
+    state.school?.switchToManeuver(id);     // the SAME student, into the chosen lesson
   }
   state.acc = 0.0;
   state.playing = true;
   els.play.textContent = "\u23f8 pause";
 }
 
-/** The restart button: the one sanctioned fresh start of everything. */
+/** The developer's fast path: ?boot=skip — no offline pre-learning,
+ *  a fresh untrained brain, straight into the live world (the classroom's
+ *  student and every newborn drone fly on beginner's luck). */
+const BOOT_SKIP =
+  new URLSearchParams(location.search).get("boot") === "skip";
+
+/** Skip mode's world: a new classroom around a beginner's brain — the
+ *  same world shape bootTraining lands, minus the training. */
+function startUntrainedWorld(): void {
+  const curriculum = new FlightSchool(new FlightInstruments(TRIM_SPEED));
+  state.brain = null;
+  state.golden = [];
+  state.school = new FlightSchoolShow(curriculum, new ServoPolicy());
+  populateScenarioDropdown([...curriculum.lessons.keys()]);
+  els.boot.classList.add("hidden");
+  setScenario(els.scenario.value || "takeoff");
+  if (!frameRunning) {
+    frameRunning = true;
+    requestAnimationFrame((ts) => {
+      lastTs = ts;
+      requestAnimationFrame(frame);
+    });
+  }
+}
+
+/** The restart button: start the CURRENT SCENARIO over — and only
+ *  it. The student's trained brain, the golden reference, and the
+ *  waves all stay alive; the chosen maneuver (or the drone waves)
+ *  simply begins again from its start. A full world reset (new brain,
+ *  new boot) is the scenario dropdown's job, not this button's. */
 function restart(): void {
-  state.school = null;
-  state.waves = null;
-  state.pinned = false;
   state.reportKey = "";
-  setScenario(els.scenario.value);
+  state.camera.tracking = true;
+  if (state.scenario === WAVES_SCENARIO) {
+    if (state.seed !== null) {
+      state.waves = new WavesShow(state.seed, state.brain ?? undefined);
+    }
+    return;
+  }
+  if (state.school !== null && state.scenario !== "") {
+    state.school.switchToManeuver(state.scenario);
+  }
 }
 
 function populateScenarioDropdown(lessons: readonly string[]): void {
@@ -582,6 +846,37 @@ els.aircraft.addEventListener("change", () => {
     state.pinned = true;
   }
 });
+
+// --- the controls dropdown ----------------------------------------------------------
+
+/** Whose hands fly the CURRENT aircraft — the sticky per-aircraft
+ *  choice (AI, instructor, or a both-mode). Switching the aircraft
+ *  dropdown leaves every other machine flying under whoever was
+ *  chosen for it; the dropdown shows the current one's own mode. */
+els.controls.addEventListener("change", () => {
+  const mode = els.controls.value as ControlMode;
+  if (state.scenario === WAVES_SCENARIO && state.waves !== null) {
+    state.waves.setControlsMode(mode);
+    return;
+  }
+  state.school?.setControlsMode(mode);
+});
+
+/** Keep the controls dropdown honest: it always shows the CURRENT
+ *  aircraft's own sticky mode. */
+function refreshControlsDropdown(): void {
+  if (state.scenario === WAVES_SCENARIO && state.waves !== null) {
+    const mode = state.waves.selectedControlsMode;
+    if (mode !== null && els.controls.value !== mode) {
+      els.controls.value = mode;
+    }
+    return;
+  }
+  const school = state.school;
+  if (school !== null && els.controls.value !== school.controlsMode) {
+    els.controls.value = school.controlsMode;
+  }
+}
 els.sky.addEventListener("click", (event) => {
   // Clicking an aircraft on the sky selects it: it becomes the current
   // aircraft (the panel follows it) and the dropdown follows.
@@ -638,13 +933,128 @@ els.zoomIn.addEventListener("click", () => {
 });els.zoomOut.addEventListener("click", () => {
   state.span = Math.min(4000.0, state.span * 1.3);
 });
+
+// --- the resize grips --------------------------------------------------------
+// The bottom panel's height and the sidebar's width are the user's, by
+// drag. The LAWS (fractions of the stage height / the window width):
+//   BOTTOM: visible while >= 10%; drag it lower and it HIDES; from
+//     hidden, a pull upwards of more than 10% opens it (it then tracks
+//     the pointer, so it opens exactly as tall as you pulled).
+//   SIDEBAR: visible while >= 30%; drag it narrower and it HIDES; from
+//     hidden, a pull leftwards of more than 10% opens it back at its
+//     LAST width (then it tracks the pointer from there).
+const BOTTOM_HIDE = 0.10;
+const BOTTOM_MAX = 0.85;
+const SIDE_HIDE = 0.30;
+const SIDE_MAX = 0.80;
+const REOPEN = 0.10;
+
+let bottomFrac = 0.30;       // the bottom panel's height, of the stage
+let bottomHidden = false;
+let sideHidden = false;
+let sideLastW = 0;           // the last width the sidebar showed
+
+/** The stage's height: the app below the toolbar (the grips' tracks
+ *  themselves are excluded — they sit between the regions). */
+function stageHeight(): number {
+  return els.app.clientHeight - els.bar.offsetHeight - 7.0;
+}
+
+/** Apply the bottom panel's height law to the DOM (guarded: writing
+ *  the same height twice is free). */
+let bottomPx = -1;
+function layoutBottom(): void {
+  const avail = stageHeight();
+  const px = bottomHidden ? 0 : Math.round(bottomFrac * avail);
+  if (px !== bottomPx) {
+    bottomPx = px;
+    els.results.style.height = `${px}px`;
+  }
+}
+
+/** Apply the sidebar's width law to the DOM. */
+function applySide(): void {
+  els.cockpit.classList.toggle("collapsed", sideHidden);
+  if (sideWidth !== null) {
+    els.cockpit.style.width = sideHidden ? "0px" : `${Math.round(sideWidth)}px`;
+  }
+  layoutSidebar();
+}
+
+/** Wire one grip: pointer-captured drags call back with (delta, start),
+ *  where delta is the drag distance in the grip's GROW direction
+ *  (up for the bottom panel, left for the sidebar). */
+function gripDrag<T>(grip: HTMLElement, axis: "x" | "y",
+                     startState: () => T,
+                     onMove: (delta: number, start: T) => void): void {
+  grip.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    grip.setPointerCapture(event.pointerId);
+    grip.classList.add("dragging");
+    const startPt = axis === "y" ? event.clientY : event.clientX;
+    const start = startState();
+    const move = (ev: PointerEvent): void => {
+      const delta = axis === "y" ? startPt - ev.clientY : startPt - ev.clientX;
+      onMove(delta, start);
+    };
+    const up = (): void => {
+      grip.classList.remove("dragging");
+      grip.removeEventListener("pointermove", move);
+      grip.removeEventListener("pointerup", up);
+      grip.removeEventListener("pointercancel", up);
+    };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", up);
+    grip.addEventListener("pointercancel", up);
+  });
+}
+
+gripDrag(els.bottomGrip, "y",
+  () => ({ px: bottomHidden ? 0.0 : bottomFrac * stageHeight() }),
+  (dy, start): void => {
+    const avail = stageHeight();
+    const cand = Math.max(0.0, Math.min(avail * BOTTOM_MAX, start.px + dy));
+    bottomFrac = cand / avail;
+    bottomHidden = cand < avail * BOTTOM_HIDE;   // under 10%: it hides
+    layoutBottom();
+  });
+
+gripDrag(els.sideGrip, "x",
+  () => ({
+    hidden: sideHidden,
+    w: sideWidth ?? els.cockpit.offsetWidth,
+    last: sideLastW > 0 ? sideLastW : els.cockpit.offsetWidth,
+  }),
+  (dx, start): void => {
+    const sw = window.innerWidth;
+    // from hidden the pull must cross REOPEN first; from visible the
+    // width just follows the pointer
+    const cand = start.hidden
+      ? dx <= sw * REOPEN ? 0.0 : start.last + (dx - sw * REOPEN)
+      : start.w + dx;
+    if (cand >= sw * SIDE_HIDE) {
+      sideHidden = false;
+      sideWidth = Math.min(cand, sw * SIDE_MAX);
+      sideLastW = sideWidth;
+    } else {
+      sideHidden = true;                        // under 30%: it hides
+    }
+    applySide();
+  });
+
+layoutBottom();   // the initial 30%
 els.zoomReset.addEventListener("click", () => {
   state.span = 260.0;
   state.camera.tracking = true;   // the view returns to the action
 });
 window.addEventListener("resize", () => {
-  // the window changed: the sidebar's panels re-fit their 3:2 sizes
+  // the window changed: the panels re-fit, the grips' fractions re-apply
   layoutSidebar();
+  layoutBottom();
+  if (sideWidth !== null) {
+    sideWidth = Math.min(sideWidth, window.innerWidth * SIDE_MAX);
+    applySide();
+  }
 });
 window.addEventListener("keydown", (event) => {
   if (event.code === "Space") {
@@ -667,23 +1077,97 @@ async function fetchJson(url: string): Promise<any> {
   return response.json();
 }
 
+/** The boot terminal's lesson table — one row per lesson, live:
+ *  attempts, the EMA score, and the pass mark. Rendered after each chunk. */
+function renderBootTable(rows: ReadonlyArray<{
+  lesson: string; attempts: number; score: number | null;
+  status: "training" | "done";
+}>): void {
+  const width = 26;
+  const lines = rows.map((row) => {
+    const name = row.lesson.padEnd(width).slice(0, width - 1);
+    const score = row.score === null ? "     \u2013"
+      : `${row.score.toFixed(2)}`.padStart(5) + "/6";
+    const mark = row.status === "done" ? " done" : " \u00b7\u00b7\u00b7";
+    return `${name}${String(row.attempts).padStart(2)}  ${score} ${mark}`;
+  });
+  els.bootLog.textContent =
+    ["lesson".padEnd(width) + "demo   ema",
+     "-".repeat(width + 17), ...lines].join("\n");
+  // shrunk mode: keep the LAST line in view — the table scrolls to the
+  // bottom (where the classroom currently is)
+  if (!els.bootExpand.closest(".boot-dialog")?.classList.contains("expanded")) {
+    els.bootLog.scrollTop = els.bootLog.scrollHeight;
+  }
+}
+
+/** The boot dialog's expand button: the terminal grows to the full
+ *  dialog, replacing the cubes; pressing it again brings them back. */
+els.bootExpand.addEventListener("click", () => {
+  const dialog = els.bootExpand.closest(".boot-dialog")!;
+  const expanded = dialog.classList.toggle("expanded");
+  els.bootExpand.textContent = expanded ? "\u29c9" : "\u29ca";
+});
+
+let frameRunning = false;
+
+/**
+ * THE OFFLINE PRE-LEARNING: the flight school trains the tensors before
+ * the main scene ever appears — the boot dialog's terminal streams the
+ * training and the bar fills left to right. When the classroom
+ * completes, the dialog vanishes and the TRAINED BRAIN is transplanted
+ * into the live world: the classroom's student AND every newborn drone.
+ */
+async function bootTraining(): Promise<void> {
+  els.bootLog.textContent = "skynerd genesis \u2014 offline pre-learning\n";
+  els.bootFill.style.width = "0%";
+  const trainer = new BootTrainer();
+  // THE DONE BUTTON: the classroom is ENDLESS — once every lesson has
+  // had its repetitions the schedule deals another cycle and keeps
+  // sharpening the tensors. Only the person's press stops it; the
+  // graduate is whatever the brain has become by then.
+  els.bootDone.disabled = false;
+  els.bootDone.onclick = () => { trainer.finishNow(); };
+  let done = false;
+  const t0 = performance.now();
+  while (!done) {
+    // Chunked: the browser keeps painting the dialog between chunks —
+    // the cubes rotate and the synapses pulse while the tensors fill.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const progress = trainer.runChunk(14.0);
+    renderBootTable(progress.rows);
+    els.bootFill.style.width = `${(progress.fraction * 100.0).toFixed(1)}%`;
+    drawBrainView(els.bootBrain, (performance.now() - t0) / 1000.0,
+                  tensorCounts(trainer.policy));
+    done = progress.done;
+  }
+  // THE BRAIN TRANSPLANT: separate copies of the trained tensors for the
+  // classroom's student and for the swarm's newborns.
+  state.brain = trainer.graduate;
+  state.golden = trainer.golden();
+  state.school = new FlightSchoolShow(trainer.school, trainer.graduate);
+  populateScenarioDropdown([...trainer.school.lessons.keys()]);
+  els.boot.classList.add("hidden");
+  setScenario(els.scenario.value || "takeoff");
+  if (!frameRunning) {
+    frameRunning = true;
+    requestAnimationFrame((ts) => {
+      lastTs = ts;
+      requestAnimationFrame(frame);
+    });
+  }
+}
+
 async function boot(): Promise<void> {
-  const [rngRef, c172] = await Promise.all([
-    fetchJson("/reference/rng-ref.json"),
-    fetchJson("/reference/c172-frozen.json").catch(() => null),
-  ]);
+  const rngRef = await fetchJson("/reference/rng-ref.json");
   // The waves' master dice: the reference seed stream (seed 42).
   const seed42 = rngRef.seeds.find((s: { seed: number }) => s.seed === 42);
   state.seed = seed42 ?? rngRef.seeds[0];
-  // The frozen classroom reference (per-maneuver golden scores) — the
-  // report card compares the LIVE student against it as it learns.
-  state.golden = c172?.lessons ?? [];
-  const curriculum = new FlightSchool(new FlightInstruments(TRIM_SPEED));
-  populateScenarioDropdown([...curriculum.lessons.keys()]);
-  setScenario("takeoff");  requestAnimationFrame((ts) => {
-    lastTs = ts;
-    requestAnimationFrame(frame);
-  });
+  if (BOOT_SKIP) {
+    startUntrainedWorld();
+    return;
+  }
+  await bootTraining();
 }
 
 boot().catch((error) => {

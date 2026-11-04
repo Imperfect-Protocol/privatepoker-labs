@@ -83,6 +83,10 @@ export class PulseNeuron {
   readonly values = new Map<number, Float32Array>();
   /** key index -> the epoch each layer was fired in. */
   readonly epochs = new Map<number, Int32Array>();
+  /** The cells FIRED or IMPOSED since the last consolidation — the
+   *  incremental pass's work list (consolidate spreads only what the
+   *  training actually touched, never the whole brain). */
+  readonly dirty = new Set<number>();
 
   constructor(spec: NeuronSpec) {
     this.name = spec.name;
@@ -112,6 +116,26 @@ export class PulseNeuron {
     return index;
   }
 
+  /**
+   * Decode a packed key index back into its axis digits — the
+   * consolidation pass's group-by-prefix read.
+   */
+  keyOf(index: number): number[] {
+    const key: number[] = [];
+    let rest = index;
+    for (let i = this.strides.length - 1; i >= 0; i--) {
+      key[i] = rest % this.axisShapes[i];
+      rest = Math.floor(rest / this.axisShapes[i]);
+    }
+    return key;
+  }
+
+  /** The exact-bin EMA-mixed value at a key (no fuzz, no
+   *  neighborhood) — the consolidation pass's read. */
+  peek(key: readonly number[]): number {
+    return this.recallExact(key);
+  }
+
   get storedCombinations(): number {
     return this.values.size;
   }
@@ -131,6 +155,7 @@ export class PulseNeuron {
       return;
     }
     const index = this.keyIndex(key);
+    this.dirty.add(index);
     let layers = this.values.get(index);
     if (layers === undefined) {
       layers = new Float32Array(NEURON_LAYERS + 1).fill(this.baseline);
@@ -159,6 +184,28 @@ export class PulseNeuron {
     // float32 store, like NumPy
     layers[0] = Math.min(this.maxWeight,
                          Math.max(this.minWeight, layers[0] + amount));
+  }
+
+  /**
+   * IMPOSE a prior: raise the freshest layer to AT LEAST `value` —
+   * a floor, never a ceiling, so a cell training itself above the
+   * prior keeps its training — and refresh the epoch (a prior nobody
+   * re-fires must not die to the forgetting law). Idempotent: the
+   * same prior imposed twice leaves the same weight.
+   */
+  impose(key: readonly number[], value: number, epoch: number): void {
+    const index = this.keyIndex(key);
+    this.dirty.add(index);
+    let layers = this.values.get(index);
+    if (layers === undefined) {
+      layers = new Float32Array(NEURON_LAYERS + 1).fill(this.baseline);
+      this.values.set(index, layers);
+      this.epochs.set(index, new Int32Array(NEURON_LAYERS + 1).fill(-1));
+    }
+    if (layers[0] < value) {
+      layers[0] = Math.min(this.maxWeight, Math.max(this.minWeight, value));
+    }
+    this.epochs.get(index)![0] = Math.trunc(epoch);
   }
 
   /**
@@ -222,6 +269,33 @@ export class PulseNeuron {
 
   private readonly axisShapes: number[] = [];
 
+  /**
+   * THE FORGETTING LAW: drop every key nobody has re-fired within the
+   * span — the endless classroom's memory bound. Nothing else ever
+   * shrinks the sparse map (untouched keys keep their values
+   * forever), and the school deals cycle after cycle forever, so the
+   * keys that no lesson re-uses must eventually die. Returns how many
+   * died.
+   */
+  prune(beforeEpoch: number): number {
+    let removed = 0;
+    for (const [index, layerEpochs] of this.epochs) {
+      let newest = -1;
+      for (let layer = 0; layer < layerEpochs.length; layer++) {
+        if (layerEpochs[layer] > newest) {
+          newest = layerEpochs[layer];
+        }
+      }
+      if (newest < beforeEpoch) {
+        this.values.delete(index);
+        this.epochs.delete(index);
+        this.dirty.delete(index);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+
   snapshot(): { values: Map<number, Float32Array>; epochs: Map<number, Int32Array> } {
     const values = new Map<number, Float32Array>();
     for (const [key, layers] of this.values) {
@@ -237,6 +311,7 @@ export class PulseNeuron {
   restore(snapshot: { values: Map<number, Float32Array>;
                       epochs: Map<number, Int32Array> }): void {
     this.values.clear();
+    this.dirty.clear();
     for (const [key, layers] of snapshot.values) {
       this.values.set(key, Float32Array.from(layers));
     }
@@ -287,12 +362,16 @@ export function denoiseProjection(projection: Float64Array, rng: NumpyPcg64,
                                   threshold: number): Float64Array {
   const n = projection.length;
   const noisy = Float64Array.from(projection);
-  for (let i = 0; i < n; i++) {
+  if (noiseSigma > 0.0) {
     // Box-Muller: a deterministic gaussian from the shared dice.
-    const u1 = Math.max(1e-12, rng.uniform());
-    const u2 = rng.uniform();
-    noisy[i] += noiseSigma * Math.sqrt(-2.0 * Math.log(u1))
-                * Math.cos(2.0 * Math.PI * u2);
+    // (Sigma 0 — the factual tensors' deterministic spread — skips
+    // the noise entirely: noise is the SKILL tensor's alone.)
+    for (let i = 0; i < n; i++) {
+      const u1 = Math.max(1e-12, rng.uniform());
+      const u2 = rng.uniform();
+      noisy[i] += noiseSigma * Math.sqrt(-2.0 * Math.log(u1))
+                  * Math.cos(2.0 * Math.PI * u2);
+    }
   }
   const blurred = new Float64Array(n);
   for (let i = 0; i < n; i++) {

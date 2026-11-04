@@ -21,11 +21,18 @@ import { Vec3 } from "../core/vec.js";
 import { Flock } from "../learning/flock.js";
 import { FlightInstruments, EpisodeOutcome } from "../learning/instruments.js";
 import { TRIM_SPEED, LiveEpisode } from "../learning/flight.js";
-import { ServoPolicy } from "../learning/servo-tensor.js";
+import { ServoPolicy, type BrainSnapshot, type TensorStateView } from "../learning/servo-tensor.js";
 import { Scene, type SceneAircraft } from "./scene.js";
+import {
+  hudDelta, readoutOf, meanReadoutOf, type HudDelta,
+} from "./hud-delta.js";
+import type { ControlMode } from "../learning/guardian.js";
 
 /** The carpet's shape: 8 drones per line, 5 % exploration, no hazard. */
 export const WAVE_SIZE = 8;
+/** The sky holds at most this many living drones: a new wave launches
+ *  only as many as fit (40 alive — nothing lifts off; 39 — one does). */
+export const DRONE_CAP = 40;
 export const WAVE_EPSILON = 0.05;
 const WAVE_ROW_SPACING = 40.0;
 /** A new wave lifts off this often — the DISTANCE between waves, not a
@@ -61,14 +68,19 @@ export class WavesShow {
   /** The swarm's master dice: flock inheritance, and each new drone's
    *  own stream drawn from it at spawn. */
   private readonly rng: NumpyPcg64;
+  /** The boot-trained brain: every newborn drone is transplanted with
+   *  these tensors before the flock's living mosaic teaches on top. */
+  private readonly brainSnapshot: BrainSnapshot | null;
   private simTime = 0.0;
   private nextWaveAt = 0.0;
   /** The next wave's number (0-based; the first wave is 0). */
   private nextWave = 0;
   private readonly drones: ConveyorDrone[] = [];
 
-  constructor(seed: { state: string; inc: string }) {
+  constructor(seed: { state: string; inc: string },
+              brain?: ServoPolicy) {
     this.rng = new NumpyPcg64(BigInt(seed.state), BigInt(seed.inc));
+    this.brainSnapshot = brain === undefined ? null : brain.snapshot();
     this.launchWave();
     this.nextWaveAt = WAVE_SPAWN_EVERY;
   }
@@ -96,6 +108,97 @@ export class WavesShow {
   }
   get obituaries(): number {
     return this.flock.obituariesHeard;
+  }
+
+  /** THE AI STATE LOG's subject: the selected drone's tensor network
+   *  view (whichever aircraft the panel shows; null while none fly). */
+  get selectedStateView(): TensorStateView | null {
+    const current = this.scene.current;
+    if (current === null) {
+      return null;
+    }
+    const drone = this.drones.find((d) => d.entry === current
+                                    && d.flight.episodeOutcome === null);
+    return drone === undefined ? null : drone.flight.stateView();
+  }
+
+  /** THE CONTROLS DROPDOWN — whose hands fly the SELECTED drone. The
+   *  choice is STICKY per drone: switching the aircraft dropdown to
+   *  another drone leaves this one flying under whoever was chosen
+   *  for it (and its own mode shows when it is selected again). */
+  setControlsMode(mode: ControlMode): void {
+    const current = this.scene.current;
+    if (current === null) {
+      return;
+    }
+    const drone = this.drones.find((d) => d.entry === current
+                                    && d.flight.episodeOutcome === null);
+    if (drone !== undefined) {
+      drone.flight.setControlsMode(mode);
+    }
+  }
+
+  /** The selected drone's controls mode (null when it is not a flying
+   *  drone — the dropdown shows nothing to change). */
+  get selectedControlsMode(): ControlMode | null {
+    const current = this.scene.current;
+    if (current === null) {
+      return null;
+    }
+    const drone = this.drones.find((d) => d.entry === current
+                                    && d.flight.episodeOutcome === null);
+    return drone === undefined ? null : drone.flight.controlsMode;
+  }
+
+  /** Whether the instructor's hand is on the selected drone's levers
+   *  right now (a guarded takeover included) — the status line. */
+  get selectedInstructorAtControls(): boolean {
+    const current = this.scene.current;
+    if (current === null) {
+      return false;
+    }
+    const drone = this.drones.find((d) => d.entry === current
+                                    && d.flight.episodeOutcome === null);
+    return drone !== undefined && drone.flight.instructorAtControls;
+  }
+
+  /** The AI log's delta column: the selected drone against the MEAN of
+   *  the drone carpet (the swarm's centre of mass, in pilot's units;
+   *  empty when the selected aircraft is not a flying drone). */
+  get carpetDelta(): HudDelta | null {
+    const current = this.scene.current;
+    if (current === null) {
+      return null;
+    }
+    const drone = this.drones.find((d) => d.entry === current
+                                    && d.flight.episodeOutcome === null);
+    if (drone === undefined || this.aliveCount < 2) {
+      return null;
+    }
+    const carpet = meanReadoutOf(this.drones
+      .filter((d) => d.flight.episodeOutcome === null)
+      .map((d) => d.entry.aircraft));
+    if (carpet === null) {
+      return null;
+    }
+    return hudDelta(readoutOf(drone.entry.aircraft), carpet);
+  }
+
+  /** The wiki tab's scenario description (the waves). */
+  get wiki(): {
+    title: string; goal: string;
+    elements: readonly string[]; goals: readonly string[];
+  } {
+    return {
+      title: "drone attack waves",
+      goal: "the swarm keeps flying: every drone that dies screams its " +
+            "memory to the flock, and every newborn inherits the boot-" +
+            "trained brain plus the living mosaic",
+      elements: ["free flight"],
+      goals: ["survive (never expire: a drone flies until it crashes)",
+              "stay inside the world's bounds",
+              "keep the swarm's memory alive (the obituaries heard)"],
+    };
   }
 
   /** The swarm's mesh: every live pair within LINK_RANGE. */
@@ -138,17 +241,28 @@ export class WavesShow {
       }
     }
     this.pruneOldCrashSites();
-    if (this.simTime >= this.nextWaveAt) {
+    // The cap: a wave lifts off only while the sky has room — 40 alive
+    // means nothing new launches; the moment one dies, room opens and
+    // the next wave launches (as many slots as fit, no waiting).
+    if (this.simTime >= this.nextWaveAt && this.aliveCount < DRONE_CAP) {
       this.launchWave();
       this.nextWaveAt += WAVE_SPAWN_EVERY;
     }
   }
   /** One wave lifts off: a line of new drones — assembled as mosaics of
-   *  what the living still remember — right behind the previous wave. */
+   *  what the living still remember — right behind the previous wave.
+   *  Only as many slots as the sky's cap has room for. */
   private launchWave(): void {
     const wave = this.nextWave++;
-    for (let slot = 0; slot < WAVE_SIZE; slot++) {
+    const slots = Math.min(WAVE_SIZE, DRONE_CAP - this.aliveCount);
+    for (let slot = 0; slot < slots; slot++) {
       const policy = new ServoPolicy();
+      // THE BRAIN TRANSPLANT: the newborn receives the boot-trained
+      // tensors first, then the flock's living mosaic teaches on top —
+      // every drone starts from what the flight school learned.
+      if (this.brainSnapshot !== null) {
+        policy.restore(this.brainSnapshot);
+      }
       this.flock.seedNewborn(policy, this.rng);
       this.flock.enroll(policy);
       // The drone's own dice, drawn from the swarm's master stream: its
@@ -161,6 +275,7 @@ export class WavesShow {
                                      new NumpyPcg64(state, inc), {
         startPosition: position,
         epsilonOverride: WAVE_EPSILON,
+        horizon: Infinity,   // drones NEVER expire: they fly until they crash
       });
       const entry = this.scene.add({
         label: `Wave ${wave + 1} \u00b7 Drone ${slot + 1}`,

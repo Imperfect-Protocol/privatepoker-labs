@@ -10,7 +10,7 @@ import { dirname, join } from "node:path";
 import { Vec3, Heading, RangeBins, azimuthRadians, elevationRadians,
          azimuthBin, elevationBin, fuzzyBinWeights } from "../src/core/vec.js";
 import { Quaternion } from "../src/core/quaternion.js";
-import { World, Hill } from "../src/core/world.js";
+import { World, Hill, AIRFIELD } from "../src/core/world.js";
 import { check, finish, section } from "./harness.js";
 
 const TOL = 1e-9;
@@ -158,7 +158,17 @@ section("world vs python reference");
   });
   const points = [new Vec3(0.0, 0.0, 50.0), new Vec3(120.0, -80.0, 10.0), new Vec3(120.0, -80.0, 80.0),
                   new Vec3(900.0, 0.0, 50.0), new Vec3(65.0, 75.0, 15.0)];
-  check("terrain_height matches", points.every((pt, i) => near(w.terrainHeight(pt.x, pt.y), ref.world.terrain_height[i])),
+  // The frozen Python baseline predates the AIRFIELD carve: inside the
+  // field's ellipse the terrain is the flat plateau (the runway's 95 ft,
+  // the world model's own law), outside it the Python hills still rule.
+  const inField = (x: number, y: number): boolean => {
+    const fx = (x - AIRFIELD.cx) / AIRFIELD.rx;
+    const fy = y / AIRFIELD.ry;
+    return fx * fx + fy * fy < 1.0;
+  };
+  check("terrain_height matches (field plateau; python hills outside)",
+        points.every((pt, i) => near(w.terrainHeight(pt.x, pt.y),
+          inField(pt.x, pt.y) ? AIRFIELD.elev : ref.world.terrain_height[i])),
         `got ${points.map((pt) => w.terrainHeight(pt.x, pt.y))} want ${ref.world.terrain_height}`);
   check("inside_bounds matches",
         points.every((pt, i) => w.isInsideBounds(pt) === ref.world.inside_bounds[i]));

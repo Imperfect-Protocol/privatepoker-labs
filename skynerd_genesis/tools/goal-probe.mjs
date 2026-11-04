@@ -21,10 +21,7 @@ const RNG0_INC = 87136372517582989555478159403783844777n;
 console.log("== every maneuver: its goal, its elements, and what each earns");
 for (const [name, lesson] of school.lessons) {
   console.log(`\n${name}  (goal id ${lesson.goalId})`);
-  console.log(`  elements: ${lesson.phases.map((e) => e.name).join(" -> ")}`
-    + (lesson.repeatFrom > 0
-      ? `   (student repeats from: ${lesson.phases[lesson.repeatFrom].name})`
-      : ""));
+  console.log(`  elements: ${lesson.phases.map((e) => e.name).join(" -> ")}`);
   const spec = school.goalSpec(lesson);
   for (const goal of spec.goals) {
     console.log(`  goal: ${goal.label}`);
@@ -62,7 +59,8 @@ for (const [name, lesson] of school.lessons) {
   const demo = new DemoFlight(school, lesson, policy, 0);
   while (demo.step()) { /* teach this one maneuver */ }
   const exam = new ExamFlight(school, lesson, policy,
-                              new NumpyPcg64(RNG0_STATE, RNG0_INC));
+                              new NumpyPcg64(RNG0_STATE, RNG0_INC),
+                              school.demoSeconds(lesson) * 2.2 + 5.0);
   const elements = [];
   while (exam.step()) {
     if (exam.tick % DECISION_EVERY === 0) {
@@ -85,7 +83,7 @@ console.log(`rounds (re-demos): ${report.rounds}, failed: [${report.failed.join(
 // per-lesson detail from a fresh session (same deterministic result)
 const school2 = new FlightSchool(new FlightInstruments(TRIM_SPEED));
 const policy2 = new ServoPolicy();
-const session = new (await import("../build/src/learning/school.js")).SchoolSession(school2, policy2, {});
+const session = new (await import("../build/src/learning/school.js")).SchoolSession(school2, policy2, { examCap: "auto" });
 session.runToCompletion();
 for (const name of school2.lessons.keys()) {
   const score = session.scores.get(name);

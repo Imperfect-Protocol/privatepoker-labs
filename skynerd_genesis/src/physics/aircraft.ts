@@ -37,8 +37,10 @@ import { GRAVITY, RHO_SEA_LEVEL } from "./aero.js";
  * Null choices while the instructor eases its smooth demonstration path.
  */
 export interface HandDecisions {
-  /** Per-channel decision (EASE_OFF / HOLD / PUSH), or null while the
-   *  instructor eases (no decisions happen). */
+  /** Per-channel decision: the commanded LEVEL (0..6, the lever's
+   *  7-step vocabulary) or ACTION_HOLD (-1) for a lever the hand did
+   *  not move — or null while the instructor eases (no decisions
+   *  happen). */
   readonly choices: ArrayLike<number> | null;
   /** Whether a decision window just opened. */
   readonly fresh: boolean;

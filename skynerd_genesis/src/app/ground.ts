@@ -26,14 +26,15 @@
  * each filtered at the minor width).
  *
  * THE LANDSCAPE: the LandUse layer (src/app/land.ts) plans the world —
- * which squares are grass, which dry yellow, which rock, which forest —
- * and this texture paints it. Each biome owns its own base palette
- * pair (cloned up the pyramid with the same x1.12 brightening), the
- * FOREST and ROCK tiles carry a mottled detail overlay (the canopy and
- * scree texture) that fades out with the pixel footprint, the ROADS
- * are painted as asphalt strips along the map's grid lines, and the
- * runway is painted over everything with its markings, slab edges
- * box-filtered by coverage.
+ * a procedural 512x512 land-use texture (16 m texels, tiling every 8 km)
+ * that decides what each square IS: grass, dry, rock, forest, or WATER
+ * (lakes and rivers). Each biome owns its own base palette pair (cloned
+ * up the pyramid with the same x1.12 brightening), the FOREST and ROCK
+ * texels carry a mottled detail overlay (the canopy and scree texture)
+ * that fades out with the pixel footprint, the ROADS are painted as
+ * asphalt strips along the map's grid lines (ending at every shore),
+ * and the runway is painted over everything with its markings, slab
+ * edges box-filtered by coverage.
  *
  * Flat for now: the surface is the z = 0 plane, so the ray intersection
  * is analytic. The query surface — heightAt, intersectRay, sample — is
@@ -41,18 +42,19 @@
  * as a height field (heightAt) with a marching intersectRay, and the
  * cockpit pipeline does not change.
  */
-import { Biome, LandUse, RUNWAY } from "./land.js";
+import { Biome, FIELD, FIELD_ELEV, LandUse, MAXMIP_LEVELS, RUNWAY, SUN_DIR, TERRAIN_MAX } from "./land.js";
 
 type RGB = readonly [number, number, number];
 
 /** The base checker pair per biome — SUBTLE contrasts around each biome's
  *  mean: the grassy green default, the dry yellow-brown, the grey rock,
- *  the deep forest. */
+ *  the deep forest, the lake water. */
 const PAIRS: Readonly<Record<Biome, readonly [RGB, RGB]>> = {
   [Biome.Grass]: [[58, 86, 42], [74, 106, 56]],
   [Biome.Dry]: [[68, 50, 32], [84, 62, 40]],
   [Biome.Rocky]: [[96, 96, 90], [112, 112, 104]],
   [Biome.Forest]: [[40, 66, 34], [52, 82, 42]],
+  [Biome.Water]: [[30, 62, 92], [42, 84, 122]],
 };
 
 /** The manual mip pyramid: 6 levels, each a copy of the base map,
@@ -102,6 +104,14 @@ const RUNWAY_FILTER_MAX = 300.0;
 /** Anisotropic filtering's tap cap, as on GPUs (16x). */
 const ANISO_MAX = 16;
 
+/** The terrain's RELIEF SHADING: the surface normal against the sun,
+ *  NORMALISED so flat ground keeps exactly its palette colour (factor
+ *  1.0) — sun-facing slopes brighten a little, shaded slopes darken a
+ *  little, the approved look untouched on the plain. */
+const SHADE_AMBIENT = 0.78;
+const SHADE_SUN = 0.22;
+const SHADE_FLAT = SHADE_AMBIENT + SHADE_SUN * SUN_DIR[2];
+
 /** One mip level's palette: the same checker, at its own scale and
  *  brightness. */
 interface MipLevel {
@@ -135,34 +145,170 @@ const PYRAMIDS: Readonly<Record<Biome, readonly MipLevel[]>> = {
   [Biome.Dry]: pyramidFor(PAIRS[Biome.Dry][0], PAIRS[Biome.Dry][1]),
   [Biome.Rocky]: pyramidFor(PAIRS[Biome.Rocky][0], PAIRS[Biome.Rocky][1]),
   [Biome.Forest]: pyramidFor(PAIRS[Biome.Forest][0], PAIRS[Biome.Forest][1]),
+  [Biome.Water]: pyramidFor(PAIRS[Biome.Water][0], PAIRS[Biome.Water][1]),
 };
 
-/** The world's ground surface: flat today, a height field tomorrow. */
+/** The world's ground surface: the land-use map's height field, walked
+ *  by a marching ray — water and the airfield plain at level 0, hills
+ *  to ~1000 ft, all shaded by the one sun. */
 export class Ground {
   /** The land-use plan this texture paints (shared with the flora). */
   readonly land = new LandUse();
   /** Render distance K: cells beyond this are not drawn (haze takes over). */
   readonly drawDistance = 24000.0;
 
-  /** Surface height at a world point. Flat for now; mountains and
-   *  valleys override this with a height field later. */
+  /** Surface height at a world point — the land-use map's height
+   *  channel: water and the airfield at level 0, hills to TERRAIN_MAX. */
   heightAt(x: number, y: number): number {
-    void x;
-    void y;
-    return 0.0;
+    return this.land.heightAt(x, y);
   }
 
   /** The first intersection of the ray (origin, direction) with the
-   *  ground, as distance along the (unit) direction, or null when the
-   *  ray departs. Flat ground: the analytic z = 0 plane hit. */
+   *  terrain, as distance along the (unit) direction, or null when the
+   *  ray departs. THE MARCHING RAY: the terrain lives in the band
+   *  z \u2208 [0, TERRAIN_MAX], so the march starts where the ray enters
+   *  the band (or at the eye, when already inside it) and steps with a
+   *  RELATIVE stride (~9% of distance \u2014 near pixels step metres, horizon
+   *  pixels step hundreds of metres, each staying inside its pixel's
+   *  footprint), leaping whole provably-empty blocks where the height
+   *  map's coarse max allows, and refining the crossing by bisection
+   *  once found. Rays that cross ground level inside the airfield's
+   *  flat carve are answered analytically — no march at all. */
   intersectRay(ox: number, oy: number, oz: number,
                dx: number, dy: number, dz: number): number | null {
-    void oy;
-    if (dz >= -1e-9) {
-      return null;                          // level or departing rays never land
+    const K = this.drawDistance;
+    let t = 0.0;
+    if (oz > TERRAIN_MAX) {
+      if (dz >= -1e-9) {
+        return null;                        // above the band, departing
+      }
+      t = (TERRAIN_MAX - oz) / dz;         // enter the band here
     }
-    const t = -oz / dz;
-    return t > 0.0 ? t : null;
+    // THE PLATEAU'S ANALYTIC HIT: through the airfield's ellipse the
+    // terrain is exactly FIELD_ELEV, so a descending ray that crosses
+    // the plateau's plane inside it — with its whole in-band prefix
+    // inside too (the ellipse is convex) — hits at the plane crossing
+    // itself: no march. The school's home views ride this path.
+    if (dz < -1e-9 && oz + dz * t > FIELD_ELEV) {
+      const tPlane = (FIELD_ELEV - oz) / dz;
+      if (tPlane <= K
+          && this.land.inField(ox + dx * t, oy + dy * t)
+          && this.land.inField(ox + dx * tPlane, oy + dy * tPlane)) {
+        return tPlane;
+      }
+    }    // the march's end: the z = 0 crossing, the band's ceiling, or K
+    let end = K;
+    if (dz < -1e-9) {
+      const t0 = -oz / dz;
+      if (t0 < end) {
+        end = t0;
+      }
+    } else if (dz > 1e-9 && oz < TERRAIN_MAX) {
+      const tUp = (TERRAIN_MAX - oz) / dz;  // rising out of the band
+      if (tUp <= 0.0) {
+        return null;
+      }
+      if (tUp < end) {
+        end = tUp;
+      }
+    }
+    let prev = t;
+    while (true) {
+      const z = oz + dz * t;
+      const h = this.land.heightAt(ox + dx * t, oy + dy * t);
+      if (z <= h) {
+        // crossed into the hill: refine the crossing between prev..t
+        // by FALSE POSITION — the gap to the surface is near-linear,
+        // so the interpolated probes land close within a few tries
+        if (prev === t) {
+          return t;                         // the first probe hit
+        }
+        let lo = prev;
+        let hi = t;
+        let flo = (oz + dz * lo) - this.land.heightAt(ox + dx * lo, oy + dy * lo);
+        let fhi = z - h;
+        const close = Math.max(0.25, 0.001 * t);
+        for (let i = 0; i < 6 && hi - lo > close; i++) {
+          const mid = lo + (hi - lo) * (flo / (flo - fhi));
+          const fm = (oz + dz * mid) - this.land.heightAt(ox + dx * mid, oy + dy * mid);
+          if (fm <= 0.0) {
+            hi = mid;
+            fhi = fm;
+          } else {
+            lo = mid;
+            flo = fm;
+          }
+        }
+        return hi;
+      }
+      if (t >= end) {
+        return null;                        // the band held no ground
+      }
+      // THE SKIP-AHEAD: when the ray flies provably above the tallest
+      // terrain of the block it crosses (the height map's coarse max,
+      // one ring wide for hermite's window), it may leap to that
+      // block's far edge — or to where it would sink to that max — in
+      // one step: no probe between can hit. The levels cascade from
+      // the coarsest block down: the first whose max the ray clears
+      // gives the longest provable leap; near the ground the cascade
+      // bottoms out at the fine stride.
+      const fine = Math.max(6.0, 0.09 * t);
+      let step = fine;
+      const px = ox + dx * t;
+      const py = oy + dy * t;
+      // THE FIELD EXIT: inside the airfield's flat carve the terrain
+      // is exactly level 0 and the ray rides above it — the whole
+      // in-field stretch is provably hit-free, so cross it in one
+      // step to where the track leaves the ellipse.
+      const fx = (px - FIELD.cx) / FIELD.rx;
+      const fy = py / FIELD.ry;
+      const rr = fx * fx + fy * fy;
+      if (rr < 1.0) {
+        const a = (dx * dx) / (FIELD.rx * FIELD.rx)
+                + (dy * dy) / (FIELD.ry * FIELD.ry);
+        if (a > 1e-18) {
+          const b = 2.0 * (fx * dx / FIELD.rx + fy * dy / FIELD.ry);
+          const exit = (-b + Math.sqrt(b * b - 4.0 * a * (rr - 1.0))) / (2.0 * a);
+          if (exit > fine) {
+            step = exit;
+            prev = t;
+            t = Math.min(t + step, end);
+            continue;
+          }
+        }
+      }
+      const lvlFine = Math.min(MAXMIP_LEVELS,
+        Math.max(1, Math.ceil(Math.log2(fine / this.land.texel))));
+      for (let lvl = MAXMIP_LEVELS; lvl >= lvlFine; lvl--) {
+        const blockMax = this.land.maxHeightAt(px, py, lvl);
+        if (z <= blockMax) {
+          continue;                       // this block holds taller ground
+        }
+        const B = this.land.texel * (1 << lvl);
+        let edge = Infinity;
+        if (dx > 1e-12) {
+          edge = Math.min(edge, (Math.floor(px / B) * B + B - px) / dx);
+        } else if (dx < -1e-12) {
+          edge = Math.min(edge, (px - Math.floor(px / B) * B) / -dx);
+        }
+        if (dy > 1e-12) {
+          edge = Math.min(edge, (Math.floor(py / B) * B + B - py) / dy);
+        } else if (dy < -1e-12) {
+          edge = Math.min(edge, (py - Math.floor(py / B) * B) / -dy);
+        }
+        let drop = Infinity;
+        if (dz < -1e-12) {
+          drop = (z - blockMax) / -dz;
+        }
+        const skip = Math.min(edge, drop);
+        if (skip > fine) {
+          step = skip;
+        }
+        break;
+      }
+      prev = t;
+      t = Math.min(t + step, end);
+    }
   }
 
   /** The mip level for an eye height: one map per doubling above the
@@ -328,6 +474,9 @@ export class Ground {
     if (cov <= 0.0) {
       return field;
     }
+    if (this.land.biomeAt(u, v) === Biome.Water) {
+      return field;          // roads end at the shore — no asphalt on water
+    }
     // the nearer road family: its length coordinate and lateral offset
     const alongX = covX >= covY;             // x-family roads run along y
     const along = alongX ? v : u;
@@ -368,6 +517,15 @@ export class Ground {
     let colour = this.fieldTaps(u, v, stepXU, stepXV, stepYU, stepYV, level);
     colour = this.roadOverlay(u, v, Math.hypot(stepXU, stepXV),
                               Math.hypot(stepYU, stepYV), colour, distance);
+    // THE RELIEF: the surface normal against the sun, normalised so the
+    // flat plain keeps its exact palette (roads shade with their hill)
+    const n = this.land.normalAt(u, v);
+    const ndl = Math.max(0.0, n[0] * SUN_DIR[0] + n[1] * SUN_DIR[1]
+                                + n[2] * SUN_DIR[2]);
+    const f = (SHADE_AMBIENT + SHADE_SUN * ndl) / SHADE_FLAT;
+    colour = [Math.min(255.0, colour[0] * f),
+              Math.min(255.0, colour[1] * f),
+              Math.min(255.0, colour[2] * f)];
     // the runway's footprint coverage: soft slab edges in both axes
     const wU = Math.min(Math.hypot(stepXU, stepXV), RUNWAY_FILTER_MAX);
     const wV = Math.min(Math.hypot(stepYU, stepYV), RUNWAY_FILTER_MAX);

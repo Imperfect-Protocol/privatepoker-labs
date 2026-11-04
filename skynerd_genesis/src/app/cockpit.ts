@@ -2,8 +2,9 @@
  * The cockpit view: the selected drone's own instruments and controls.
  * Pure rendering from a DroneView snapshot — the app builds a view per
  * frame (live sim state or playback sample) and this module draws it: a
- * 3D world (sky, textured ground plane, runway with markings and a control
- * tower) filling the whole square under an MFD-style HUD — HDG tape on
+ * 3D world (a gradient sky with the sun, its glare and drifting clouds;
+ * textured ground plane; runway with markings and a control tower)
+ * filling the whole square under an MFD-style HUD — HDG tape on
  * top, ASI tape on the left edge, ALT tape on the right edge with the VSI
  * segment beside it — plus the controls square (yoke, rudder pedals,
  * throttle can with green-to-red bars and the RPM readout). Over the world
@@ -28,8 +29,10 @@
  */
 import { mphOf, vsHundredsOf, altFtOf, rpmOf } from "./units.js";
 import { Ground } from "./ground.js";
-import { Flora, type TreeSpot, type HouseSpot } from "./land.js";
+import { Flora, hash01, SUN_DIR,
+         type TreeSpot, type HouseSpot, type CloudSpot } from "./land.js";
 import type { SceneAircraft } from "./scene.js";
+import { levelOf } from "../learning/instruments.js";
 
 /** One aircraft's instantaneous reading, for the cockpit and controls. */
 export interface DroneView {
@@ -50,15 +53,17 @@ export interface DroneView {
   rud: number;
   alive: boolean;
   /**
-   * THE HAND'S INPUTS — what the pilot (instructor or student) is
-   * commanding, as distinct from what the airframe's surfaces are doing:
-   *  - handCommands: the 4 raw commanded targets;
-   *  - handChoices: the student's last per-channel decision, PUSH (+1),
-   *    ease (−1), hold (0) per channel — null while the instructor's
-   *    hand eases (no decisions happen);
+   * THE PILOT'S DECISIONS — the overlay on top of the machine's state:
+   *  - handChoices: the student's last per-channel decision, the
+   *    commanded lever LEVEL (a stop, or -1 for hold) — null while the
+   *    instructor's hand eases (no decisions happen);
    *  - handFresh: a decision window just opened — the 5 Hz brain beat.
+   *
+   * The CONTROLS themselves (yoke, pedals, throttle, the surfaces) are
+   * the machine's own state: ail / elev / rud / throttle below, read
+   * through the aircraft's sealed getters — what the selected aircraft
+   * is actually holding, not what a hand asked for.
    */
-  handCommands: readonly number[];
   handChoices: readonly number[] | null;
   handFresh: boolean;
 }
@@ -73,16 +78,17 @@ export function droneViewOf(entry: SceneAircraft): DroneView {
   const body = machine.body;
   const [fwdX, fwdY] = machine.forward;
   const choices = entry.hand.choices;
-  const hand = machine.handCommands;
   return {
     x: body.position.x, y: body.position.y, z: body.position.z,
     fwdX, fwdY,
     pitch: machine.pitch, bank: machine.bank,
     speed: machine.asi, vs: machine.vsi,
     velX: body.velocity.x, velY: body.velocity.y,
-    throttle: hand[3],
+    // The state of controls — the machine's own, via its sealed
+    // getters: the yoke, the pedals, and the throttle lever as the
+    // selected aircraft actually holds them.
+    throttle: machine.throttle,
     ail: machine.aileron, elev: machine.elevator, rud: machine.rudder,
-    handCommands: [hand[0], hand[1], hand[2], hand[3]],
     handChoices: choices === null
       ? null : [choices[0], choices[1], choices[2], choices[3]],
     handFresh: entry.hand.fresh,
@@ -91,7 +97,17 @@ export function droneViewOf(entry: SceneAircraft): DroneView {
 }
 
 const FOV_H = (90 * Math.PI) / 180; // the windshield's horizontal field of view
-const SKY: readonly [number, number, number] = [36, 51, 86];  // #243356
+/** The sky's gradient: pale haze at the horizon, deep blue overhead —
+ *  and the ground's far haze fades INTO the same fog colour, so earth
+ *  and sky melt together far away instead of meeting at a line. */
+const SKY_ZENITH: readonly [number, number, number] = [30, 46, 84];
+const SKY_FOG: readonly [number, number, number] = [184, 200, 214];
+const SKY_GRAD_SIN = 0.35;         // sin(elevation) where the sky is fully zenith
+/** The sun's screen constants — its world direction (SUN_DIR) is the
+ *  land's own light, shared with the terrain's relief shading. */
+const SUN_ANG = 0.035;             // the disc's angular radius, rad (~2°)
+const SUN_GLOW = 9.0;              // the glow's radius, in discs
+const GLARE_STRENGTH = 0.42;       // the veil's peak alpha, facing the sun
 const WORLD_SCALE = 1;               // the world renders at full resolution
 
 function fitCanvas(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
@@ -266,6 +282,7 @@ function drawWorld(ctx: CanvasRenderingContext2D, cam: Camera): void {
   // Ground sample mips/trilinear-filters/aniso-taps the checker over it.
   for (let py = 0; py < h; py++) {
     const row = py * w;
+    const b = (cam.cy - (py + 0.5) * step) / cam.f;   // the ray's up component
     for (let px = 0; px < w; px++) {
       const i = row + px;
       let r: number;
@@ -300,13 +317,19 @@ function drawWorld(ctx: CanvasRenderingContext2D, cam: Camera): void {
                                 stepYU, stepYV, hitT[i],
                                 cam.pz - ground.heightAt(cam.px, cam.py));
         const mix = Math.min(1.0, Math.max(0.0, (hitT[i] - hazeFrom) / hazeSpan));
-        r = c[0] + (SKY[0] - c[0]) * mix;
-        g = c[1] + (SKY[1] - c[1]) * mix;
-        bl = c[2] + (SKY[2] - c[2]) * mix;
+        r = c[0] + (SKY_FOG[0] - c[0]) * mix;
+        g = c[1] + (SKY_FOG[1] - c[1]) * mix;
+        bl = c[2] + (SKY_FOG[2] - c[2]) * mix;
       } else {
-        r = SKY[0];
-        g = SKY[1];
-        bl = SKY[2];
+        // the sky's gradient: fog at the horizon, deepening with elevation
+        const sx = (px + 0.5) * step;
+        const a = (sx - cam.cx) / cam.f;
+        const invL = 1.0 / Math.sqrt(1.0 + a * a + b * b);
+        const dz = (cam.fz + a * cam.rz + b * cam.uz) * invL;
+        const t = Math.min(1.0, Math.max(0.0, dz / SKY_GRAD_SIN));
+        r = SKY_FOG[0] + (SKY_ZENITH[0] - SKY_FOG[0]) * t;
+        g = SKY_FOG[1] + (SKY_ZENITH[1] - SKY_FOG[1]) * t;
+        bl = SKY_FOG[2] + (SKY_ZENITH[2] - SKY_FOG[2]) * t;
       }
       const o = i * 4;
       data[o] = r;
@@ -341,15 +364,18 @@ const flora = new Flora(ground.land);
  *  cruise. */
 function pushTower(objects: WorldObject[], cam: Camera): void {
   const TW = { x: 260.0, y: -95.0, base: 6.0, h: 26.0 };   // world metres
+  const TWz = ground.heightAt(TW.x, TW.y);  // planted on the terrain
   const centreDepth = (TW.x - cam.px) * cam.fx + (TW.y - cam.py) * cam.fy
-    + (0.0 - cam.pz) * cam.fz;
+    + (TWz - cam.pz) * cam.fz;
   if (centreDepth < 30.0) {
     return;                                  // behind or beside us
   }
   objects.push({
     depth: centreDepth,
     shadow: (ctx, cam2) => {
-      const pS = projectPoint(cam2, TW.x + TW.h * 0.7, TW.y + TW.base, 0.0);
+      const sx = TW.x + TW.h * 0.7;
+      const sy = TW.y + TW.base;
+      const pS = projectPoint(cam2, sx, sy, ground.heightAt(sx, sy));
       if (pS === null) {
         return;
       }
@@ -374,12 +400,12 @@ function pushTower(objects: WorldObject[], cam: Camera): void {
         ctx.fill();
       };
       const p = (ox: number, oz: number): [number, number] | null =>
-        projectPoint(cam2, TW.x + ox, TW.y, oz);
+        projectPoint(cam2, TW.x + ox, TW.y, TWz + oz);
       quad([p(-TW.base, 0.0), p(TW.base, 0.0), p(TW.base * 0.6, TW.h),
-            p(-TW.base * 0.6, TW.h)], "#8b96ab");
+            p(-TW.base * 0.6, TW.h)], "#35586b");
       quad([p(-TW.base * 0.9, TW.h), p(TW.base * 0.9, TW.h),
             p(TW.base * 0.9, TW.h + 4.0), p(-TW.base * 0.9, TW.h + 4.0)], "#9fd8ff");
-      ctx.strokeStyle = "#e8ecf4";
+      ctx.strokeStyle = "#dff2fc";
       ctx.lineWidth = 0.7;
       ctx.stroke();
     },
@@ -391,12 +417,13 @@ function pushTower(objects: WorldObject[], cam: Camera): void {
  *  the ground. Sub-pixel trees are skipped: the forest tiles' mottled
  *  texture carries them from altitude. */
 function pushTree(objects: WorldObject[], cam: Camera, t: TreeSpot): void {
-  const pB = projectPoint(cam, t.x, t.y, 0.0);
+  const bz = ground.heightAt(t.x, t.y);     // planted on the terrain
+  const pB = projectPoint(cam, t.x, t.y, bz);
   if (pB === null) {
     return;
   }
   const depth = (t.x - cam.px) * cam.fx + (t.y - cam.py) * cam.fy
-              + (0.0 - cam.pz) * cam.fz;
+              + (bz - cam.pz) * cam.fz;
   if (depth < 3.0) {
     return;
   }
@@ -404,7 +431,13 @@ function pushTree(objects: WorldObject[], cam: Camera, t: TreeSpot): void {
   if (cr < 0.8) {
     return;                                  // sub-pixel: the texture carries
   }
-  const pT = projectPoint(cam, t.x, t.y, t.h)!;   // same depth as the base
+  // The top can clip behind the near plane while the base does not when
+  // the camera is pitched hard (the stall-recovery dive): the projection
+  // returns null and the tree is simply not drawn.
+  const pT = projectPoint(cam, t.x, t.y, bz + t.h);
+  if (pT === null) {
+    return;
+  }
   const mX = 40.0 + cr * 2.0;
   if (Math.min(pB[0], pT[0]) < -mX || Math.max(pB[0], pT[0]) > cam.W + mX
       || Math.min(pB[1], pT[1]) < -mX || Math.max(pB[1], pT[1]) > cam.H + mX) {
@@ -419,7 +452,9 @@ function pushTree(objects: WorldObject[], cam: Camera, t: TreeSpot): void {
   objects.push({
     depth,
     shadow: (ctx, cam2) => {
-      const pS = projectPoint(cam2, t.x + t.h * 0.6, t.y + t.h * 0.15, 0.0);
+      const sx = t.x + t.h * 0.6;
+      const sy = t.y + t.h * 0.15;
+      const pS = projectPoint(cam2, sx, sy, ground.heightAt(sx, sy));
       if (pS === null) {
         return;
       }
@@ -459,12 +494,19 @@ const shadeOf = (base: readonly [number, number, number], f: number): string =>
  *  and shaded by its orientation, drawn far face first (painter's
  *  algorithm within the object). */
 function pushHouse(objects: WorldObject[], cam: Camera, h: HouseSpot): void {
+  const x0 = h.x - h.w / 2, x1 = h.x + h.w / 2;
+  const y0 = h.y - h.d / 2, y1 = h.y + h.d / 2;
+  // the foundation conforms: each corner planted at its own terrain
+  // height, the walls rising from the ground it stands on
+  const gz = [ground.heightAt(x0, y0), ground.heightAt(x1, y0),
+              ground.heightAt(x1, y1), ground.heightAt(x0, y1)];
+  const bz = ground.heightAt(h.x, h.y);
   const depth = (h.x - cam.px) * cam.fx + (h.y - cam.py) * cam.fy
-              + (0.0 - cam.pz) * cam.fz;
+              + (bz - cam.pz) * cam.fz;
   if (depth < 8.0) {
     return;
   }
-  const pC = projectPoint(cam, h.x, h.y, 0.0);
+  const pC = projectPoint(cam, h.x, h.y, bz);
   if (pC === null) {
     return;
   }
@@ -473,14 +515,14 @@ function pushHouse(objects: WorldObject[], cam: Camera, h: HouseSpot): void {
       || pC[1] < -extent || pC[1] > cam.H + extent) {
     return;                                  // off the windshield
   }
-  const x0 = h.x - h.w / 2, x1 = h.x + h.w / 2;
-  const y0 = h.y - h.d / 2, y1 = h.y + h.d / 2;
   const p = (x: number, y: number, z: number): [number, number] =>
     projectPoint(cam, x, y, z) ?? [0.0, 0.0];
-  const g: [number, number][] = [p(x0, y0, 0.0), p(x1, y0, 0.0),
-                                p(x1, y1, 0.0), p(x0, y1, 0.0)];
-  const e: [number, number][] = [p(x0, y0, h.wallH), p(x1, y0, h.wallH),
-                                 p(x1, y1, h.wallH), p(x0, y1, h.wallH)];
+  const g: [number, number][] = [p(x0, y0, gz[0]), p(x1, y0, gz[1]),
+                                p(x1, y1, gz[2]), p(x0, y1, gz[3])];
+  const e: [number, number][] = [p(x0, y0, gz[0] + h.wallH),
+                                 p(x1, y0, gz[1] + h.wallH),
+                                 p(x1, y1, gz[2] + h.wallH),
+                                 p(x0, y1, gz[3] + h.wallH)];
   const faceDepth = (x: number, y: number, z: number): number =>
     (x - cam.px) * cam.fx + (y - cam.py) * cam.fy + (z - cam.pz) * cam.fz;
   interface Face { depth: number; pts: [number, number][]; colour: string; }
@@ -494,28 +536,28 @@ function pushHouse(objects: WorldObject[], cam: Camera, h: HouseSpot): void {
                pts: [g[0], g[1], e[1], e[0]], colour: shadeOf(WALL, 0.9) });
   faces.push({ depth: faceDepth(h.x, y1, h.wallH / 2),
                pts: [g[3], g[2], e[2], e[3]], colour: shadeOf(WALL, 0.8) });
-  const top = h.wallH + h.roofH;
+  const ridgeZ = bz + h.wallH + h.roofH;   // the ridge axis, for sorting
   if (h.along === "x") {
-    const r0 = p(x0, h.y, top);
-    const r1 = p(x1, h.y, top);
-    faces.push({ depth: faceDepth(h.x, y0, top),
+    const r0 = p(x0, h.y, ground.heightAt(x0, h.y) + h.wallH + h.roofH);
+    const r1 = p(x1, h.y, ground.heightAt(x1, h.y) + h.wallH + h.roofH);
+    faces.push({ depth: faceDepth(h.x, y0, ridgeZ),
                  pts: [e[0], e[1], r1, r0], colour: shadeOf(ROOF, 1.0) });
-    faces.push({ depth: faceDepth(h.x, y1, top),
+    faces.push({ depth: faceDepth(h.x, y1, ridgeZ),
                  pts: [e[3], e[2], r1, r0], colour: shadeOf(ROOF, 0.72) });
-    faces.push({ depth: faceDepth(x0, h.y, top),
+    faces.push({ depth: faceDepth(x0, h.y, ridgeZ),
                  pts: [e[0], e[3], r0], colour: shadeOf(WALL, 1.0) });
-    faces.push({ depth: faceDepth(x1, h.y, top),
+    faces.push({ depth: faceDepth(x1, h.y, ridgeZ),
                  pts: [e[1], e[2], r1], colour: shadeOf(WALL, 0.72) });
   } else {
-    const r0 = p(h.x, y0, top);
-    const r1 = p(h.x, y1, top);
-    faces.push({ depth: faceDepth(x0, h.y, top),
+    const r0 = p(h.x, y0, ground.heightAt(h.x, y0) + h.wallH + h.roofH);
+    const r1 = p(h.x, y1, ground.heightAt(h.x, y1) + h.wallH + h.roofH);
+    faces.push({ depth: faceDepth(x0, h.y, ridgeZ),
                  pts: [e[0], e[3], r1, r0], colour: shadeOf(ROOF, 1.0) });
-    faces.push({ depth: faceDepth(x1, h.y, top),
+    faces.push({ depth: faceDepth(x1, h.y, ridgeZ),
                  pts: [e[1], e[2], r1, r0], colour: shadeOf(ROOF, 0.72) });
-    faces.push({ depth: faceDepth(h.x, y0, top),
+    faces.push({ depth: faceDepth(h.x, y0, ridgeZ),
                  pts: [e[0], e[1], r0], colour: shadeOf(WALL, 0.9) });
-    faces.push({ depth: faceDepth(h.x, y1, top),
+    faces.push({ depth: faceDepth(h.x, y1, ridgeZ),
                  pts: [e[3], e[2], r1], colour: shadeOf(WALL, 0.8) });
   }
   faces.sort((a, b) => b.depth - a.depth);
@@ -539,6 +581,119 @@ function pushHouse(objects: WorldObject[], cam: Camera, h: HouseSpot): void {
 /** Collect and draw the landscape's objects: the tower, the trees within
  *  700 m, the hamlet houses within 2.5 km — shadows first (ground
  *  decals), then far to near. */
+/** The sun's screen position when it stands in front of the camera,
+ *  else null. */
+function sunScreen(cam: Camera): [number, number] | null {
+  return projectDir(cam, SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]);
+}
+
+/** How directly the camera faces the sun, 0 (away) to 1 (dead ahead). */
+function sunAlign(cam: Camera): number {
+  return Math.max(0.0, cam.fx * SUN_DIR[0] + cam.fy * SUN_DIR[1]
+                           + cam.fz * SUN_DIR[2]);
+}
+
+/** The sun: a hot disc with a soft additive glow, at its fixed world
+ *  direction — behind the clouds and the landscape's objects. */
+function drawSun(ctx: CanvasRenderingContext2D, cam: Camera): void {
+  const at = sunScreen(cam);
+  if (at === null) {
+    return;                                // the sun is behind us
+  }
+  const [sx, sy] = at;
+  const disc = cam.f * Math.tan(SUN_ANG);
+  const glow = disc * SUN_GLOW;
+  const grad = ctx.createRadialGradient(sx, sy, disc, sx, sy, glow);
+  grad.addColorStop(0.0, "rgba(255,250,225,0.55)");
+  grad.addColorStop(0.3, "rgba(255,244,205,0.24)");
+  grad.addColorStop(1.0, "rgba(255,240,200,0)");
+  ctx.globalCompositeOperation = "lighter";
+  ctx.fillStyle = grad;
+  ctx.fillRect(sx - glow, sy - glow, glow * 2.0, glow * 2.0);
+  ctx.fillStyle = "rgba(255,253,242,0.97)";  // the disc itself
+  ctx.beginPath();
+  ctx.arc(sx, sy, disc, 0.0, 2.0 * Math.PI);
+  ctx.fill();
+  ctx.globalCompositeOperation = "source-over";
+}
+
+/** The sun's glare: a wide soft veil over the whole scene, blooming as
+ *  the camera swings toward the sun — the lens flare of the eye. */
+function drawSunGlare(ctx: CanvasRenderingContext2D, cam: Camera): void {
+  const at = sunScreen(cam);
+  if (at === null) {
+    return;
+  }
+  const align = sunAlign(cam);
+  if (align <= 0.05) {
+    return;                                // facing away: no glare
+  }
+  const a = GLARE_STRENGTH * align ** 3;
+  const [sx, sy] = at;
+  const R = Math.hypot(cam.W, cam.H);
+  const grad = ctx.createRadialGradient(sx, sy, 0.0, sx, sy, R);
+  grad.addColorStop(0.0, `rgba(255,246,220,${a.toFixed(3)})`);
+  grad.addColorStop(0.35, `rgba(255,246,220,${(a * 0.45).toFixed(3)})`);
+  grad.addColorStop(1.0, "rgba(255,246,220,0)");
+  ctx.globalCompositeOperation = "lighter";
+  ctx.fillStyle = grad;
+  ctx.fillRect(0.0, 0.0, cam.W, cam.H);
+  ctx.globalCompositeOperation = "source-over";
+}
+
+/** One cloud: a cluster of soft puffs at its fixed world spot, its flat
+ *  grey base shaded — 80% TRANSPARENT (a faint veil, not a whiteout) and
+ *  three times the cluster radius, drawn behind anything nearer. */
+function pushCloud(objects: WorldObject[], cam: Camera, c: CloudSpot): void {
+  const dist = Math.hypot(c.x - cam.px, c.y - cam.py, c.alt - cam.pz);
+  const cr = (c.r * cam.f) / dist;          // the cluster's projected radius
+  if (cr < 2.0) {
+    return;                                  // sub-pixel fluff
+  }
+  const p = projectPoint(cam, c.x, c.y, c.alt);
+  if (p === null) {
+    return;
+  }
+  if (p[0] < -cr * 3.0 || p[0] > cam.W + cr * 3.0
+      || p[1] < -cr * 3.0 || p[1] > cam.H + cr * 3.0) {
+    return;                                  // off the windshield
+  }
+  const fade = Math.max(0.0, 1.0 - dist / 16000.0);   // melts into the haze
+  if (fade <= 0.02) {
+    return;
+  }
+  objects.push({
+    depth: dist,
+    draw: (ctx) => {
+      // the puff layout: along the wind axis, deterministic per cloud
+      const wind = hash01(c.seedX, c.seedY, 41) * Math.PI;
+      const ax = Math.cos(wind);
+      const ay = Math.sin(wind);
+      for (let k = 0; k < 4; k++) {
+        const off = (k - 1.5) * 0.42;                 // along the wind
+        const jitterY = (hash01(c.seedX + k, c.seedY, 42) - 0.5) * 0.5;
+        const jitterR = 0.45 + 0.20 * hash01(c.seedX, c.seedY + k, 43);
+        const bx = p[0] + ax * off * cr;
+        const by = p[1] + ay * off * cr * 0.4 + jitterY * cr * 0.3;
+        const br = cr * jitterR;
+        const grad = ctx.createRadialGradient(bx, by - br * 0.15, 0.0,
+                                              bx, by, br);
+        grad.addColorStop(0.0, `rgba(250,252,255,${(0.15 * fade).toFixed(3)})`);
+        grad.addColorStop(1.0, "rgba(250,252,255,0)");
+        ctx.fillStyle = grad;
+        ctx.fillRect(bx - br, by - br, br * 2.0, br * 2.0);
+      }
+      // the flat grey base — the cloud's own shadow on itself
+      const grad = ctx.createRadialGradient(p[0], p[1] + cr * 0.22, 0.0,
+                                            p[0], p[1] + cr * 0.22, cr * 0.9);
+      grad.addColorStop(0.0, `rgba(198,210,224,${(0.06 * fade).toFixed(3)})`);
+      grad.addColorStop(1.0, "rgba(198,210,224,0)");
+      ctx.fillStyle = grad;
+      ctx.fillRect(p[0] - cr, p[1] - cr * 0.7, cr * 2.0, cr * 1.8);
+    },
+  });
+}
+
 function drawWorldObjects(ctx: CanvasRenderingContext2D, cam: Camera): void {
   const objects: WorldObject[] = [];
   pushTower(objects, cam);
@@ -553,6 +708,12 @@ function drawWorldObjects(ctx: CanvasRenderingContext2D, cam: Camera): void {
                    cam.px + 2500.0, cam.py + 2500.0, houses);
   for (const h of houses) {
     pushHouse(objects, cam, h);
+  }
+  const clouds: CloudSpot[] = [];
+  flora.cloudsNear(cam.px - 8000.0, cam.py - 8000.0,
+                   cam.px + 8000.0, cam.py + 8000.0, clouds);
+  for (const c of clouds) {
+    pushCloud(objects, cam, c);
   }
   for (const o of objects) {
     if (o.shadow !== undefined) {
@@ -571,10 +732,10 @@ function drawHeadingTape(ctx: CanvasRenderingContext2D, W: number,
                          heading: number): void {
   const h = 18;
   const pxPerDeg = 2.2;
-  ctx.fillStyle = "rgba(10,14,22,0.55)";
+  ctx.fillStyle = "rgba(2,6,12,0.62)";
   ctx.fillRect(0, 0, W, h);
   const hdg = (((heading * 180 / Math.PI) % 360) + 360) % 360;
-  ctx.font = "8px ui-monospace, monospace";
+  ctx.font = "10px Rajdhani, 'SF Mono', monospace";
   ctx.textAlign = "center";
   for (let d = 0; d < 360; d += 10) {
     let rel = d - hdg;
@@ -585,7 +746,7 @@ function drawHeadingTape(ctx: CanvasRenderingContext2D, W: number,
       continue;
     }
     const major = d % 30 === 0;
-    ctx.strokeStyle = "rgba(201,212,227,0.8)";
+    ctx.strokeStyle = "rgba(160,220,245,0.8)";
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(x, h);
@@ -593,16 +754,16 @@ function drawHeadingTape(ctx: CanvasRenderingContext2D, W: number,
     ctx.stroke();
     if (major) {
       const cardinals: Record<number, string> = { 0: "N", 90: "E", 180: "S", 270: "W" };
-      ctx.fillStyle = "rgba(201,212,227,0.9)";
+      ctx.fillStyle = "rgba(160,220,245,0.9)";
       ctx.fillText(cardinals[d] ?? String(d / 10), x, h - 10);
     }
   }
-  ctx.fillStyle = "#0b0e14";
+  ctx.fillStyle = "#040a12";
   ctx.fillRect(W / 2 - 17, h - 1, 34, 13);
-  ctx.strokeStyle = "#7dff8e";
+  ctx.strokeStyle = "#35d0ff";
   ctx.strokeRect(W / 2 - 16.5, h - 0.5, 33, 12);
-  ctx.fillStyle = "#7dff8e";
-  ctx.font = "bold 10px ui-monospace, monospace";
+  ctx.fillStyle = "#35d0ff";
+  ctx.font = "bold 12px Rajdhani, 'SF Mono', monospace";
   ctx.fillText(`${String(Math.round(hdg) % 360).padStart(3, "0")}\u00b0`, W / 2, h + 9);
   ctx.textAlign = "left";
 }
@@ -614,11 +775,11 @@ function drawSpeedTape(ctx: CanvasRenderingContext2D, W: number, H: number,
   const w = 34;
   const top = 30;
   const bot = H - 6;
-  ctx.fillStyle = "rgba(10,14,22,0.55)";
+  ctx.fillStyle = "rgba(2,6,12,0.62)";
   ctx.fillRect(0, top, w, bot - top);
   const midY = (top + bot) / 2;
   const pxPerMph = 1.6;
-  ctx.font = "8px ui-monospace, monospace";
+  ctx.font = "10px Rajdhani, 'SF Mono', monospace";
   ctx.textAlign = "right";
   for (let v = 0; v <= 170; v += 10) {
     const y = midY - (v - mph) * pxPerMph;
@@ -626,23 +787,23 @@ function drawSpeedTape(ctx: CanvasRenderingContext2D, W: number, H: number,
       continue;
     }
     const major = v % 20 === 0;
-    ctx.strokeStyle = "rgba(201,212,227,0.8)";
+    ctx.strokeStyle = "rgba(160,220,245,0.8)";
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(w, y);
     ctx.lineTo(w - (major ? 9 : 4), y);
     ctx.stroke();
     if (major) {
-      ctx.fillStyle = "rgba(201,212,227,0.9)";
+      ctx.fillStyle = "rgba(160,220,245,0.9)";
       ctx.fillText(String(v), w - 11, y + 3);
     }
   }
-  ctx.fillStyle = "#0b0e14";
+  ctx.fillStyle = "#040a12";
   ctx.fillRect(0, midY - 9, w + 16, 18);
-  ctx.strokeStyle = "#7dff8e";
+  ctx.strokeStyle = "#35d0ff";
   ctx.strokeRect(0.5, midY - 8.5, w + 15, 17);
-  ctx.fillStyle = "#7dff8e";
-  ctx.font = "bold 12px ui-monospace, monospace";
+  ctx.fillStyle = "#35d0ff";
+  ctx.font = "bold 14px Rajdhani, 'SF Mono', monospace";
   ctx.fillText(mph.toFixed(0), w + 12, midY + 4);
   ctx.textAlign = "left";
 }
@@ -655,11 +816,11 @@ function drawAltTape(ctx: CanvasRenderingContext2D, W: number, H: number,
   const x0 = W - w;
   const top = 30;
   const bot = H - 6;
-  ctx.fillStyle = "rgba(10,14,22,0.55)";
+  ctx.fillStyle = "rgba(2,6,12,0.62)";
   ctx.fillRect(x0, top, w, bot - top);
   const midY = (top + bot) / 2;
   const pxPerFt = 0.16;
-  ctx.font = "8px ui-monospace, monospace";
+  ctx.font = "10px Rajdhani, 'SF Mono', monospace";
   ctx.textAlign = "left";
   const base = Math.round(altFt / 100) * 100;
   for (let v = base - 1200; v <= base + 1200; v += 100) {
@@ -668,24 +829,24 @@ function drawAltTape(ctx: CanvasRenderingContext2D, W: number, H: number,
       continue;
     }
     const major = v % 200 === 0;
-    ctx.strokeStyle = "rgba(201,212,227,0.8)";
+    ctx.strokeStyle = "rgba(160,220,245,0.8)";
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(x0, y);
     ctx.lineTo(x0 + (major ? 9 : 4), y);
     ctx.stroke();
     if (major) {
-      ctx.fillStyle = "rgba(201,212,227,0.9)";
+      ctx.fillStyle = "rgba(160,220,245,0.9)";
       ctx.fillText(String(v), x0 + 11, y + 3);
     }
   }
   // current altitude box (opens inward)
-  ctx.fillStyle = "#0b0e14";
+  ctx.fillStyle = "#040a12";
   ctx.fillRect(x0 - 16, midY - 9, w + 16, 18);
-  ctx.strokeStyle = "#7dff8e";
+  ctx.strokeStyle = "#35d0ff";
   ctx.strokeRect(x0 - 15.5, midY - 8.5, w + 15, 17);
-  ctx.fillStyle = "#7dff8e";
-  ctx.font = "bold 11px ui-monospace, monospace";
+  ctx.fillStyle = "#35d0ff";
+  ctx.font = "bold 13px Rajdhani, 'SF Mono', monospace";
   ctx.textAlign = "right";
   ctx.fillText(altFt.toFixed(0), x0 + w - 2, midY + 4);
   ctx.textAlign = "left";
@@ -696,7 +857,7 @@ function drawAltTape(ctx: CanvasRenderingContext2D, W: number, H: number,
   const vBot = midY + 66;
   const clampV = Math.max(-16.0, Math.min(16.0, vsHundreds));
   const dy = clampV * (66.0 / 16.0);        // px, positive = climb
-  ctx.strokeStyle = "rgba(139,150,171,0.5)";
+  ctx.strokeStyle = "rgba(70,115,140,0.5)";
   ctx.lineWidth = 1;
   ctx.setLineDash([3, 3]);
   ctx.beginPath();
@@ -706,18 +867,18 @@ function drawAltTape(ctx: CanvasRenderingContext2D, W: number, H: number,
   ctx.setLineDash([]);
   const y0 = Math.min(midY, midY - dy);
   const y1 = Math.max(midY, midY - dy);
-  ctx.fillStyle = Math.abs(vsHundreds) < 0.05 ? "rgba(125,223,142,0.35)" : "#7dff8e";
+  ctx.fillStyle = Math.abs(vsHundreds) < 0.05 ? "rgba(53,208,255,0.35)" : "#35d0ff";
   ctx.fillRect(vx - 4, y0, 8, Math.max(1.0, y1 - y0));
   // the zero notch: a solid bright tick across the segment at zero climb,
   // drawn over the bar so level flight reads at a glance
-  ctx.strokeStyle = "#c9d4e3";
+  ctx.strokeStyle = "#d0ecff";
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.moveTo(vx - 7, midY);
   ctx.lineTo(vx + 7, midY);
   ctx.stroke();
-  ctx.fillStyle = "rgba(201,212,227,0.75)";
-  ctx.font = "7px ui-monospace, monospace";
+  ctx.fillStyle = "rgba(160,220,245,0.75)";
+  ctx.font = "9px Rajdhani, 'SF Mono', monospace";
   ctx.textAlign = "center";
   ctx.fillText("VSI", vx, vBot + 9);
   ctx.fillText(`${vsHundreds >= 0 ? "+" : ""}${vsHundreds.toFixed(1)}`, vx, vTop - 3);
@@ -747,7 +908,7 @@ function drawFlightPathMarker(ctx: CanvasRenderingContext2D, s: DroneView,
   }
   const r = 4.5;
   ctx.lineCap = "round";
-  for (const [colour, width] of [["#0b0e14", 4.0], ["#7dff8e", 2.0]] as const) {
+  for (const [colour, width] of [["#040a12", 4.0], ["#35d0ff", 2.0]] as const) {
     ctx.strokeStyle = colour;
     ctx.lineWidth = width;
     ctx.beginPath();
@@ -781,6 +942,8 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
   // the windshield: the 3D world fills the WHOLE square — sky above the
   // horizon, the ground's textured squares below, one ray per pixel
   drawWorld(ctx, cam);
+  // the sun: a hot disc with its glow, at its fixed world direction
+  drawSun(ctx, cam);
 
   // world overlays, projected through the same camera
   ctx.save();
@@ -802,28 +965,20 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
     }
     return [pl[0], pl[1], pr[0], pr[1]];
   };
-  // the horizon line, extended across the viewport
-  const hz = horizon(0.0, 0.6);
-  if (hz !== null) {
-    const ex = hz[2] - hz[0];
-    const ey = hz[3] - hz[1];
-    const el = Math.hypot(ex, ey);
-    if (el > 1e-6) {
-      const k = Math.hypot(W, H) / el;
-      ctx.strokeStyle = "#f2f5fa";
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(hz[0] - ex * k, hz[1] - ey * k);
-      ctx.lineTo(hz[0] + ex * k, hz[1] + ey * k);
-      ctx.stroke();
-    }
-  }
-  // pitch ladder: the world's elevation rungs, at ±10° and ±20°
-  ctx.strokeStyle = "rgba(226,232,244,0.55)";
-  ctx.fillStyle = "rgba(226,232,244,0.75)";
-  ctx.font = "8px ui-monospace, monospace";
+  // no horizon line is drawn: the ground's far haze and the sky's fog
+  // band are the SAME pale colour, so the world melts at the horizon —
+  // the pitch ladder below is the attitude reference
+  // pitch ladder: the world's elevation rungs, every 10° from −90° up to
+  // +90° — the full range. Zero is the horizon itself: the world melts
+  // into haze there, so the ladder is the only attitude reference.
+  ctx.strokeStyle = "rgba(170,232,255,0.55)";
+  ctx.fillStyle = "rgba(170,232,255,0.75)";
+  ctx.font = "10px Rajdhani, 'SF Mono', monospace";
   ctx.lineWidth = 1;
-  for (const d of [-20, -10, 10, 20]) {
+  for (let d = -90; d <= 90; d += 10) {
+    if (d === 0) {
+      continue;                               // the haze line is the 0° rung
+    }
     const rung = horizon((d * Math.PI) / 180, 0.6);
     if (rung === null) {
       continue;                               // this rung is behind us
@@ -847,10 +1002,12 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
     ctx.stroke();
     ctx.fillText(String(d), midX + ux * (half + 4), midY + uy * (half + 4) + 3);
   }
-  // the landscape's objects: tower, trees, houses, depth-sorted
+  // the landscape's objects: tower, trees, houses, clouds, depth-sorted
   drawWorldObjects(ctx, cam);
+  // the sun's glare: a soft veil over the whole scene when facing it
+  drawSunGlare(ctx, cam);
   // traffic: other drones in the forward view
-  ctx.font = "8px ui-monospace, monospace";
+  ctx.font = "10px Rajdhani, 'SF Mono', monospace";
   for (const other of others) {
     if (!other.alive) {
       continue;
@@ -869,14 +1026,14 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
     }
     const size = Math.max(3.0, Math.min(9.0, 260.0 / range));
     const dz = other.z - s.z;
-    ctx.fillStyle = dz > 2 ? "#9fd8ff" : dz < -2 ? "#ffb066" : "#e8ecf4";
+    ctx.fillStyle = dz > 2 ? "#9fd8ff" : dz < -2 ? "#ffb066" : "#dff2fc";
     ctx.beginPath();
     ctx.moveTo(tx, ty - size);
     ctx.lineTo(tx + size * 0.7, ty + size * 0.6);
     ctx.lineTo(tx - size * 0.7, ty + size * 0.6);
     ctx.closePath();
     ctx.fill();
-    ctx.fillStyle = "rgba(200,210,228,0.7)";
+    ctx.fillStyle = "rgba(170,225,250,0.7)";
     ctx.fillText(`${Math.round(range)}m`, tx + size + 2, ty + 3);
   }
   // flight path marker: rides the world, not the frame
@@ -912,7 +1069,40 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
   ctx.lineJoin = "miter";
   ctx.lineCap = "butt";
 
-  // bank pointer (rides the card) + fixed reference tick
+  // the ADI: a bright reference circle carrying the BANK SCALE — a notch
+  // every 5°, longer notches at 15/30/60°, and the CARDINAL marks 0/45/90°
+  // BIGGER and THICKER — all 65% transparent, drawn in the HUD's ink (the
+  // same pale blue as the rest of its text); the amber bank pointer rides
+  // the card against it
+  ctx.strokeStyle = "rgba(170,232,255,0.35)";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, 2 * Math.PI);
+  ctx.stroke();
+  const BANK_MAJOR = new Set([15, 30, 60]);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let a = -90; a <= 90; a += 5) {
+    const aa = Math.abs(a);
+    if (aa === 0 || aa === 45 || aa === 90) {
+      continue;                        // the cardinals get their own pass
+    }
+    const len = BANK_MAJOR.has(aa) ? 10 : 5;
+    const th = (a * Math.PI) / 180 - Math.PI / 2;   // angles from the top
+    ctx.moveTo(cx + Math.cos(th) * R, cy + Math.sin(th) * R);
+    ctx.lineTo(cx + Math.cos(th) * (R - len), cy + Math.sin(th) * (R - len));
+  }
+  ctx.stroke();
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  for (const a of [-90, -45, 0, 45, 90]) {
+    const th = (a * Math.PI) / 180 - Math.PI / 2;
+    ctx.moveTo(cx + Math.cos(th) * R, cy + Math.sin(th) * R);
+    ctx.lineTo(cx + Math.cos(th) * (R - 15), cy + Math.sin(th) * (R - 15));
+  }
+  ctx.stroke();
+
+  // bank pointer (rides the card): the amber triangle against the scale
   ctx.save();
   ctx.translate(cx, cy);
   ctx.rotate(-s.bank);
@@ -924,26 +1114,6 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
   ctx.closePath();
   ctx.fill();
   ctx.restore();
-  ctx.strokeStyle = "#8b96ab";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(cx, cy - R);
-  ctx.lineTo(cx, cy - R + 7);
-  ctx.stroke();
-  ctx.restore();                             // un-clip
-
-  // the ADI rim: a thin ring marking the instrument's reference circle
-  ctx.strokeStyle = "rgba(139,150,171,0.35)";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.arc(cx, cy, R, 0, 2 * Math.PI);
-  ctx.stroke();
-
-  ctx.strokeStyle = "#3a4258";               // bezel
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(cx, cy, R, 0, 2 * Math.PI);
-  ctx.stroke();
 
   // --- MFD-style HUD: tapes over the world --------------------------------
   // ASI ladder on the left edge, ALT ladder on the right edge with the
@@ -957,7 +1127,7 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
     ctx.fillStyle = "rgba(255,58,48,0.18)";
     ctx.fillRect(0, cy - 15, W, 30);
     ctx.fillStyle = "#ff4a3a";
-    ctx.font = "bold 13px ui-monospace, monospace";
+    ctx.font = "bold 15px Rajdhani, 'SF Mono', monospace";
     ctx.textAlign = "center";
     ctx.fillText("CRASHED", cx, cy + 5);
     ctx.textAlign = "left";
@@ -972,7 +1142,21 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
   void foot;
 }
 
-/** The controls square: yoke, rudder pedals, throttle lever. */
+/** The controls square: one NARROW HORIZONTAL STRIP —
+ *        LEFT RUDDER | YOKE | RIGHT RUDDER | A E R T | the RPM bar —
+ * with every label riding the strip's BOTTOM EDGE.
+ *
+ * THE HAND'S INPUTS drive this panel — what the pilot at the controls is
+ * commanding right now (the student's own inputs while it flies), not
+ * merely where the airframe's surfaces happen to be. The A E R T strip
+ * carries the four channels' decisions (A aileron, E elevator, R rudder,
+ * T throttle — ▲ driving the lever up a level, ▼ down a level, · hold;
+ * the beat dot pulses when a decision window just opened; while the
+ * instructor demonstrates there are no discrete decisions — its hand
+ * eases smoothly — the strip rests). The RPM bar reads the engine:
+ * idle at the RIGHT edge, INCREASING LEFTWARDS to full — green at
+ * idle, red at the redline.
+ */
 export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): void {
   const ctx = fitCanvas(canvas);
   const W = canvas.clientWidth;
@@ -981,190 +1165,188 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   const s = view;
   const SURF_MAX = 0.35;    // mechanical limit, rad
 
-  // THE HAND'S INPUTS drive this panel — what the pilot at the controls
-  // is commanding right now (the student's own inputs while it flies),
-  // not merely where the airframe's surfaces happen to be.
-  const inAil = s.handCommands[0];
-  const inElev = s.handCommands[1];
-  const inRud = s.handCommands[2];
-  const inThr = Math.max(0.0, Math.min(1.0, s.handCommands[3]));
+  // the controls as the SELECTED AIRCRAFT actually holds them — the
+  // machine's own state, read through its sealed getters
+  const inAil = s.ail;
+  const inElev = s.elev;
+  const inRud = s.rud;
+  const inThr = Math.max(0.0, Math.min(1.0, s.throttle));
 
-  // THE LAYOUT: the AERT decision strip sits NORTH of the yoke — dead
-  // above it, on the yoke's own column — with the rudder below and the
-  // throttle lever to the east.
-  const yx = W * 0.32;            // the yoke column
-  const yy = H * 0.53;            // the yoke centre
-  const rx = yx;                  // the rudder rides the yoke column
-  const ry = H * 0.85;
-  const tx = W * 0.80;            // the throttle lever, east side
-  const tyTop = H * 0.18;
-  const tyBot = H * 0.62;
+  // THE STRIP: left rudder pedal, yoke, right rudder pedal, the A E R T
+  // decision boxes, the RPM bar — all centred on one row, labels below
+  const textY = H - 8;              // the bottom text band's baseline
+  const midY = (H - 26) / 2 + 4;    // the content row's centre
+  const pl = W * 0.08;              // the left pedal's centre
+  const yk = W * 0.21;              // the yoke's centre
+  const pr = W * 0.355;             // the right pedal's centre
+  const aert0 = W * 0.44;           // the A E R T boxes' left edge
+  const rpmL = W * 0.66;            // the RPM bar's LEFT edge (full)
+  const rpmR = W - 16;              // the RPM bar's RIGHT edge (idle)
 
-  ctx.textAlign = "left";
-  ctx.font = "9px ui-monospace, monospace";
+  ctx.font = "11px Rajdhani, 'SF Mono', monospace";
 
-  // --- AERT decisions (directly above the yoke) -----------------------------
-  // The four control channels and the pilot's decision on each, at every
-  // 0.2 s decision window: A aileron, E elevator, R rudder, T throttle —
-  // ▲ push (+0.05), ▼ ease (−0.05), · hold. The beat dot pulses when a
-  // decision window just opened. While the instructor demonstrates there
-  // are no discrete decisions — its hand eases smoothly — the strip rests.
-  ctx.fillStyle = "#5b6878";
-  ctx.fillText("AERT DECISIONS", yx - 52, 18);
-  ctx.fillStyle = s.handFresh ? "#ff8c3a" : "#2a3242";
-  ctx.beginPath();
-  ctx.arc(yx + 58, 15, 2.5, 0, 2 * Math.PI);
-  ctx.fill();
-  const CHANNEL_LABELS = ["A", "E", "R", "T"];
-  for (let i = 0; i < 4; i++) {
-    const bx = yx - 52 + i * 26;
-    ctx.strokeStyle = "#3a4258";
-    ctx.strokeRect(bx + 0.5, 24.5, 22, 22);
-    ctx.fillStyle = "#5b6878";
-    ctx.fillText(CHANNEL_LABELS[i], bx + 8, 57);
-    const choice = s.handChoices;
-    if (choice === null) {
-      ctx.fillStyle = "#3a4258";            // the instructor eases: no decisions
-      ctx.fillText("\u2014", bx + 8, 40);
-      continue;
-    }
-    if (choice[i] === 2) {                   // PUSH
-      ctx.fillStyle = "#ff8c3a";
-      ctx.fillText("\u25b2", bx + 7, 40);
-    } else if (choice[i] === 0) {            // ease
-      ctx.fillStyle = "#9fd8ff";
-      ctx.fillText("\u25bc", bx + 7, 41);
-    } else {                                 // hold
-      ctx.fillStyle = "#5b6878";
-      ctx.fillText("\u00b7", bx + 10, 39);
-    }
+  // --- the rudder pedals: left of the yoke, right of the yoke --------------
+  const press = (inRud / SURF_MAX) * H * 0.10;   // one forward, one back
+  const pedalH = H * 0.34;
+  for (const side of [-1, 1]) {
+    const cx = side < 0 ? pl : pr;
+    const forward = (inRud > 0 && side > 0) || (inRud < 0 && side < 0);
+    const disp = inRud === 0 ? 0.0 : forward ? -press : press * 0.35;
+    const engaged = inRud !== 0 && forward;
+    // the rest reference: a dashed tick at the pedal's neutral height
+    ctx.strokeStyle = "#232b3d";
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(cx - 11, midY);
+    ctx.lineTo(cx + 11, midY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = engaged ? "#ff8c3a" : "#14283a";
+    ctx.fillRect(cx - 7, midY + disp - pedalH / 2, 14, pedalH);
   }
-  // the channel legend: what each letter commands
-  ctx.fillStyle = "#3d4658";
-  ctx.fillText("A aileron \u00b7 E elevator", yx - 52, 72);
-  ctx.fillText("R rudder \u00b7 T throttle", yx - 52, 84);
 
-  // --- yoke (aileron rotates the wheel, elevator pushes/pulls it) -----------
-  const travel = 15;                    // px of push/pull travel
-  const pull = (inElev / SURF_MAX) * travel;    // nose up = pull = yoke toward pilot
-  const wheelAngle = (inAil / SURF_MAX) * 1.15; // rad of visual wheel rotation
+  // --- the yoke: aileron rotates the wheel, elevator pushes/pulls it ------
+  const pull = (inElev / SURF_MAX) * H * 0.08;    // nose up = pull = toward pilot
+  const wheelAngle = (inAil / SURF_MAX) * 1.15;   // rad of visual rotation
+  const hw = Math.min(30.0, H * 0.26);            // the horn half-spacing
+  const hornUp = Math.min(18.0, H * 0.16);
+  const dip = Math.min(9.0, H * 0.08);           // the lower bar's depth
 
-  // neutral cross reference
+  // the neutral cross reference
   ctx.strokeStyle = "#232b3d";
   ctx.setLineDash([4, 4]);
   ctx.beginPath();
-  ctx.moveTo(yx - 70, yy); ctx.lineTo(yx + 70, yy);
-  ctx.moveTo(yx, yy - 44); ctx.lineTo(yx, yy + 44);
+  ctx.moveTo(yk - hw - 10, midY);
+  ctx.lineTo(yk + hw + 10, midY);
+  ctx.moveTo(yk, midY - hornUp - 12);
+  ctx.lineTo(yk, midY + dip + 8);
   ctx.stroke();
   ctx.setLineDash([]);
 
   ctx.save();
-  ctx.translate(yx, yy + pull);
+  ctx.translate(yk, midY + pull);
   ctx.rotate(wheelAngle);
-  // the W: wheel bar with two horns
-  ctx.strokeStyle = s.alive ? "#c9d4e3" : "#5b6878";
-  ctx.lineWidth = 5;
+  // the W: two horns, the shallow bar between them
+  ctx.strokeStyle = s.alive ? "#d0ecff" : "#3d5a70";
+  ctx.lineWidth = Math.max(3.0, H * 0.045);
   ctx.lineCap = "round";
   ctx.beginPath();
-  ctx.moveTo(-46, 0);
-  ctx.lineTo(-46, -26);
-  ctx.moveTo(-24, 0);
-  ctx.lineTo(-24, 10);
-  ctx.lineTo(24, 10);
-  ctx.lineTo(24, 0);
-  ctx.moveTo(46, 0);
-  ctx.lineTo(46, -26);
+  ctx.moveTo(-hw, 0);
+  ctx.lineTo(-hw, -hornUp);
+  ctx.moveTo(-hw * 0.55, 0);
+  ctx.lineTo(-hw * 0.55, dip);
+  ctx.lineTo(hw * 0.55, dip);
+  ctx.lineTo(hw * 0.55, 0);
+  ctx.moveTo(hw, 0);
+  ctx.lineTo(hw, -hornUp);
   ctx.stroke();
-  ctx.fillStyle = s.alive ? "#8b96ab" : "#3d4658";
-  for (const hx of [-46, 46]) {
+  ctx.fillStyle = s.alive ? "#35586b" : "#3d4658";   // the horn grips
+  for (const hx of [-hw, hw]) {
     ctx.beginPath();
-    ctx.arc(hx, -28, 5, 0, 2 * Math.PI);
+    ctx.arc(hx, -hornUp - 2, Math.max(3.5, H * 0.04), 0, 2 * Math.PI);
     ctx.fill();
   }
-  // center hub
-  ctx.fillStyle = "#ff8c3a";
+  ctx.fillStyle = "#ff8c3a";                         // the centre hub
   ctx.beginPath();
-  ctx.arc(0, 0, 4, 0, 2 * Math.PI);
+  ctx.arc(0, 0, 3, 0, 2 * Math.PI);
   ctx.fill();
   ctx.restore();
   ctx.lineCap = "butt";
-  ctx.fillStyle = "#5b6878";
-  ctx.fillText("YOKE", yx - 14, yy + 58);
-  ctx.fillText(inElev >= 0 ? "PULL" : "PUSH", yx + 26, yy + pull - 4);
 
-  // --- rudder pedals ---------------------------------------------------------
-  const press = (inRud / SURF_MAX) * 9;      // one pedal forward, one back
-  for (const side of [-1, 1]) {
-    const forward = (inRud > 0 && side > 0) || (inRud < 0 && side < 0);
-    const disp = forward ? -press : (inRud !== 0 ? press * 0.35 : 0);
-    const engaged = (inRud > 0 && side > 0) || (inRud < 0 && side < 0);
-    ctx.fillStyle = engaged ? "#ff8c3a" : "#3a4258";
-    ctx.fillRect(rx + side * 34 - 9, ry + disp - 16, 18, 30);
-  }
-  ctx.strokeStyle = "#232b3d";
-  ctx.setLineDash([4, 4]);
+  // --- A E R T: the four channels' decision boxes --------------------------
+  // ▲ driving the lever up a level, ▼ down a level, · hold/already there;
+  // the beat dot pulses when a decision window just opened. While the
+  // instructor demonstrates (no discrete decisions) the boxes rest.
+  const BOX = Math.max(10.0, Math.min(18.0, H * 0.16));
+  const CHANNEL_LABELS = ["A", "E", "R", "T"];
+  ctx.fillStyle = s.handFresh ? "#ff8c3a" : "#0c1a26";
   ctx.beginPath();
-  ctx.moveTo(rx - 62, ry); ctx.lineTo(rx + 62, ry);
-  ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.fillStyle = "#5b6878";
-  ctx.fillText("L", rx - 66, ry + 3);
-  ctx.fillText("R", rx + 62, ry + 3);
-  ctx.fillText("RUDDER", rx - 21, ry + 28);
+  ctx.arc(aert0 - 9, midY, 2.5, 0, 2 * Math.PI);
+  ctx.fill();
+  ctx.textAlign = "center";
+  for (let i = 0; i < 4; i++) {
+    const bx = aert0 + i * (BOX + 7);
+    ctx.strokeStyle = "#14283a";
+    ctx.strokeRect(bx + 0.5, midY - BOX / 2 + 0.5, BOX, BOX);
+    ctx.fillStyle = "#3d5a70";
+    ctx.fillText(CHANNEL_LABELS[i], bx + BOX / 2, textY);
+    const choice = s.handChoices;
+    if (choice === null) {
+      ctx.fillStyle = "#14283a";            // the instructor eases: rest
+      ctx.fillText("\u2014", bx + BOX / 2, midY + 3.5);
+      continue;
+    }
+    const level = choice[i];
+    if (level < 0) {                        // hold: the hand rests
+      ctx.fillStyle = "#3d5a70";
+      ctx.fillText("\u00b7", bx + BOX / 2, midY + 3.5);
+      continue;
+    }
+    const now = [inAil, inElev, inRud, inThr][i];
+    const nowLevel = levelOf(i, now);       // the stop the lever is at
+    if (level > nowLevel) {                 // driving the lever up
+      ctx.fillStyle = "#ff8c3a";
+      ctx.fillText("\u25b2", bx + BOX / 2, midY + 3.5);
+    } else if (level < nowLevel) {          // driving the lever down
+      ctx.fillStyle = "#9fd8ff";
+      ctx.fillText("\u25bc", bx + BOX / 2, midY + 4.5);
+    } else {                                // already at the level
+      ctx.fillStyle = "#3d5a70";
+      ctx.fillText("\u00b7", bx + BOX / 2, midY + 3.5);
+    }
+  }
 
-  // --- throttle can: horizontal bars from green (idle) to red (full) ------
-  const th = Math.max(0.0, Math.min(1.0, inThr));
-  const canW = 26;
-  const canH = tyBot - tyTop;
-  ctx.fillStyle = "#1a2030";
-  ctx.fillRect(tx - canW / 2, tyTop, canW, canH);
-  const BARS = 12;
-  const barH = (canH - 4) / BARS;
-  for (let i = 0; i < BARS; i++) {
-    const lit = (i + 0.5) / BARS <= th;      // bars up to the throttle level
-    const t = i / (BARS - 1);                // green at the bottom to red at the top
+  // --- the engine: a horizontal RPM bar, INCREASING LEFTWARDS ---------------
+  // Idle at the right edge, full at the left; green at idle, red at the
+  // redline — the segment ramp runs right (idle) to left (full), lit
+  // from the right edge as the revs rise.
+  const rpm = rpmOf(inThr);
+  const maxRpm = rpmOf(1.0);
+  const revs = Math.max(0.0, Math.min(1.0, rpm / maxRpm));
+  const barH = Math.max(10.0, Math.min(22.0, H * 0.30));
+  const barY = midY - barH / 2;
+  const SEGS = 14;
+  const segW = (rpmR - rpmL) / SEGS;
+  for (let i = 0; i < SEGS; i++) {
+    const xR = rpmR - i * segW;             // i counts leftwards from idle
+    const t = i / (SEGS - 1);               // 0 at idle, 1 at full
     const r = Math.round(70 + (255 - 70) * t);
     const g = Math.round(210 + (70 - 210) * t);
     const b = Math.round(90 + (60 - 90) * t);
-    ctx.fillStyle = lit ? `rgb(${r},${g},${b})` : "#2a3242";
-    ctx.fillRect(tx - canW / 2 + 2, tyTop + canH - 2 - (i + 1) * barH + 1,
-                 canW - 4, Math.max(1.0, barH - 1.5));
+    const lit = (i + 0.5) / SEGS <= revs;
+    ctx.fillStyle = lit ? `rgb(${r},${g},${b})` : "#0c1a26";
+    ctx.fillRect(xR - segW + 1.5, barY, segW - 3, barH);
   }
-  ctx.strokeStyle = "#3a4258";
-  ctx.strokeRect(tx - canW / 2 + 0.5, tyTop + 0.5, canW - 1, canH - 1);
-  ctx.fillStyle = "#5b6878";
-  ctx.fillText("THROTTLE", tx - 27, tyBot + 16);
-  ctx.fillStyle = "#c9d4e3";
-  ctx.fillText(`${Math.round(th * 100)}%`, tx - 10, tyBot + 28);
+  ctx.strokeStyle = "#14283a";
+  ctx.strokeRect(rpmL + 0.5, barY + 0.5, rpmR - rpmL - 1, barH - 1);
+  // ticks every 500 rpm along the scale
+  ctx.beginPath();
+  for (let tick = 500; tick < maxRpm; tick += 500) {
+    const x = rpmR - (tick / maxRpm) * (rpmR - rpmL);
+    ctx.moveTo(x, barY + barH);
+    ctx.lineTo(x, barY + barH + 3);
+  }
+  ctx.stroke();
+  // the number, bottom edge, under the bar's right end
+  ctx.font = "bold 12px Rajdhani, 'SF Mono', monospace";
+  ctx.fillStyle = rpm > 2450 ? "#ff6a5a" : "#35d0ff";
+  ctx.fillText(`RPM ${rpm.toFixed(0)} \u00b7 THR ${Math.round(inThr * 100)}%`,
+              (rpmL + rpmR) / 2, textY);
+  ctx.font = "11px Rajdhani, 'SF Mono', monospace";
 
-  // --- engine: the RPM lives here, beside the throttle can ---------------
-  ctx.fillStyle = "#8b96ab";
-  ctx.fillText("RPM", tx + 20, tyTop + 6);
-  ctx.fillStyle = rpmOf(inThr) > 2450 ? "#ff6a5a" : "#7dff8e";
-  ctx.font = "bold 13px ui-monospace, monospace";
-  ctx.fillText(rpmOf(inThr).toFixed(0), tx + 20, tyTop + 20);
-
-  // surface readouts, bottom right — the HAND (inputs) above the
-  // AIRFRAME (surfaces), so the student's inputs are always readable
-  ctx.textAlign = "right";
-  ctx.fillStyle = "#ff8c3a";
-  ctx.font = "9px ui-monospace, monospace";
-  ctx.fillText(`HAND A ${inAil >= 0 ? "+" : ""}${inAil.toFixed(2)}` +
-              ` E ${inElev >= 0 ? "+" : ""}${inElev.toFixed(2)}` +
-              ` R ${inRud >= 0 ? "+" : ""}${inRud.toFixed(2)}`, W - 10, H - 34);
-  ctx.fillStyle = "#8b96ab";
-  ctx.fillText(`SRF  A ${s.ail >= 0 ? "+" : ""}${s.ail.toFixed(2)}` +
-              ` E ${s.elev >= 0 ? "+" : ""}${s.elev.toFixed(2)}` +
-              ` R ${s.rud >= 0 ? "+" : ""}${s.rud.toFixed(2)}`, W - 10, H - 22);
-  ctx.textAlign = "left";
+  // --- the labels: every text rides the BOTTOM EDGE ------------------------
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#3d5a70";
+  ctx.fillText("LEFT RUDDER", pl, textY);
+  ctx.fillText("YOKE", yk, textY);
+  ctx.fillText("RIGHT RUDDER", pr, textY);
 
   if (!s.alive) {
     ctx.fillStyle = "rgba(255,58,48,0.16)";
     ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = "#ff4a3a";
-    ctx.font = "bold 11px ui-monospace, monospace";
-    ctx.textAlign = "center";
-    ctx.fillText("CONTROLS FROZEN", W / 2, H - 10);
-    ctx.textAlign = "left";
+    ctx.font = "bold 13px Rajdhani, 'SF Mono', monospace";
+    ctx.fillText("CONTROLS FROZEN", W / 2, midY + H * 0.32);
   }
+  ctx.textAlign = "left";
 }

@@ -28,7 +28,8 @@ import {
   DenseReward, EpisodeOutcome, FlightInstruments, classifyOutcome,
 } from "../src/learning/instruments.js";
 import {
-  ServoPolicy, HOLD, PUSH, ELEMENT_FREE_FLIGHT,
+  ServoPolicy, TensorNetwork, TensorContext, ACTION_HOLD, GOAL_FREE_FLIGHT,
+  ELEMENT_FREE_FLIGHT,
 } from "../src/learning/servo-tensor.js";
 import {
   TRIM_COMMAND, TRIM_SPEED, flyEpisode, springTowardNeutral,
@@ -53,8 +54,9 @@ function replayEpisode(pol: ServoPolicy, epoch: number, rng: NumpyPcg64,
   const servos = new SurfacesState();
   const dense = new DenseReward(instruments, 5.0);
   dense.reset(body);
+  const network = new TensorNetwork(pol, ELEMENT_FREE_FLIGHT, rng);
   let commands = Float64Array.from(TRIM_COMMAND);
-  const recent: Array<[number[], Int32Array]> = [];
+  const recent: Array<[readonly number[], Int32Array]> = [];
   let pending = 0.0;
   const choices: number[] = [];
   const samples: number[][] = [];
@@ -70,11 +72,14 @@ function replayEpisode(pol: ServoPolicy, epoch: number, rng: NumpyPcg64,
         pol.reinforce(recent, pending, epoch);
       }
       pending = 0.0;
-      const sense = instruments.senseReading(body, commands);
-      const actions = pol.choose(ELEMENT_FREE_FLIGHT, sense, rng);
+      // The drone reads the MACHINE: the panel comes from the body's
+      // physical truth and the surface positions the actuators
+      // actually hold (LiveEpisode's law).
+      const sense = instruments.senseReading(body, servos.positions);
+      const decision = network.decide(GOAL_FREE_FLIGHT, sense, null, rng);
+      const actions = decision.actions;
       commands = pol.commandFrom(commands, actions);
-      recent.push([[ELEMENT_FREE_FLIGHT, ...sense.flight, ...sense.controls],
-                   actions]);
+      recent.push([decision.key, actions]);
       if (recent.length > 10) {
         recent.shift();
       }
@@ -114,11 +119,13 @@ function replayEpisode(pol: ServoPolicy, epoch: number, rng: NumpyPcg64,
   };
 }
 
-/** The Python tracer's choice encoding: 0 = hold-all, else 1 + surface*2 + push. */
+/** The tracer's choice encoding: 0 = hold-all, else the option index
+ *  (each lever's stops in channel order). */
 function choiceOf(actions: Int32Array): number {
-  for (let surface = 0; surface < 4; surface++) {
-    if (actions[surface] !== HOLD) {
-      return 1 + surface * 2 + (actions[surface] === PUSH ? 1 : 0);
+  const base = [1, 10, 21, 30];
+  for (let channel = 0; channel < 4; channel++) {
+    if (actions[channel] !== ACTION_HOLD) {
+      return base[channel] + actions[channel];
     }
   }
   return 0;
@@ -176,18 +183,18 @@ ref.episodes.forEach((ep: any) => {
 // The neuron memory after the episodes.
 {
   section("neuron memory after the episodes");
-  check("the servo neuron learned",
-        policy.servoNeuron.storedCombinations > 0,
-        `got ${policy.servoNeuron.storedCombinations} keys`);
-  check("the brain holds all five neurons",
-        policy.storedCombinations >= policy.servoNeuron.storedCombinations
-        && policy.goalNeuron.storedCombinations === 0,   // free flight files no goal map
+  check("the controls tensor learned",
+        policy.servoTensor.storedCombinations > 0,
+        `got ${policy.servoTensor.storedCombinations} keys`);
+  check("the brain holds all five tensors",
+        policy.storedCombinations >= policy.servoTensor.storedCombinations
+        && policy.goalTensor.storedCombinations === 0,   // free flight files no goal map
         `total ${policy.storedCombinations}`);
   const snap = policy.snapshot();
   const keysBefore = policy.storedCombinations;
-  policy.imprint(99, 99, { flight: [0, 0, 0, 0, 0, 0], engine: [0],
-                           controls: [0, 0, 0, 0] },
-                 [HOLD, HOLD, HOLD, HOLD], 1.0, 12345);
+  policy.imprint(99, 99, { location: [0, 0], energy: [0, 0, 0, 0, 0],
+                           flight: [0, 0, 0, 0, 0], controls: [4, 5, 4, 6] },
+                 [3, 3, 3, 5], new TensorContext(0), 1.0, 12345);
   check("imprint fires into the neurons",
         policy.storedCombinations > keysBefore,
         `got ${policy.storedCombinations} want > ${keysBefore}`);
