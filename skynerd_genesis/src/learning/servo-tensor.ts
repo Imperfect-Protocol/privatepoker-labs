@@ -461,141 +461,76 @@ export class ServoPolicy {
     return this.errorNeurons[nodeId];
   }
 
-  // --- THE PRIORS ----------------------------------------------------------
-  // The no-brainer knowledge: we KNOW what these tensors are, so we
-  // know which combinations deserve high weights — a yawing-right
-  // flight wants left rudder, an incipient stall wants the nose pushed
-  // down and full power. The priors are IMPOSED as floors (never above
-  // a trained cell), re-imposed every classroom cycle (they must not
-  // die to the forgetting law), and SPREAD by the firing law's signal
-  // processing: stochastic noise -> Gaussian [1 2 1]/4 -> Haar ->
-  // threshold -> de-Haar over the option axis, and the fuzzy class
-  // axes bridge the neighbouring classes at recall time.
+  // --- THE NO-BRAINER REFLEXES + THE PRIOR WIRES ----------------------------
+  // The no-brainers are NOT memory: stamping them across the goal x
+  // element grid cost ~35k cells per brain (and every transplanted
+  // drone copies them all). They are a REFLEX — the same teacher-
+  // fallback pattern the sensors use: when the servo's own cells
+  // recall nothing above the fire bar under the skill's forward, the
+  // built-in pilot reflex answers (a stall always pushes, a yaw
+  // always rudders against it), deterministically, forever, at zero
+  // memory cost. What IS memory: the SKILL WIRES (the sensible
+  // companies cohering), imposed as floors and re-imposed every
+  // classroom cycle so the forgetting law never kills them, each
+  // student's jitter its own (the flock differs from birth), then
+  // SPREAD by the firing law's signal processing (a).
 
-  /** The prior plan: (key prefix, channel, level, weight) — computed
-   *  once per student (each student's jittered its own way, so the
-   *  flock differs from birth), re-imposed idempotently. */
-  private priorPlan: Array<{ key: readonly number[]; channel: number;
-                            level: number; weight: number }> | null = null;
+    /** THE SERVO'S REFLEX TABLE: (energy class, flight class) -> the
+   *  correction (channel, level). Channels: 0 aileron, 1 elevator,
+   *  2 rudder, 3 throttle; levels index each lever's stop table. */
+  private static readonly SERVO_REFLEXES: ReadonlyMap<string,
+      readonly [number, number]> = new Map([
+    // the energy emergencies — the drone must decide recovery itself
+    ["9,0", [1, 1]], ["9,11", [1, 1]], ["9,12", [1, 1]],   // developed stall: PUSH
+    ["8,0", [1, 2]], ["8,11", [1, 2]], ["8,12", [1, 2]],    // incipient stall: push
+    ["7,0", [1, 3]], ["7,11", [1, 3]], ["7,12", [1, 3]],    // high AoA: relax the pull
+    ["2,0", [1, 3]],                                        // climbing, losing speed
+    ["4,0", [1, 8]],                                        // descending: back pressure
+    ["12,0", [3, 5]],                                       // low-power descent: power
+    // the attitude corrections — the servo applies these itself
+    ["0,3", [2, 2]],    // yawing right: LEFT rudder
+    ["0,4", [2, 6]],    // yawing left: RIGHT rudder
+    ["0,12", [1, 8]],   // nose low: pull up
+    ["0,11", [1, 2]],   // nose high: ease the nose down
+    ["0,9", [0, 6]],    // overbanked left: aileron RIGHT
+    ["0,10", [0, 2]],   // overbanked right: aileron LEFT
+    ["0,5", [1, 8]],    // banking left, losing altitude
+    ["0,6", [1, 8]],    // banking right, losing altitude
+  ]);
 
-  /** Build the prior plan: the no-brainer class->correction pairs,
-   * stamped across the goal/element grid (the servo keys exactly), at
-   * the cruise-nominal location and controls classes, with each
-   * student's own jitter on the weights. */
-  private buildPriorPlan(rng: NumpyPcg64): void {
-    // The no-brainers: (energy class, flight class, channel, level,
-    // weight). Channels: 0 aileron, 1 elevator, 2 rudder, 3 throttle;
-    // levels index each lever's stop table. The stall-family priors
-    // stand at every attitude a stall actually shows (wings level,
-    // nose high, nose low); the rest at the neutral attitude.
-    const NO_BRINERS: readonly (readonly number[])[] = [
-      // the energy emergencies — the drone must decide recovery itself
-      [9, 0, 1, 1, 3.0],   // developed stall: PUSH the nose down
-      [9, 11, 1, 1, 3.0],  //   (nose high)
-      [9, 12, 1, 1, 3.0],  //   (nose low)
-      [9, 0, 3, 6, 2.0],   //   and full throttle
-      [9, 11, 3, 6, 2.0],
-      [9, 12, 3, 6, 2.0],
-      [8, 0, 1, 2, 3.0],   // incipient stall: push
-      [8, 11, 1, 2, 3.0],
-      [8, 12, 1, 2, 3.0],
-      [8, 0, 3, 6, 2.0],   //   and full throttle
-      [8, 11, 3, 6, 2.0],
-      [8, 12, 3, 6, 2.0],
-      [7, 0, 1, 3, 2.5],   // high AoA, not enough speed: relax the pull
-      [7, 11, 1, 3, 2.5],
-      [7, 12, 1, 3, 2.5],
-      [7, 0, 3, 6, 2.0],   //   and add power
-      [7, 11, 3, 6, 2.0],
-      [7, 12, 3, 6, 2.0],
-      [2, 0, 1, 3, 1.5],   // climbing, losing speed: nose down
-      [4, 0, 1, 8, 1.5],   // descending: slight back pressure
-      [12, 0, 3, 5, 1.5],  // low-power descent: power up
-      // the attitude corrections — the servo applies these itself
-      [0, 3, 2, 2, 2.0],   // yawing right: LEFT rudder
-      [0, 4, 2, 6, 2.0],   // yawing left: RIGHT rudder
-      [0, 12, 1, 8, 2.5],  // nose low: pull up
-      [0, 11, 1, 2, 2.0],  // nose high: ease the nose down
-      [0, 9, 0, 6, 2.5],   // overbanked left: aileron RIGHT
-      [0, 10, 0, 2, 2.5],  // overbanked right: aileron LEFT
-      [0, 5, 1, 8, 1.5],   // banking left, losing altitude: back pressure
-      [0, 6, 1, 8, 1.5],   // banking right, losing altitude: back pressure
-    ];
-    const plan: Array<{ key: readonly number[]; channel: number;
-                       level: number; weight: number }> = [];
-    for (const [energy, flight, channel, level, weight] of NO_BRINERS) {
-      // The goal/element grid: the goal and element axes are exact
-      // on the servo key, so the prior must stand at every goal the
-      // curriculum and the swarm fly, in every element.
-      for (let goal = 1; goal <= 21; goal++) {
-        for (let element = 0; element <= 21; element++) {
-          const jitter = 0.8 + 0.4 * rng.uniform();
-          // The coherence-bin spread: a prior at bin 0 stands at its
-          // full weight, at bin 1 (the wires agreeing) at half — the
-          // Gaussian neighbour of the same belief.
-          plan.push({
-            key: [goal, element, energy, flight, 0],
-            channel, level, weight: weight * jitter,
-          });
-          plan.push({
-            key: [goal, element, energy, flight, 1],
-            channel, level, weight: weight * jitter * 0.5,
-          });
-        }
-      }
-    }
-    this.priorPlan = plan;
+  /** THE REFLEX: the no-brainer correction for a forwarded key, or
+   *  null when the situation has no reflex. Key layout: [goal,
+   *  element, energy, flight, coherence]. */
+  static servoReflex(key: readonly number[]):
+      readonly [number, number] | null {
+    return ServoPolicy.SERVO_REFLEXES.get(
+      `${key[2]},${key[3]}`) ?? null;
   }
 
+  /** THE STALL-RECOVERY REFLEX's power half: the stall family always
+   *  adds full throttle, whatever the pitch correction did. */
+
   /**
-   * IMPOSE the priors — the plan built once (each student's own
-   * jitter), re-imposed every classroom cycle so the forgetting law
-   * never kills a no-brainer. The SPREAD: each prior's option
-   * projection runs the firing law's signal processing — stochastic
-   * noise -> Gaussian -> Haar -> threshold -> de-Haar — so the high
-   * weight bleeds onto the neighbouring stops of the same lever;
-   * the fuzzy class axes carry the neighbourhood the rest of the way
-   * at recall time.
+   * IMPOSE THE PRIOR WIRES — the sensible companies cohering on the
+   * patch panel ("yawing right" hangs with "rudder left", the stall
+   * hangs with the push and the power), imposed as floors, each
+   * student's own jitter on the weight, re-imposed every classroom
+   * cycle so the forgetting law never kills them. The (a) spread runs
+   * at the first consolidation (the wires ride the dirty set).
    */
   installPriors(epoch: number, rng: NumpyPcg64): void {
-    if (this.priorPlan === null) {
-      this.buildPriorPlan(rng);
-    }
-    const plan = this.priorPlan!;
-    const scores = new Float64Array(64).fill(0.0);
-    for (const prior of plan) {
-      // The option projection under this key: the prior's own cell,
-      // then the law's noise -> Haar -> Gaussian -> threshold.
-      scores.fill(0.0);
-      scores[ServoPolicy.optionOf(prior.channel, prior.level)] = prior.weight;
-      const fired = denoiseProjection(scores, rng, ELEMENT_NOISE_SIGMA,
-                                      ELEMENT_DETAIL_THRESHOLD,
-                                      ELEMENT_FIRE_THRESHOLD);
-      for (let option = 0; option < ServoPolicy.OPTIONS; option++) {
-        if (fired[option] > 0.0) {
-          const [channel, level] = ServoPolicy.channelLevelOf(option);
-          this.servoTensor.impose([...prior.key, channel, level],
-                                  fired[option], epoch);
-        }
-      }
-    }
-    // The skill's no-brainer wires: the sensible companies cohere —
-    // "yawing right" hangs with "rudder left", the stall hangs with
-    // the push and the power. The wires raise the patch panel's
-    // verdict for exactly the companies the priors believe in.
+    const jitter = (): number => 0.8 + 0.4 * rng.uniform();
     const CONTROLS_TRIM = 45 + 15 + 5 + 3;
     const RUD_LEFT = 45 + 15 + 0 * 5 + 3, RUD_RIGHT = 45 + 15 + 2 * 5 + 3;
     const PUSH = 0 * 45 + 15 + 5 + 3, PULL = 2 * 45 + 15 + 5 + 3;
     const FULL_PWR = 45 + 15 + 5 + 4;
     const WIRE_F = (flightClass: number, controlsClass: number): void => {
-      const wire = wireIndexOf("flight", "controls");
-      this.skillTensor.impose([wire, flightClass, controlsClass],
-                               3.0, epoch);
+      this.skillTensor.impose([wireIndexOf("flight", "controls"),
+        flightClass, controlsClass], 3.0 * jitter(), epoch);
     };
     const WIRE_E = (energyClass: number, controlsClass: number): void => {
-      const wire = wireIndexOf("energy", "controls");
-      this.skillTensor.impose([wire, energyClass, controlsClass],
-                               3.0, epoch);
+      this.skillTensor.impose([wireIndexOf("energy", "controls"),
+        energyClass, controlsClass], 3.0 * jitter(), epoch);
     };
     WIRE_F(3, RUD_LEFT); WIRE_F(4, RUD_RIGHT);
     WIRE_F(9, 2 * 15 + 45 + 5 + 3);   // overbanked left <- aileron right
@@ -632,7 +567,7 @@ export class ServoPolicy {
   /** A sensor's full key: its panel, its OWN previous class (the
    *  situation from itself), the goal's element, and its skill patch
    *  bin (the situation from the goal and skill tensors). */
-  private static sensorKey(panel: readonly number[], context: TensorContext,
+  static sensorKey(panel: readonly number[], context: TensorContext,
                            sensorIndex: number): number[] {
     return [...panel, context.signalOf(sensorIndex), context.element,
             context.skillBins[sensorIndex]];
@@ -795,7 +730,7 @@ export class ServoPolicy {
   })();
 
   /** The option count: every lever's every stop, plus hold-all. */
-  private static readonly OPTIONS =
+  static readonly OPTIONS =
     ServoPolicy.OPTION_BASE[4];
 
   /** The option index of a (channel, level) decision. */
@@ -804,7 +739,7 @@ export class ServoPolicy {
   }
 
   /** The (channel, level) an option index names. */
-  private static channelLevelOf(option: number): [number, number] {
+  static channelLevelOf(option: number): [number, number] {
     for (let channel = 3; channel >= 0; channel--) {
       if (option >= ServoPolicy.OPTION_BASE[channel]) {
         return [channel, option - ServoPolicy.OPTION_BASE[channel]];
@@ -858,24 +793,35 @@ export class ServoPolicy {
       }
       return actions;
     }
-    // The skill cells' options, denoised (padded to 64 for Haar).
-    const scores = new Float64Array(64).fill(0.0);
+    // The skill cells' options — PURE RECALL: argmax over the option
+    // cells under the forwarded key (the noise -> Haar -> Gaussian ->
+    // threshold pass belongs to the consolidations, never here).
+    let choice = 0;
+    let best = this.servoTensor.recall(
+      [...key, HOLD_ALL_CHANNEL, 0]);
+    const buf = [...key, 0, 0];
     for (let channel = 0; channel < 4; channel++) {
+      buf[buf.length - 2] = channel;
       for (let level = 0; level < stopCount(channel); level++) {
-        scores[ServoPolicy.optionOf(channel, level)] = this.servoTensor.recall(
-          [...key, channel, level]);
+        buf[buf.length - 1] = level;
+        const value = this.servoTensor.recall(buf);
+        const option = ServoPolicy.optionOf(channel, level);
+        if (value > best) {
+          best = value;
+          choice = option;
+        }
       }
     }
-    scores[0] = this.servoTensor.recall([...key, HOLD_ALL_CHANNEL, 0]);
-    const fired = denoiseProjection(scores, rng, ACTION_NOISE_SIGMA,
-                                    ACTION_DETAIL_THRESHOLD,
-                                    ACTION_FIRE_THRESHOLD);
-    let choice = 0;
-    let best = fired[0];
-    for (let option = 1; option < ServoPolicy.OPTIONS; option++) {
-      if (fired[option] > best) {
-        best = fired[option];
-        choice = option;
+    // THE REFLEX — the teacher-fallback pattern: when nothing the
+    // servo ever learned clears the fire bar under this key, the
+    // built-in pilot reflex answers (a stall pushes, a yaw rudders
+    // against it) — deterministically, forever, at no memory cost.
+    // Training overrides it the moment a real cell clears the bar.
+    if (choice === 0 && best < ACTION_FIRE_THRESHOLD) {
+      const reflex = ServoPolicy.servoReflex(key);
+      if (reflex !== null) {
+        actions[reflex[0]] = reflex[1];
+        return actions;
       }
     }
     if (choice > 0) {
@@ -943,6 +889,147 @@ export class ServoPolicy {
          + this.servoTensor.prune(beforeEpoch);
   }
 
+  // --- THE CONSOLIDATION ----------------------------------------------------
+  // The signal-processing pass — stochastic noise -> Gaussian
+  // [1 2 1]/4 -> Haar -> threshold -> de-Haar — run ONLY at the three
+  // moments it belongs: (a) after the priors are imposed
+  // (installPriors), (b) ONCE PER COMPLETED REPETITION (here), and
+  // (c) when a tensor relaxes from a LONG stun (the network's
+  // consolidateAround). Never per decision — that was the slow way.
+  //
+  // The pass reads each cell's NEIGHBORHOOD — a +/-2 window around
+  // what the tensor knows (the Gaussian's actual reach) — runs the
+  // law over the window, and writes back: the spread raises the
+  // neighbors of a strong belief, the threshold cuts the noise floor
+  // of a weak one. Cost is O(cells), not O(axis^2): a full brain
+  // consolidates in one pass.
+
+  /** One window's spread: read the cells, run the law, write back.
+   *  NOISE LIVES IN THE SKILL TENSOR ALONE — the patch panel's wires
+   *  explore their relationships stochastically; the factual tensors
+   *  (the sensors' classes, the goal's transitions, the servo's
+   *  levers) are EVIDENCE: their spread is the deterministic
+   *  Gaussian -> Haar -> threshold -> de-Haar, no random cell ever
+   *  invented. */
+  static spreadWindow(tensor: PulseNeuron, prefix: readonly number[],
+                              centers: readonly number[], axis: number,
+                              tailKey: (tail: number) => number[],
+                              rng: NumpyPcg64, epoch: number,
+                              noiseSigma = 0.0): void {
+    // The +/-2 window around every center, unique, sorted, EVEN
+    // (Haar pairs).
+    const windowSet = new Set<number>();
+    for (const center of centers) {
+      for (let d = -2; d <= 2; d++) {
+        const w = center + d;
+        if (w >= 0 && w < axis) {
+          windowSet.add(w);
+        }
+      }
+    }
+    const cells = [...windowSet].sort((a, b) => a - b);
+    if (cells.length < 2) {
+      return;
+    }
+    if (cells.length % 2 === 1) {
+      const next = cells[cells.length - 1] + 1;
+      if (next < axis) {
+        cells.push(next);
+      } else if (cells[0] > 0) {
+        cells.unshift(cells[0] - 1);
+      } else {
+        return;
+      }
+    }
+    const scores = new Float64Array(cells.length);
+    for (let i = 0; i < cells.length; i++) {
+      scores[i] = tensor.peek([...prefix, ...tailKey(cells[i])]);
+    }
+    // Nothing stored in the window: nothing to spread — the pass
+    // spreads BELIEFS over their neighbors, it never invents them
+    // out of the noise floor (free flight files no goal map).
+    let known = false;
+    for (let i = 0; i < cells.length; i++) {
+      if (scores[i] > tensor.baseline + 1e-6) {
+        known = true;
+        break;
+      }
+    }
+    if (!known) {
+      return;
+    }
+    const fired = denoiseProjection(scores, rng, noiseSigma,
+                                    ELEMENT_DETAIL_THRESHOLD,
+                                    ELEMENT_FIRE_THRESHOLD);
+    for (let i = 0; i < cells.length; i++) {
+      const delta = fired[i] - scores[i];
+      if (Math.abs(delta) <= 0.02) {
+        continue;
+      }
+      const key = [...prefix, ...tailKey(cells[i])];
+      if (delta > 0.0) {
+        tensor.impose(key, scores[i] + delta, epoch);
+      } else {
+        tensor.fire(key, delta, epoch);   // the threshold's cut: toward baseline
+      }
+    }
+  }
+
+  /**
+   * (B) THE POST-REPETITION CONSOLIDATION — INCREMENTAL: only the
+   *  windows the training FIRED or IMPOSED since the last pass (the
+   *  neuron's dirty set), never the whole brain. Each touched cell's
+   *  group runs the spread once; the work is proportional to what
+   *  the repetition taught, and the dirty set clears.
+   */
+  consolidate(epoch: number, rng: NumpyPcg64): void {
+    const classTail = (tail: number): number[] => [tail];
+    const optionTail = (tail: number): number[] =>
+      tail === 0 ? [HOLD_ALL_CHANNEL, 0]
+                 : ServoPolicy.channelLevelOf(tail);
+    const group = (tensor: PulseNeuron, tailLen: number, axis: number,
+                   toOption: boolean,
+                   tailKey: (tail: number) => number[],
+                   noiseSigma = 0.0): void => {
+      if (tensor.dirty.size === 0) {
+        return;
+      }
+      const groups = new Map<string, { prefix: number[]; tails: number[] }>();
+      for (const index of tensor.dirty) {
+        const key = tensor.keyOf(index);
+        const prefix = key.slice(0, key.length - tailLen);
+        const tail = toOption
+          ? ServoPolicy.optionOf(key[key.length - 2], key[key.length - 1])
+          : key[key.length - 1];
+        const gid = prefix.join(",");
+        let g = groups.get(gid);
+        if (g === undefined) {
+          g = { prefix, tails: [] };
+          groups.set(gid, g);
+        }
+        if (!g.tails.includes(tail)) {
+          g.tails.push(tail);
+        }
+      }
+      tensor.dirty.clear();
+      for (const g of groups.values()) {
+        ServoPolicy.spreadWindow(tensor, g.prefix, g.tails, axis, tailKey,
+                                 rng, epoch, noiseSigma);
+      }
+    };
+    group(this.locationTensor, 1, LOC_CLASS_AXIS, false, classTail);
+    group(this.energyTensor, 1, ENERGY_CLASS_AXIS, false, classTail);
+    group(this.flightTensor, 1, FLIGHT_CLASS_AXIS, false, classTail);
+    group(this.controlsTensor, 1, CONTROLS_CLASS_AXIS, false, classTail);
+    // THE SKILL TENSOR — the only NOISY one: the patch panel's wires
+    // explore their relationships stochastically; every other tensor
+    // spreads deterministically.
+    group(this.skillTensor, 1, PATCH_SLOT_AXIS, false, classTail,
+          ELEMENT_NOISE_SIGMA);
+    group(this.goalTensor, 1, ELEMENT_AXIS, false, classTail);
+    group(this.servoTensor, 2, ServoPolicy.OPTIONS, true, optionTail);
+  }
+
   /** Copy the whole brain: the graduate the flock inherits from. */
   snapshot(): BrainSnapshot {
     return {
@@ -976,31 +1063,70 @@ export class ServoPolicy {
 
 
 // ===========================================================================
-// THE DISPATCHER RUNTIME — the Python mechanism, verbatim:
+// THE DISPATCHER RUNTIME — the Python mechanism, REDESIGNED FOR SPEED:
 //
-//   input message -> reward weights -> stun (set timer, logsig timeout)
-//                 -> into dispatcher queue
+//   input message -> reward weights -> stun (set timer, ISRLU timeout)
+//                 -> the node waits, stunned
 //   dispatcher -> dispatch (timer)  -> handle timer -> the firing law
 //                                 -> make message -> send message
 //   dispatcher -> dispatch (message) -> handle message (reward, stun)…
 //
-// APPLIES TO EVERY TENSOR ALWAYS. Each tensor is a NODE on the shared
-// dispatcher (net/events.ts EventQueue — the ported Python heap, same
-// -time events dispatch in scheduling order) with ONE stun timer
-// (net/events.ts StunTimer — re-arming replaces, the coalescing law).
-// A handler NEVER sends: it rewards and re-arms; the TIMER'S fire is
-// the only emitter.
+// APPLIES TO EVERY TENSOR ALWAYS — but with NONE of the machinery the
+// old queue paid for. No heap, no cancellable timers, no re-armed
+// entries: each tensor IS its own timer. The stun's timeout lives IN
+// the node (relaxAt); the dispatcher is a plain SWEEP — find the
+// earliest relaxation among the stunned nodes, advance the clock to
+// it, fire every node whose stun relaxed (in node-id order), repeat
+// until the cascade settles or the decision window's horizon passes.
+// Same coalescing law (a stunned tensor absorbs the news and fires
+// ONCE, when it relaxes), same determinism (fixed sweep order), one
+// pass over seven plain objects per step. A handler NEVER sends: it
+// rewards and re-arms; the RELAXATION is the only emitter.
 //
-// The firing law, every tensor, always:
-//   recall the output projection -> stochastic noise -> Haar in all
-//   axes -> Gaussian in all axes -> thresholding -> make message ->
-//   send message. (denoiseProjection IS the law on one axis: noise ->
-//   [1 2 1]/4 Gaussian -> Haar soft-threshold -> the noise floor cut.)
+// The firing law's signal processing — stochastic noise -> Haar in
+// all axes -> Gaussian in all axes -> thresholding -> de-Haar —
+// runs at the three moments it belongs and NOWHERE per decision:
+//   (a) after the priors are imposed (installPriors),
+//   (b) once per completed repetition (ServoPolicy.consolidate),
+//   (c) when a tensor relaxes from a LONG stun
+//       (TensorNetwork.consolidateAround).
+// The per-decision laws are pure recall: what the tensor remembers,
+// it says.
 // ===========================================================================
 
-import { EventQueue, StunTimer } from "../net/events.js";
+/**
+ * THE STUN TIMEOUT — ISRLU (the inverse square root linear unit,
+ * Carlisle et al. 2017), the cheap saturating ramp: no exp, no log,
+ * one sqrt. f(x) = x/sqrt(1+ax^2) above zero (saturates at 1/sqrt(a)),
+ * x*sqrt(1+ax^2) below (the leaky side — negative news flows
+ * through, steeper than linear). The reward's reach is folded into
+ * [0,1]: a well-fed tensor relaxes fast, a starved one sulks.
+ * The window is sub-decision: the last re-arm must still fire inside
+ * the settle horizon, or the cascade starves downstream tensors.
+ */
+const ISRLU_ALPHA = 1.0;
+const STUN_MIN = 0.1;    // decision units
+const STUN_MAX = 0.6;
+/** A stun at least this long is a LONG stun: the tensor was hit hard
+ *  (a big error wave, or starved reward) — when it relaxes, it also
+ *  consolidates its slice (c). */
+const LONG_STUN_BAR = 0.5;
+/** How often ONE tensor may consolidate on long-stun relaxes — the
+ *  cooldown that keeps (c) cheap (once per 25 decision windows). */
+const CONSOLIDATE_COOLDOWN = 25.0;
 
-/** The seven tensor node ids, in dispatch order. */
+export function isrlu(x: number, alpha: number = ISRLU_ALPHA): number {
+  return x >= 0.0
+    ? x / Math.sqrt(1.0 + alpha * x * x)
+    : x * Math.sqrt(1.0 + alpha * x * x);
+}
+
+export function stunTimeout(reward: number): number {
+  const reach = Math.min(1.0, Math.max(0.0, 0.5 + 0.5 * isrlu(reward - 1.5)));
+  return STUN_MIN + (STUN_MAX - STUN_MIN) * (1.0 - reach);
+}
+
+/** The seven tensor node ids, in sweep order. */
 export const TENSOR_NODE = {
   location: 0,
   energy: 1,
@@ -1029,7 +1155,8 @@ export type TensorMessageKind =
                  //   shadow instructor's delta, pumped backwards
                  //   servo -> skill -> goal/sensors, each hop a stun
 
-/** One tensor message on the dispatcher. */
+/** One tensor message on the dispatcher — a lightweight plain object
+ *  (six fields, nothing else). */
 export class TensorMessage {
   constructor(readonly senderId: TensorNodeId,
               readonly recipientId: TensorNodeId,
@@ -1041,95 +1168,88 @@ export class TensorMessage {
               readonly sentAt: number) {}
 }
 
-/** THE LOGSIG TIMEOUT: the stun's length shrinks as the tensor's
- *  reward weight grows — a well-fed tensor relaxes fast, a starved
- *  one sulks. Deterministic, no dice. The window is sub-decision: a
- *  tensor's inbound messages all land within one decision, and the
- *  last re-arm must still fire inside the settle horizon, or the
- *  cascade would starve downstream tensors forever (the servo would
- *  never hear its own timer). */
-const STUN_MIN = 0.1;    // decision units
-const STUN_MAX = 0.6;
-export function stunTimeout(reward: number): number {
-  const logsig = 1.0 / (1.0 + Math.exp(-(reward - 1.5)));
-  return STUN_MIN + (STUN_MAX - STUN_MIN) * (1.0 - logsig);
-}
-
 /**
- * One tensor as a dispatcher node. The reward weight is the node's
+ * One tensor as a dispatcher node — A PLAIN OBJECT WITH A CLOCK
+ * FIELD, nothing scheduled anywhere. The reward weight is the node's
  * running confidence: every input message rewards it (EMA), the
- * reward sets the logsig stun timeout and scales the fired message's
+ * reward sets the ISRLU stun timeout and scales the fired message's
  * weight. WHAT the firing law recalls differs per tensor; THAT it
  * stuns on input and fires on relaxation never does.
  */
 class TensorNode {
   /** The running reward weight (EMA toward each message's weight). */
   reward = 0.1;
-  /** The last staged input — the handler's stage (handlers never send;
-   *  the law reads the NETWORK's state, the stage is only the
+  /** The last staged input — the handler's stage (handlers never
+   *  send; the law reads the NETWORK's state, the stage is only the
    *  trigger's evidence). */
   staged: TensorMessage | null = null;
   fires = 0;
-  readonly stun: StunTimer;
+  /** THE STUN TIMER: the dispatcher time this node relaxes at
+   *  (Infinity = not stunned). Receiving re-arms it — coalescing,
+   *  without cancelling anything. */
+  relaxAt = Infinity;
+  /** The length of the stun being served (the long-stun law (c)). */
+  armedDelay = 0.0;
+  /** The network time of this node's last (c) consolidation. */
+  lastConsolidate = -Infinity;
 
-  constructor(readonly id: TensorNodeId, queue: EventQueue,
-              /** THE FIRING LAW: recall -> noise -> Haar -> Gaussian
-               *  -> threshold -> the messages to send (null = the
-               *  threshold cut everything: no message). */
+  constructor(readonly id: TensorNodeId,
+              /** THE FIRING LAW: what the tensor says when it relaxes
+               *  (null = no message: no news). */
               private readonly law: (node: TensorNode,
                                      staged: TensorMessage) =>
                 TensorMessage[] | null,
               /** THE ERROR LAW (upstream): what the tensor does when
-               *  the ERROR WAVE reaches it — the local pump into its
-               *  own cells, then the error forwarded one hop up. */
+               *  the ERROR WAVE reaches it. */
               private readonly errorLaw: (node: TensorNode,
-                                          staged: TensorMessage) =>
-                TensorMessage[] | null = () => null) {
-    this.stun = new StunTimer(queue, () => { this.fire(); });
-  }
+                                           staged: TensorMessage) =>
+                TensorMessage[] | null = () => null) {}
 
   /**
-   * INPUT MESSAGE -> REWARD WEIGHTS -> STUN (set timer, logsig
-   * timeout) -> INTO DISPATCHER QUEUE. The handler proper: it never
-   * sends — it rewards the node and re-arms the single stun timer
-   * (re-arming replaces: a stunned tensor absorbs the news and fires
-   * ONCE, when it relaxes — the coalescing law).
-   *
-   * THE ERROR WAVE's size law: an ERROR message stuns for a delay
-   * PROPORTIONAL to the size of the information hitting the tensor —
-   * the bigger the error, the longer the tensor sits with it before
-   * its error law runs. The feedback is a wave with a random-length
-   * delay, exactly like the forward flow, only scaled by the error.
+   * INPUT MESSAGE -> REWARD WEIGHTS -> STUN (set the timeout IN the
+   * neuron) -> WAITING. The handler proper: it never sends — it
+   * rewards the node and re-arms its relax time. THE ERROR WAVE's
+   * size law: an ERROR message stuns for a delay PROPORTIONAL to the
+   * size of the information hitting the tensor (the feedback is a
+   * wave with a delay scaled by the error, exactly like the forward
+   * flow).
    */
-  receive(message: TensorMessage): void {
-    if (message.kind === "error") {
-      this.reward = this.reward * 0.7 + message.weight * 0.3;
-      this.staged = message;
-      const size = Math.min(1.0, Math.abs(message.weight));
-      this.stun.arm(STUN_MIN + (STUN_MAX - STUN_MIN) * size);
-      return;
-    }
+  receive(message: TensorMessage, now: number): void {
     this.reward = this.reward * 0.7 + message.weight * 0.3;
     this.staged = message;
-    this.stun.arm(stunTimeout(this.reward));
+    if (message.kind === "error") {
+      const size = Math.min(1.0, Math.abs(message.weight));
+      this.armedDelay = STUN_MIN + (STUN_MAX - STUN_MIN) * size;
+    } else {
+      this.armedDelay = stunTimeout(this.reward);
+    }
+    this.relaxAt = now + this.armedDelay;
   }
 
-  /** THE TIMER'S FIRE: the only emitter. The staged message is the
-   *  trigger's EVIDENCE — handed to the law, then cleared. The firing
-   *  law makes the messages and sends them (immediate dispatch,
-   *  queue order). */
-  private fire(): void {
-    const staged = this.staged;
-    const wasError = staged !== null && staged.kind === "error";
+  /** THE RELAXATION: the only emitter. The law makes the messages;
+   *  the dispatcher delivers them. */
+  fireNow(): void {
+    const staged = this.staged!;
+    const wasError = staged.kind === "error";
     this.staged = null;
+    this.relaxAt = Infinity;
     this.fires += 1;
-    const messages = wasError ? this.errorLaw(this, staged!)
-                              : this.law(this, staged!);
+    const messages = wasError ? this.errorLaw(this, staged)
+                              : this.law(this, staged);
     if (messages === null) {
       return;
     }
     for (const message of messages) {
       this.network.deliver(message);
+    }
+    // (C) THE LONG-STUN RELAX: a tensor that sat stunned a long while
+    // — hit hard by the error wave, or starved of reward — spreads
+    // its own slice when it finally relaxes (with a cooldown, so a
+    // repeatedly-hit tensor still pays once per few windows).
+    if (this.armedDelay >= LONG_STUN_BAR
+        && this.network.now - this.lastConsolidate >= CONSOLIDATE_COOLDOWN) {
+      this.lastConsolidate = this.network.now;
+      this.network.consolidateAround(this.id);
     }
   }
 
@@ -1140,19 +1260,20 @@ class TensorNode {
   }
 }
 
-/** The logsig-scaled weight a fired message carries. */
+/** The ISRLU-scaled weight a fired message carries. */
 function firedWeight(node: TensorNode): number {
   return node.reward;
 }
 
 /**
- * THE TENSOR NETWORK — one per flight, on its own dispatcher. The
- * flight steps it once per decision window: the panel pulse goes in,
- * then the dispatcher pumps until the cascade settles. The stun, the
- * relaxation, and the gossip all happen on the queue's time.
+ * THE TENSOR NETWORK — one per flight, its own clock. The flight
+ * steps it once per decision window: the panel pulse goes in, then
+ * the dispatcher SWEEPS until the cascade settles. The stun, the
+ * relaxation, and the gossip all happen on this clock.
  */
 export class TensorNetwork {
-  private readonly queue = new EventQueue();
+  /** THE DISPATCHER's CLOCK (decision units). */
+  now = 0.0;
   private readonly nodes: readonly TensorNode[];
   private readonly rngs: readonly NumpyPcg64[];
   private readonly policy: ServoPolicy;
@@ -1168,25 +1289,32 @@ export class TensorNetwork {
   private firedActions: Int32Array | null = null;
   private firedKey: readonly number[] = [];
   /** The last gossip each tensor sent — THE NO-NEWS LAW: a firing law
-   *  whose projection thresholds to what the tensor already said
-   *  makes NO message (only news travels; the cascade settles instead
-   *  of ping-ponging itself past the horizon). */
+   *  whose output is what the tensor already said makes NO message
+   *  (only news travels; the cascade settles instead of ping-ponging
+   *  itself past the horizon). */
   private readonly sensorLastGossip:
       Array<{ panel: readonly number[]; code: number } | null> =
     [null, null, null, null];
-  private goalLastGossip = "";
-  private skillCoherenceLast = "";
+  private goalLastGoal = -1;
+  private goalLastElement = -1;
+  private skillCoherenceLast: readonly number[] | null = null;
   /** The sensors' recurrent keys from the last classification — where
    *  the error law's pump lands (on-policy: the exact cells the
    *  student's own flight will recall). */
   private readonly lastSensorKeys:
       Array<readonly number[]> = [[], [], [], []];
+  /** The epoch the current teach() pumps fire at. */
+  private teachEpoch = 0;
   /** The cascade's settle horizon, in decision units. The servo sits
    *  TWO stuns downstream (the skill must relax and forward before
    *  the servo can even be stunned), so the horizon must cover the
    *  whole chain: panel -> sensors -> goal/skill -> skill's forward
    *  -> servo's fire. */
   private static readonly SETTLE = 2.5;
+  /** The error wave's own settle horizon — it must cover the whole
+   *  upstream chain (servo -> skill -> goal -> sensors) at each hop's
+   *  size-scaled stun. */
+  private static readonly ERROR_SETTLE = 2.5;
 
   constructor(policy: ServoPolicy, startElementId: number,
               seedRng: NumpyPcg64) {
@@ -1194,31 +1322,33 @@ export class TensorNetwork {
     this.elementId = startElementId;
     this.context = new TensorContext(startElementId);
     // Every tensor's own dice, derived deterministically from the
-    // flight's seed — the firing law's stochastic noise.
+    // flight's seed — the stochastic noise of the (c) consolidations
+    // and the servo's exploration.
     const rngs: NumpyPcg64[] = [];
     for (let id = 0; id < 7; id++) {
       rngs.push(new NumpyPcg64(seedRng.draw64(), seedRng.draw64()));
     }
     this.rngs = rngs;
     this.nodes = [
-      new TensorNode(TENSOR_NODE.location, this.queue,
-        (node) => this.sensorLaw(node, 0, LOC_CLASS_AXIS),
+      new TensorNode(TENSOR_NODE.location,
+        (node, staged) => this.sensorLaw(node, staged, 0, LOC_CLASS_AXIS),
         (node, staged) => this.sensorErrorLaw(node, staged, 0, LOC_CLASS_AXIS)),
-      new TensorNode(TENSOR_NODE.energy, this.queue,
-        (node) => this.sensorLaw(node, 1, ENERGY_CLASS_AXIS),
+      new TensorNode(TENSOR_NODE.energy,
+        (node, staged) => this.sensorLaw(node, staged, 1, ENERGY_CLASS_AXIS),
         (node, staged) => this.sensorErrorLaw(node, staged, 1, ENERGY_CLASS_AXIS)),
-      new TensorNode(TENSOR_NODE.flight, this.queue,
-        (node) => this.sensorLaw(node, 2, FLIGHT_CLASS_AXIS),
+      new TensorNode(TENSOR_NODE.flight,
+        (node, staged) => this.sensorLaw(node, staged, 2, FLIGHT_CLASS_AXIS),
         (node, staged) => this.sensorErrorLaw(node, staged, 2, FLIGHT_CLASS_AXIS)),
-      new TensorNode(TENSOR_NODE.controls, this.queue,
-        (node) => this.sensorLaw(node, 3, CONTROLS_CLASS_AXIS),
+      new TensorNode(TENSOR_NODE.controls,
+        (node, staged) => this.sensorLaw(node, staged, 3, CONTROLS_CLASS_AXIS),
         (node, staged) => this.sensorErrorLaw(node, staged, 3, CONTROLS_CLASS_AXIS)),
-      new TensorNode(TENSOR_NODE.goal, this.queue,
-        (node) => this.goalLaw(),
+      new TensorNode(TENSOR_NODE.goal,
+        (node, staged) => this.goalLaw(),
         (node, staged) => this.goalErrorLaw(node, staged)),
-      new TensorNode(TENSOR_NODE.skill, this.queue, () => this.skillLaw(),
+      new TensorNode(TENSOR_NODE.skill,
+        (node, staged) => this.skillLaw(),
         (node, staged) => this.skillErrorLaw(node, staged)),
-      new TensorNode(TENSOR_NODE.servo, this.queue,
+      new TensorNode(TENSOR_NODE.servo,
         (node, staged) => this.servoLaw(node, staged),
         (node, staged) => this.servoErrorLaw(node, staged)),
     ];
@@ -1230,43 +1360,72 @@ export class TensorNetwork {
   /** The dispatcher's delivery: a sent message lands in its
    *  recipient's handler, immediately, in send order. */
   deliver(message: TensorMessage): void {
-    this.nodes[message.recipientId].receive(message);
+    this.nodes[message.recipientId].receive(message, this.now);
   }
 
-  // --- THE FIRING LAWS ------------------------------------------------------
+  /**
+   * THE SWEEP — the dispatcher itself. Find the earliest relaxation
+   * among the stunned nodes, advance the clock to it, fire every
+   * node whose stun relaxed (in node-id order), and repeat until a
+   * full sweep finds nothing before the horizon. No heap, no
+   * cancellation: seven plain fields scanned per step.
+   */
+  private pump(horizon: number): void {
+    for (;;) {
+      let earliest = Infinity;
+      for (const node of this.nodes) {
+        if (node.staged !== null && node.relaxAt < earliest) {
+          earliest = node.relaxAt;
+        }
+      }
+      if (earliest === Infinity || earliest > horizon) {
+        return;
+      }
+      if (earliest > this.now) {
+        this.now = earliest;
+      }
+      for (const node of this.nodes) {
+        if (node.staged !== null && node.relaxAt <= this.now) {
+          node.fireNow();
+        }
+      }
+    }
+  }
+
+  // --- THE FIRING LAWS (pure recall — the signal processing lives in
+  //     the three consolidations, never here) ---------------------------
 
   /**
    * A SENSOR'S LAW (all four, always): recall the CLASS projection
    * under the recurrent key — the CONTEXT'S CURRENT PANEL (the
    * flight's pulse — the staged evidence is only the stun trigger,
    * never the law's data), its OWN previous class, the goal's
-   * element, its skill patch bin — then the law: noise -> Haar ->
-   * Gaussian -> threshold -> the CODE message (the chosen class, or
-   * the TEACHER's label when nothing clears the bar) to the goal and
-   * the skill, direct. The class lands in the context — the skill's
-   * forward and the bus read it.
+   *  element, its skill patch bin — argmax over the projection, the
+   *  CODE message (the chosen class, or the TEACHER's label when
+   *  nothing clears the bar) to the goal and the skill, direct. The
+   *  class lands in the context — the skill's forward and the bus
+   *  read it.
    */
-  private sensorLaw(node: TensorNode, sensorIndex: number,
-                    width: number): TensorMessage[] | null {
+  private sensorLaw(node: TensorNode, staged: TensorMessage,
+                    sensorIndex: number, width: number):
+      TensorMessage[] | null {
+    if (staged.kind !== "panel") {
+      return null;   // not the panel's news: the class stands
+    }
     const panel = this.context.panels[sensorIndex];
     const context = this.context;
-    const key = [...panel, context.signalOf(sensorIndex), context.element,
-                 context.skillBins[sensorIndex]];
+    const key = ServoPolicy.sensorKey(panel, context, sensorIndex);
     this.lastSensorKeys[sensorIndex] = key;
     const tensor = this.policy.sensorTensorOf(sensorIndex);
-    const projection = new Float64Array(width).fill(0.0);
-    for (let code = 0; code < width; code++) {
-      projection[code] = tensor.recall([...key, code]);
-    }
-    const fired = denoiseProjection(projection, this.rngs[node.id],
-                                    ELEMENT_NOISE_SIGMA,
-                                    ELEMENT_DETAIL_THRESHOLD,
-                                    ELEMENT_FIRE_THRESHOLD);
+    // The argmax over the class axis, one reusable key buffer.
+    const buf = [...key, 0];
     let best = -1;
     let bestValue = CODE_BAR;
     for (let code = 0; code < width; code++) {
-      if (fired[code] > bestValue) {
-        bestValue = fired[code];
+      buf[buf.length - 1] = code;
+      const value = tensor.recall(buf);
+      if (value > bestValue) {
+        bestValue = value;
         best = code;
       }
     }
@@ -1281,35 +1440,28 @@ export class TensorNetwork {
     const weight = firedWeight(node);
     return [TENSOR_NODE.goal, TENSOR_NODE.skill]
       .map((recipient) => new TensorMessage(node.id, recipient, "code",
-        [code], weight, this.queue.now));
+        [code], weight, this.now));
   }
 
   /**
    * THE GOAL'S LAW — the fuzzy state machine (always): recall the
-   * transition projection under (goal, element, bus) -> the law ->
-   * threshold -> the ELEMENT message (the goal/element pair) to the
-   * sensors (the recurrence) and the skill. Monotone: the choice never
-   * regresses the chain. The servo no longer hears the goal directly —
-   * the skill forwards the pair with everything else.
+   * transition evidence under (goal, element, bus) — the FURTHEST
+   * candidate whose OWN cells clear the bar, monotone (the choice
+   * never regresses the chain) — then the ELEMENT message (the
+   * goal/element pair) to the sensors (the recurrence) and the skill.
+   * The servo no longer hears the goal directly — the skill forwards
+   * the pair with everything else.
    */
   private goalLaw(): TensorMessage[] | null {
     const bus = this.busOf(this.context.signals);
     const candidates = this.chains.get(this.goalId);
     if (candidates !== undefined && candidates.length > 0) {
-      const evidence = new Float64Array(32).fill(0.0);
-      for (let i = 0; i < candidates.length; i++) {
-        evidence[i] = this.policy.goalTensor.recall(
-          [this.goalId, this.elementId, bus, this.goalId, candidates[i]]);
-      }
-      const node = this.nodes[TENSOR_NODE.goal];
-      const fired = denoiseProjection(evidence, this.rngs[node.id],
-                                      ELEMENT_NOISE_SIGMA,
-                                      ELEMENT_DETAIL_THRESHOLD,
-                                      ELEMENT_FIRE_THRESHOLD);
+      const tensor = this.policy.goalTensor;
+      const buf = [this.goalId, this.elementId, bus, this.goalId, 0];
       let chosen = -1;
       for (let i = 0; i < candidates.length; i++) {
-        if (evidence[i] > ELEMENT_FIRE_BAR
-            && fired[i] > ELEMENT_FIRE_BAR) {
+        buf[buf.length - 1] = candidates[i];
+        if (tensor.recall(buf) > ELEMENT_FIRE_BAR) {
           chosen = i;
         }
       }
@@ -1320,31 +1472,32 @@ export class TensorNetwork {
         }
       }
     }
-    const weight = firedWeight(this.nodes[TENSOR_NODE.goal]);
     // THE NO-NEWS LAW: the same goal/element — nothing to say (the
     // transition itself landed in the network's element already).
-    const gossip = `${this.goalId},${this.elementId}`;
-    if (gossip === this.goalLastGossip) {
+    if (this.goalId === this.goalLastGoal
+        && this.elementId === this.goalLastElement) {
       return null;
     }
-    this.goalLastGossip = gossip;
+    this.goalLastGoal = this.goalId;
+    this.goalLastElement = this.elementId;
+    this.context.element = this.elementId;
+    const weight = firedWeight(this.nodes[TENSOR_NODE.goal]);
     return [TENSOR_NODE.location, TENSOR_NODE.energy, TENSOR_NODE.flight,
             TENSOR_NODE.controls, TENSOR_NODE.skill]
       .map((recipient) => new TensorMessage(TENSOR_NODE.goal, recipient,
-        "element", [this.goalId, this.elementId], weight,
-        this.queue.now));
+        "element", [this.goalId, this.elementId], weight, this.now));
   }
 
   /**
-   * THE SKILL'S LAW — the patch panel (always): refresh the wires'
-   * verdict on the current company -> the law -> threshold -> the
-   * COHERENCE message to the sensors (their patch bins) and the goal,
-   * and THE FORWARD message to the servo: ALL the classifications
-   * from every tensor — the goal/element pair and the four sensor
-   * classes — plus the wires' own coherence bin. The forward IS the
-   * servo's whole input. Initially this is pure forwarding; what the
-   * training mixes in is the wires' verdicts (the patch bins already
-   * in the sensors' keys, and the coherence bin riding the payload).
+   * THE SKILL'S LAW — the patch panel (always): recall the wires'
+   * verdict on the current company -> the COHERENCE message to the
+   *  sensors (their patch bins) and the goal, and THE FORWARD message
+   *  to the servo: ALL the classifications from every tensor — the
+   *  goal/element pair and the two classes that drive a correction —
+   *  plus the wires' own coherence bin. The forward IS the servo's
+   *  whole input. Initially this is pure forwarding; what the
+   *  training mixes in is the wires' verdicts (the patch bins already
+   *  in the sensors' keys, and the coherence bin riding the payload).
    */
   private skillLaw(): TensorMessage[] | null {
     const context = this.context;
@@ -1369,40 +1522,40 @@ export class TensorNetwork {
     context.coherenceBin = binOfWeight(context.coherence);
     const weight = firedWeight(this.nodes[TENSOR_NODE.skill]);
     const messages: TensorMessage[] = [];
-    // THE NO-NEWS LAW on both channels: the wires' verdict only when it
-    // moved, the forward only when the classifications changed — a
-    // steady situation is a held yoke, not a re-fired one.
+    // THE NO-NEWS LAW on the coherence channel: the wires' verdict
+    // only when it moved. The FORWARD channel always speaks — a
+    // steady input is a steady command (the stick springs to trim
+    // between commands).
     const coherence = [context.coherenceBin, ...context.skillBins];
-    if (coherence.join(",") !== this.skillCoherenceLast) {
-      this.skillCoherenceLast = coherence.join(",");
+    if (this.skillCoherenceLast === null
+        || !coherence.every((v, i) => v === this.skillCoherenceLast![i])) {
+      this.skillCoherenceLast = coherence;
       for (const recipient of [TENSOR_NODE.location, TENSOR_NODE.energy,
                                TENSOR_NODE.flight, TENSOR_NODE.controls,
                                TENSOR_NODE.goal]) {
         messages.push(new TensorMessage(TENSOR_NODE.skill, recipient,
-          "coherence", coherence, weight, this.queue.now));
+          "coherence", coherence, weight, this.now));
       }
     }
     // THE FORWARD — the servo's whole input: bit-identical to the
-    // demonstration's servo stamp key. ALWAYS sent — a steady input is
-    // a steady command: the servo must hear its input every decision
-    // to keep commanding it (the stick springs to trim between
-    // commands). Only the coherence channel obeys the no-news law.
+    // demonstration's servo stamp key.
     messages.push(new TensorMessage(TENSOR_NODE.skill, TENSOR_NODE.servo,
       "forward", [this.goalId, this.elementId, context.energy,
                   context.flight, context.coherenceBin], weight,
-      this.queue.now));
-    return messages.length > 0 ? messages : null;
+      this.now));
+    return messages;
   }
 
   /**
    * THE SERVO'S LAW (always): the STAGED FORWARD message — the skill
-   * tensor's forwarded classifications — IS the observation key (the
-   * servo's whole input, never the Aircraft, never even the other
-   * tensors directly). Recall the option scores under it -> the law ->
-   * threshold -> the COMMAND message (the chosen levers) to the skill
-   * (its patch signal). The flight reads the fired command itself.
+   *  tensor's forwarded classifications — IS the observation key (the
+   *  servo's whole input, never the Aircraft, never even the other
+   *  tensors directly). Argmax over the option cells under it (pure
+   *  recall), epsilon-greedy — the COMMAND message (the chosen
+   *  levers) to the skill (its patch signal). The flight reads the
+   *  fired command itself.
    */
-  private servoLaw(_node: TensorNode,
+  private servoLaw(node: TensorNode,
                    staged: TensorMessage): TensorMessage[] | null {
     if (staged.kind !== "forward") {
       return null;   // nothing forwarded: nothing to command
@@ -1415,25 +1568,13 @@ export class TensorNetwork {
     const option = ServoPolicy.optionOfActions(actions);
     this.context.lastOption = option;
     return [new TensorMessage(TENSOR_NODE.servo, TENSOR_NODE.skill,
-      "command", [option], firedWeight(this.nodes[TENSOR_NODE.servo]),
-      this.queue.now)];
+      "command", [option], firedWeight(node), this.now)];
   }
 
   // --- THE ERROR WAVE (upstream) --------------------------------------------
 
-  /** The epoch the current teach() pumps fire at. */
-  private teachEpoch = 0;
-  /** The error wave's own settle horizon — it must cover the whole
-   *  upstream chain (servo -> skill -> goal -> sensors) at each hop's
-   *  size-scaled stun. */
-  private static readonly ERROR_SETTLE = 2.5;
-
-  /** THE ERROR PAYLOAD (built once by teach, read by every error law):
-   *  [0] the instructor's element; [1] the instructor's worst acting
-   *  channel (-1 = hands off); [2] its commanded level; [3] the
-   *  student's effective level on that channel; [4+2i] sensor i's
-   *  EXPECTED class (the teacher on the student's own panel);
-   *  [5+2i] sensor i's ACTUAL fired class. */
+  /** The error payload's expected classes: the teacher on the
+   *  student's own panels. */
   private expectedClasses(): number[] {
     return [0, 1, 2, 3].map((i) =>
       teacherClass(i, this.context.panels[i]));
@@ -1448,7 +1589,7 @@ export class TensorNetwork {
    * own panel vs what its memory made it fire; the goal: the
    * instructor's element vs the student's) and injects ONE ERROR
    * MESSAGE at the bottom of the chain. The wave then travels UPSTREAM
-   * on the same dispatcher as the forward flow — servo -> skill ->
+   * on the same clock as the forward flow — servo -> skill ->
    * goal -> the source sensors — each tensor stunned by the SIZE of
    * the error before its error law runs the local pump.
    */
@@ -1484,7 +1625,7 @@ export class TensorNetwork {
     // panels against what its memory fired).
     const expected = this.expectedClasses();
     const widths = [LOC_CLASS_AXIS, ENERGY_CLASS_AXIS,
-                   FLIGHT_CLASS_AXIS, CONTROLS_CLASS_AXIS];
+                    FLIGHT_CLASS_AXIS, CONTROLS_CLASS_AXIS];
     let classError = 0.0;
     for (let i = 0; i < 4; i++) {
       classError += Math.abs(expected[i] - this.context.signalOf(i))
@@ -1501,15 +1642,11 @@ export class TensorNetwork {
                      expected[2], this.context.flight,
                      expected[3], this.context.controls];
     const size = Math.max(worstError, classError);
-    this.queue.now += 0.05;   // the wave rides after the forward cascade
+    this.now += 0.05;   // the wave rides after the forward cascade
     const entry = worstChannel >= 0 ? TENSOR_NODE.servo : TENSOR_NODE.skill;
     this.nodes[entry].receive(new TensorMessage(FLIGHT_SENDER_ID, entry,
-      "error", payload, -Math.min(1.0, size), this.queue.now));
-    const horizon = this.queue.now + TensorNetwork.ERROR_SETTLE;
-    while (this.queue.nextTime() !== null
-           && this.queue.nextTime()! <= horizon) {
-      this.queue.step();
-    }
+      "error", payload, -Math.min(1.0, size), this.now), this.now);
+    this.pump(this.now + TensorNetwork.ERROR_SETTLE);
   }
 
   /**
@@ -1544,7 +1681,7 @@ export class TensorNetwork {
       }
     }
     return [new TensorMessage(TENSOR_NODE.servo, TENSOR_NODE.skill,
-      "error", payload, -Math.min(1.0, error), this.queue.now)];
+      "error", payload, -Math.min(1.0, error), this.now)];
   }
 
   /**
@@ -1590,7 +1727,7 @@ export class TensorNetwork {
                       TENSOR_NODE.energy, TENSOR_NODE.flight,
                       TENSOR_NODE.controls]
       .map((recipient) => new TensorMessage(TENSOR_NODE.skill, recipient,
-        "error", payload, weight, this.queue.now));
+        "error", payload, weight, this.now));
     return wrong || payload[1] >= 0 ? messages : null;
   }
 
@@ -1617,7 +1754,7 @@ export class TensorNetwork {
     return [TENSOR_NODE.location, TENSOR_NODE.energy, TENSOR_NODE.flight,
             TENSOR_NODE.controls]
       .map((recipient) => new TensorMessage(TENSOR_NODE.goal, recipient,
-        "error", staged.payload, staged.weight, this.queue.now));
+        "error", staged.payload, staged.weight, this.now));
   }
 
   /**
@@ -1653,12 +1790,63 @@ export class TensorNetwork {
     return null;   // the source sensors are the wave's end
   }
 
+  // --- (C) THE LONG-STUN RELAX's SLICE SPREAD --------------------------------
+
+  /**
+   * (C) A tensor that relaxes from a LONG stun spreads its own slice:
+   *  the signal-processing pass over the output window AROUND WHERE
+   *  IT STANDS — its current key prefix, its current class or
+   *  option — one denoise call, its own dice. The starved tensor,
+   *  when it finally relaxes, smooths what it believes around where
+   *  it is looking.
+   */
+  consolidateAround(nodeId: TensorNodeId): void {
+    const rng = this.rngs[nodeId];
+    const epoch = this.teachEpoch;
+    const context = this.context;
+    const classTail = (tail: number): number[] => [tail];
+    const optionTail = (tail: number): number[] =>
+      tail === 0 ? [HOLD_ALL_CHANNEL, 0]
+                 : ServoPolicy.channelLevelOf(tail);
+    if (nodeId <= TENSOR_NODE.controls) {
+      const i = nodeId;
+      ServoPolicy.spreadWindow(this.policy.sensorTensorOf(i),
+        this.lastSensorKeys[i], [context.signalOf(i)],
+        [LOC_CLASS_AXIS, ENERGY_CLASS_AXIS, FLIGHT_CLASS_AXIS,
+         CONTROLS_CLASS_AXIS][i], classTail, rng, epoch);
+      return;
+    }
+    if (nodeId === TENSOR_NODE.goal) {
+      ServoPolicy.spreadWindow(this.policy.goalTensor,
+        [this.goalId, this.elementId, this.busOf(context.signals),
+         this.goalId], [this.elementId], ELEMENT_AXIS, classTail,
+        rng, epoch);
+      return;
+    }
+    if (nodeId === TENSOR_NODE.skill) {
+      const sensors: Array<keyof TensorSignals> = ["location", "energy",
+                                                   "flight", "controls"];
+      for (let s = 0; s < 4; s++) {
+        ServoPolicy.spreadWindow(this.policy.skillTensor,
+          [wireIndexOf(sensors[s], "element"), context.signalOf(s)],
+          [context.element], PATCH_SLOT_AXIS, classTail, rng, epoch,
+          ELEMENT_NOISE_SIGMA);   // the wires explore stochastically
+      }
+      return;
+    }
+    // THE SERVO: the option window around the chosen command.
+    const option = ServoPolicy.optionOfActions(
+      this.firedActions ?? new Int32Array(4).fill(ACTION_HOLD));
+    ServoPolicy.spreadWindow(this.policy.servoTensor, this.firedKey,
+      [option], ServoPolicy.OPTIONS, optionTail, rng, epoch);
+  }
+
   // --- THE FLIGHT'S PUMP ----------------------------------------------------
 
   /**
    * One decision window: the panel pulse goes in — four PANEL
    * messages, the only input from the Aircraft — then the dispatcher
-   * pumps until the cascade settles (the timers fire, the messages
+   * sweeps until the cascade settles (the stuns relax, the messages
    * travel, the handlers stun). Returns what the network holds.
    */
   decide(goalId: number, sense: SenseReading,
@@ -1672,30 +1860,25 @@ export class TensorNetwork {
     this.context.panels = [sense.location, sense.energy, sense.flight,
                             sense.controls];   // the panel pulse
     this.firedActions = null;   // a hold is a hold: no stale command
-    this.queue.now += 1.0;   // one decision window of network time
+    this.now += 1.0;   // one decision window of network time
     const panels: readonly number[][] = [sense.location, sense.energy,
                                           sense.flight, sense.controls];
     for (let s = 0; s < 4; s++) {
       this.nodes[s].receive(new TensorMessage(FLIGHT_SENDER_ID,
-        s as TensorNodeId, "panel", panels[s], 1.0, this.queue.now));
+        s as TensorNodeId, "panel", panels[s], 1.0, this.now), this.now);
     }
     // The standing invitations: the goal and the skill have news to
     // consider each decision (their handlers reward and stun; their
-    // timers fire the laws once relaxed). The servo receives NOTHING
-    // here — its only input is the skill's forward, once the skill
-    // relaxes.
+    // laws fire once relaxed). The servo receives NOTHING here — its
+    // only input is the skill's forward, once the skill relaxes.
     this.nodes[TENSOR_NODE.goal].receive(new TensorMessage(
       FLIGHT_SENDER_ID, TENSOR_NODE.goal, "element", [goalId], 1.0,
-      this.queue.now));
+      this.now), this.now);
     this.nodes[TENSOR_NODE.skill].receive(new TensorMessage(
-      FLIGHT_SENDER_ID, TENSOR_NODE.skill, "element", [this.elementId], 1.0,
-      this.queue.now));
-    // PUMP: dispatch until the cascade settles.
-    const horizon = this.queue.now + TensorNetwork.SETTLE;
-    while (this.queue.nextTime() !== null
-           && this.queue.nextTime()! <= horizon) {
-      this.queue.step();
-    }
+      FLIGHT_SENDER_ID, TENSOR_NODE.skill, "element", [this.elementId],
+      1.0, this.now), this.now);
+    // SWEEP: dispatch until the cascade settles.
+    this.pump(this.now + TensorNetwork.SETTLE);
     const actions = this.firedActions
       ?? new Int32Array(4).fill(ACTION_HOLD);
     return {
