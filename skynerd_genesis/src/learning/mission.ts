@@ -3,15 +3,20 @@
  * (learning/mission.ts).
  *
  * Drones do not appear from nowhere: every one of them LIFTS OFF FROM
- * THE RUNWAY, two abreast in a pair, the pairs in trail five seconds
- * apart — pair after pair, forever, no waves. From there the mission
- * is one chain of the flight school's own proven elements, MIRRORED BY
- * FLANK (the pair's left seat is the left flank's column, the right
- * seat the right flank's):
+ * THE RUNWAY, two abreast in a pair — the lane split into two halves,
+ * each seat at the centre of its own half — the pairs five seconds
+ * apart at the same threshold, pair after pair, forever, no waves.
+ * From there the mission is one chain of the flight school's own
+ * proven elements, MIRRORED BY FLANK (the pair's left seat is the
+ * left flank's column, the right seat the right flank's):
  *
- *   roll -> rotate -> orbit climb -> level off at 3000 ft  [takeoff]
- *   the split: left column HSI-45°, right column HSI+45°  [split]
- *   level flight at 3000 ft — the moment in the flank       [flank]
+ *   roll -> rotate -> the straight climb out of ground effect
+ *   [takeoff]
+ *   the split ON THE CLIMB: a turning departure onto the flank
+ *   heading — the left column HSI-45°, the right column HSI+45°
+ *                                                            [split]
+ *   the climb-out IN THE FLANK, straight to 3000 ft — the level
+ *   moment                                            [flank]
  *   THE ATTACK: the left flank's steep descending turn RIGHT
  *   (HSI+90°), the right flank's steep descending turn LEFT
  *   (HSI-90°), both down to 500 ft — the tank in the area below
@@ -107,11 +112,10 @@ export const GOAL_DRONE_ATTACK = 22;
 
 /** The mission's operating area: the swarm may fly this far from the
  *  origin before it has left the area (out of bounds ends a drone).
- *  The pattern's own geometry sets this: the attack glide from
- *  3000 ft down to 500 ft and the rally climb back to 1500 ft each
- *  span kilometres, and the HSI-relative pattern points wherever the
- *  orbit climb exited — the area must hold the whole sortie in any
- *  direction. */
+ *  The pattern's own geometry sets this: the flank climb-out is ~7 km
+ *  of diagonal travel, and the attack glide from 3000 ft down to
+ *  500 ft spans kilometres more — the area must hold the whole sortie
+ *  in any direction. */
 export const MISSION_AREA_M = 9000.0;
 
 const FT = 1.0 / 3.28084;
@@ -139,29 +143,13 @@ const WILL_HOLD_TICKS = 400;
 const ATTACK_VS_MPS = -6.0;
 
 /**
- * THE ORBIT CLIMB — the mission's climb to altitude: the same climbing
- * turn the school teaches, but held until the TARGET ALTITUDE instead
- * of a 180. A straight climb to 3000 ft is seven kilometres of forward
- * travel — the swarm would leave the area before the split began; the
- * orbit keeps the whole climb inside a ~300 m circle above the field,
- * the traffic pattern a real squadron flies.
+ * THE SPLIT CLIMB — the straight climb after the rotate, before the
+ * columns peel apart: the instructor's own departure (wings level,
+ * 15° pitch, full power) up to the split altitude. A turning
+ * departure off the runway is flown from here up, wings loaded and
+ * speed built — never in ground effect.
  */
-class OrbitClimbElement extends FlightElement {
-  readonly name: ElementName = "climbing turn";
-  readonly stamp = true;
-
-  constructor(bank: number, private readonly toAltitudeM: number) {
-    super({ bankTarget: bank, carryTurn: true, vsTarget: 4.0,
-            speedTarget: SYLLABUS.climbSpeedMps,
-            rudder: 0.0, throttle: 1.0 });
-  }
-
-  done(r: PhaseReadings): boolean {
-    return r.altitudeM >= this.toAltitudeM
-             - LEVEL_OFF_LEAD_S * r.vsMps
-           && r.vsMps >= -0.2;
-  }
-}
+const SPLIT_CLIMB_ALT_M = 800.0 * FT;
 
 /**
  * A held-bank turn through an ARBITRARY heading change — the mission's
@@ -204,7 +192,7 @@ class DescendingTurnByElement extends FlightElement {
 }
 
 /** The same arbitrary-amount turn, held together with a climb — the
- *  rally's climbing turn back to the mission's orbit. */
+ *  split's turning departure and the rally's climbing turn home. */
 class ClimbingTurnByElement extends FlightElement {
   readonly name: ElementName = "climbing turn";
   readonly stamp = true;
@@ -359,8 +347,8 @@ export const MISSION_LEGS: readonly {
   readonly entryIndex: number;
 }[] = [
   { token: "takeoff", entryIndex: 0 },
-  { token: "split", entryIndex: 5 },
-  { token: "flank", entryIndex: 9 },
+  { token: "split", entryIndex: 3 },
+  { token: "flank", entryIndex: 6 },
   { token: "attack", entryIndex: 10 },
   { token: "climb", entryIndex: 14 },
   { token: "spin", entryIndex: 19 },
@@ -370,8 +358,8 @@ export const MISSION_LEGS: readonly {
 /** The phase index each token's leg enters at (MISSION_LEGS as a map). */
 export const MISSION_ENTRIES: Readonly<Record<MissionToken, number>> = {
   takeoff: 0,
-  split: 5,
-  flank: 9,
+  split: 3,
+  flank: 6,
   attack: 10,
   climb: 14,
   spin: 19,
@@ -393,23 +381,28 @@ export function missionPlan(flankSign: number,
 } {
   const S = SYLLABUS;
   const phases: FlightElement[] = [
-    // [takeoff] the runway: roll, rotate, the orbit climb, level off,
-    // settle — wings level, the turn accumulator clean.
+    // [takeoff] the runway: the instructor's own departure — roll,
+    // rotate, the straight climb out of ground effect.
     new RunwayRollElement(),                          // 0
     new RotateElement(),                              // 1
-    new OrbitClimbElement(-S.bankTurn, MISSION_ALT_M),  // 2
-    new LevelOffElement(MISSION_ALT_M, "3000 ft"),    // 3
-    new SettleElement(),                              // 4
-    // [split] the columns peel apart: left HSI-45, right HSI+45.
-    new RollInElement(flankSign * S.bankTurn, S.cruiseSpeedMps,
-                      S.cruiseThrottle, 0.0),          // 5
-    new TurnByElement(flankSign * S.bankTurn, flankSign * SPLIT_TURN,
-                      S.cruiseSpeedMps, S.cruiseThrottle, 0.0,
-                      S.turnLeadOut),                 // 6
+    new ClimbElement(SPLIT_CLIMB_ALT_M),              // 2
+    // [split] the columns peel apart ON THE CLIMB: a turning
+    // departure onto the flank heading (left column HSI-45, right
+    // column HSI+45), the climb never stopping.
+    new RollInElement(flankSign * S.bankTurn, S.climbSpeedMps,
+                      1.0, 0.0, 0.0, S.pitchClimb),   // 3
+    new ClimbingTurnByElement(flankSign * S.bankTurn,
+                              flankSign * SPLIT_TURN, 4.0,
+                              S.climbSpeedMps, 1.0, 0.0, S.turnLeadOut,
+                              S.pitchClimb),          // 4
     new RollOutByElement(flankSign * SPLIT_TURN,
-                         S.cruiseSpeedMps, S.cruiseThrottle),   // 7
+                         S.climbSpeedMps, 1.0, 0.0, S.pitchClimb),   // 5
+    // [flank] the climb-out IN THE FLANK: straight down the flank
+    // heading to 3000 ft, level off, settle — the moment in the
+    // flank.
+    new ClimbElement(MISSION_ALT_M),                  // 6
+    new LevelOffElement(MISSION_ALT_M, "3000 ft"),    // 7
     new SettleElement(),                              // 8
-    // [flank] level flight at 3000 ft — the moment in the flank.
     new LevelHoldElement(FLANK_HOLD_TICKS),           // 9
     // [attack] into the other flank's side: the left column turns
     // RIGHT (HSI+90), the right column turns LEFT (HSI-90) — the

@@ -102,6 +102,8 @@ const els = {
   lightCanvas: document.getElementById("lightCanvas") as HTMLCanvasElement | null,
   worldCanvasL: document.getElementById("worldCanvasL") as HTMLCanvasElement | null,
   worldCanvasR: document.getElementById("worldCanvasR") as HTMLCanvasElement | null,
+  lightCanvasL: document.getElementById("lightCanvasL") as HTMLCanvasElement | null,
+  lightCanvasR: document.getElementById("lightCanvasR") as HTMLCanvasElement | null,
   cockpitCanvas: document.getElementById("cockpitCanvas") as HTMLCanvasElement,
   controlsCanvas: document.getElementById("controlsCanvas") as HTMLCanvasElement,
   boot: document.getElementById("boot") as HTMLElement,
@@ -359,7 +361,6 @@ function layoutSidebar(): void {
   }
   const thirds = gpuWorld !== null && gpuWorld.ready
     && sideWorlds.length === 2 && sideWorlds.every((w) => w.ready);
-  let centreX = 0.0;
   let centreW = viewW;
   if (els.cockpitView !== null) {
     els.cockpitView.style.width = `${Math.round(viewW)}px`;
@@ -371,26 +372,32 @@ function layoutSidebar(): void {
     const wL = Math.floor(viewW / 3.0);
     const wR = Math.floor((viewW - wL) / 2.0);
     const wC = Math.round(viewW - wL - wR);
-    centreX = wL;
     centreW = wC;
     placeCanvas(els.worldCanvasL, 0, wL, viewH);
+    placeCanvas(els.lightCanvasL, 0, wL, viewH);
     placeCanvas(els.worldCanvas, wL, wC, viewH);
     placeCanvas(els.lightCanvas, wL, wC, viewH);
     placeCanvas(els.cockpitCanvas, wL, wC, viewH);
     placeCanvas(els.worldCanvasR, wL + wC, wR, viewH);
+    placeCanvas(els.lightCanvasR, wL + wC, wR, viewH);
   } else {
     hideCanvas(els.worldCanvasL);
     hideCanvas(els.worldCanvasR);
+    hideCanvas(els.lightCanvasL);
+    hideCanvas(els.lightCanvasR);
     placeCanvas(els.worldCanvas, 0, viewW, viewH);
     placeCanvas(els.lightCanvas, 0, viewW, viewH);
     placeCanvas(els.cockpitCanvas, 0, viewW, viewH);
   }
-  // THE FLOATING CONTROLS: the console slab over the view's bottom,
-  // as wide as the centre pane — its own size law, unchanged
+  // THE FLOATING CONTROLS: the console slab over the view's bottom —
+  // WIDER than the centre pane (it reaches half-way across each side
+  // pane), centred on the windshield, its own height law
+  const stripW = Math.min(viewW, Math.round(centreW * 1.5));
   const stripH = Math.max(48.0,
     Math.min(140.0, Math.round(viewH * 0.22)));
-  els.controlsCanvas.style.left = `${Math.round(centreX)}px`;
-  els.controlsCanvas.style.width = `${Math.round(centreW)}px`;
+  els.controlsCanvas.style.left =
+    `${Math.round((viewW - stripW) / 2)}px`;
+  els.controlsCanvas.style.width = `${Math.round(stripW)}px`;
   els.controlsCanvas.style.height = `${Math.round(stripH)}px`;
 }
 
@@ -629,10 +636,10 @@ function drawPanel(): void {
     ? els.worldCanvasL.clientWidth : 0;
   const yawDeg = (Math.atan(centreW / (2.0 * focal))
                   + Math.atan(sideW / (2.0 * focal))) * 180.0 / Math.PI;
-  drawSideViewport(els.worldCanvasL, view, sideWorlds[0] ?? null,
-                   -yawDeg, focal);
-  drawSideViewport(els.worldCanvasR, view, sideWorlds[1] ?? null,
-                   yawDeg, focal);
+  drawSideViewport(els.worldCanvasL, els.lightCanvasL, view,
+                   sideWorlds[0] ?? null, -yawDeg, focal);
+  drawSideViewport(els.worldCanvasR, els.lightCanvasR, view,
+                   sideWorlds[1] ?? null, yawDeg, focal);
 }
 
 // --- narration + status ------------------------------------------------------------
