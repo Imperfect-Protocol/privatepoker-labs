@@ -29,13 +29,17 @@ export const CONTROL_MODES: readonly ControlMode[] = [
   "ai", "instructor", "both-suggest", "both-guarded",
 ];
 
-/** The stick-and-rudder label of a mode (the UI's status line). */
+/** The stick-and-rudder label of a mode (the UI's status line and the
+ *  controls dropdown). The values stay the machine's own; only what the
+ *  person reads changes: SOLO = one pilot aboard, PAIR = both pilots
+ *  aboard (the AI suggesting or flying under the instructor's
+ *  guardian), named by WHOSE HANDS FLY. */
 export function controlModeLabel(mode: ControlMode): string {
   switch (mode) {
-    case "ai": return "AI";
-    case "instructor": return "instructor";
-    case "both-suggest": return "both \u00b7 AI suggests";
-    case "both-guarded": return "both \u00b7 guarded";
+    case "ai": return "Solo: AI";
+    case "instructor": return "Solo: Instructor";
+    case "both-suggest": return "Pair: Instructor";
+    case "both-guarded": return "Pair: AI";
   }
 }
 

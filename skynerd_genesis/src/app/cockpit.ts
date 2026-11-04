@@ -33,6 +33,9 @@ import { Flora, hash01, SUN_DIR,
          type TreeSpot, type HouseSpot, type CloudSpot } from "./land.js";
 import type { SceneAircraft } from "./scene.js";
 import { levelOf } from "../learning/instruments.js";
+import type { WorldRenderer } from "../pipeline/index.js";
+import { CRASH_FLOOR_EYE_M, GROUND_GRADE } from "../pipeline/index.js";
+import { RENDER_STATE } from "./render-state.js";
 
 /** One aircraft's instantaneous reading, for the cockpit and controls. */
 export interface DroneView {
@@ -97,12 +100,18 @@ export function droneViewOf(entry: SceneAircraft): DroneView {
 }
 
 const FOV_H = (90 * Math.PI) / 180; // the windshield's horizontal field of view
+/** Half the view's FOV — the curved windshield's shared-focal law
+ *  (main.ts derives the panes' common focal from it). */
+export const FOV_HALF = FOV_H / 2;
 /** The sky's gradient: pale haze at the horizon, deep blue overhead —
  *  and the ground's far haze fades INTO the same fog colour, so earth
  *  and sky melt together far away instead of meeting at a line. */
 const SKY_ZENITH: readonly [number, number, number] = [30, 46, 84];
 const SKY_FOG: readonly [number, number, number] = [184, 200, 214];
 const SKY_GRAD_SIN = 0.35;         // sin(elevation) where the sky is fully zenith
+/** THE CRASH FLOOR: the background ends 15° UNDER the horizon — below
+ *  it the world is black (the crashed view), never sky. */
+const SKY_FLOOR_SIN = 0.25881904510252074;   // sin(15°)
 /** The sun's screen constants — its world direction (SUN_DIR) is the
  *  land's own light, shared with the terrain's relief shading. */
 const SUN_ANG = 0.035;             // the disc's angular radius, rad (~2°)
@@ -114,8 +123,15 @@ function fitCanvas(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
   const dpr = window.devicePixelRatio || 1;
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
-  canvas.width = Math.round(w * dpr);
-  canvas.height = Math.round(h * dpr);
+  // the size is only REASSIGNED when it changed — rewriting
+  // canvas.width clears and reallocs the whole surface (a ~10M-pixel
+  // HUD canvas per frame was the drag stall's biggest cost)
+  const bw = Math.round(w * dpr);
+  const bh = Math.round(h * dpr);
+  if (canvas.width !== bw || canvas.height !== bh) {
+    canvas.width = bw;
+    canvas.height = bh;
+  }
   const ctx = canvas.getContext("2d")!;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   return ctx;
@@ -159,6 +175,28 @@ function cameraOf(s: DroneView, W: number, H: number): Camera {
     f: (W / 2) / Math.tan(FOV_H / 2),
     cx: W / 2, cy: H / 2,
     W, H,
+  };
+}
+
+/** The camera of one aircraft's reading, yawed about its own up axis
+ *  by `deg` — the side viewport panes: the pilot's head turned left
+ *  (deg < 0) or right (deg > 0) while the airframe's attitude stands.
+ *  Position, up axis and focal law are untouched; only the forward and
+ *  right axes rotate (v' = cos·v + sin·(up × v)). */
+function yawedCameraOf(s: DroneView, W: number, H: number,
+                       deg: number): Camera {
+  const cam = cameraOf(s, W, H);
+  const a = (deg * Math.PI) / 180;
+  const c = Math.cos(a);
+  const sn = Math.sin(a);
+  return {
+    ...cam,
+    fx: c * cam.fx + sn * cam.rx,
+    fy: c * cam.fy + sn * cam.ry,
+    fz: c * cam.fz + sn * cam.rz,
+    rx: c * cam.rx - sn * cam.fx,
+    ry: c * cam.ry - sn * cam.fy,
+    rz: c * cam.rz - sn * cam.fz,
   };
 }
 
@@ -251,6 +289,23 @@ function drawWorld(ctx: CanvasRenderingContext2D, cam: Camera): void {
   const hazeSpan = K * 0.5;
   const step = WORLD_SCALE;
   const { hitU, hitV, hitT } = buf;
+  // the mood's colours (the GPU uniform's twin): the classic look IS
+  // the noon row, so the default renders exactly as before
+  const mood = RENDER_STATE.mood;
+  const zenith = mood.zenith;
+  const fog = mood.fog;
+  // THE PILOT'S IRIS: the whole composed world dims by the exposure
+  // (the GPU uniform's extras.y twin)
+  const ex = iris.exposure;
+  // THE HOUR'S GRADE: the ground wears the mood's colour — a mean-1
+  // filter (tint without darkening), noon-neutral (the GPU frame
+  // uniform's ground row twin). Applied before the haze: the near
+  // ground wears the hour, the far dissolves into the mood's fog
+  const grade = mood.grade;
+  const gradeMean = (grade[0] + grade[1] + grade[2]) / 3.0;
+  const gradeR = 1.0 + (grade[0] / gradeMean - 1.0) * GROUND_GRADE;
+  const gradeG = 1.0 + (grade[1] / gradeMean - 1.0) * GROUND_GRADE;
+  const gradeB = 1.0 + (grade[2] / gradeMean - 1.0) * GROUND_GRADE;
 
   // PASS 1 — the ground hits: one ray per pixel, stored so pass 2 can
   // difference neighbours into footprints (the texture filter's input).
@@ -317,24 +372,36 @@ function drawWorld(ctx: CanvasRenderingContext2D, cam: Camera): void {
                                 stepYU, stepYV, hitT[i],
                                 cam.pz - ground.heightAt(cam.px, cam.py));
         const mix = Math.min(1.0, Math.max(0.0, (hitT[i] - hazeFrom) / hazeSpan));
-        r = c[0] + (SKY_FOG[0] - c[0]) * mix;
-        g = c[1] + (SKY_FOG[1] - c[1]) * mix;
-        bl = c[2] + (SKY_FOG[2] - c[2]) * mix;
+        r = (c[0] * gradeR + (fog[0] - c[0] * gradeR) * mix);
+        g = (c[1] * gradeG + (fog[1] - c[1] * gradeG) * mix);
+        bl = (c[2] * gradeB + (fog[2] - c[2] * gradeB) * mix);
       } else {
-        // the sky's gradient: fog at the horizon, deepening with elevation
+        // the sky's gradient: fog at the horizon, deepening with
+        // elevation — the mood's own colours (the GPU uniform's twin)
         const sx = (px + 0.5) * step;
         const a = (sx - cam.cx) / cam.f;
         const invL = 1.0 / Math.sqrt(1.0 + a * a + b * b);
         const dz = (cam.fz + a * cam.rz + b * cam.uz) * invL;
-        const t = Math.min(1.0, Math.max(0.0, dz / SKY_GRAD_SIN));
-        r = SKY_FOG[0] + (SKY_ZENITH[0] - SKY_FOG[0]) * t;
-        g = SKY_FOG[1] + (SKY_ZENITH[1] - SKY_FOG[1]) * t;
-        bl = SKY_FOG[2] + (SKY_ZENITH[2] - SKY_FOG[2]) * t;
+        // THE CRASH FLOOR (the GPU extras.z twin): 15° under the
+        // horizon the background is black ONLY for the LOW camera —
+        // the crash. A flying camera keeps the haze band there: the
+        // world's far edge dissolves into fog, never a black band.
+        if (dz < -SKY_FLOOR_SIN && cam.pz - ground.heightAt(cam.px, cam.py)
+            < CRASH_FLOOR_EYE_M) {
+          // THE CRASH FLOOR: 15° under the horizon the background is
+          // black — a crashed camera looks into darkness, never sky
+          r = 0; g = 0; bl = 0;
+        } else {
+          const t = Math.min(1.0, Math.max(0.0, dz / SKY_GRAD_SIN));
+          r = fog[0] + (zenith[0] - fog[0]) * t;
+          g = fog[1] + (zenith[1] - fog[1]) * t;
+          bl = fog[2] + (zenith[2] - fog[2]) * t;
+        }
       }
       const o = i * 4;
-      data[o] = r;
-      data[o + 1] = g;
-      data[o + 2] = bl;
+      data[o] = r * ex;
+      data[o + 1] = g * ex;
+      data[o + 2] = bl * ex;
       data[o + 3] = 255;
     }
   }
@@ -581,45 +648,163 @@ function pushHouse(objects: WorldObject[], cam: Camera, h: HouseSpot): void {
 /** Collect and draw the landscape's objects: the tower, the trees within
  *  700 m, the hamlet houses within 2.5 km — shadows first (ground
  *  decals), then far to near. */
+/** THE PILOT'S EYE — the HDR iris: facing the sun the eye TIGHTENS
+ *  and the whole world — sky, ground, sun, glare — dims by the
+ *  exposure; away from it the eye stays wide open (1.0). The
+ *  tightening follows the glare's own align³ bloom (the veil and the
+ *  iris are one reflex), and it EASES on the eye's own time
+ *  constants: a fast flinch toward the light, a slow reopening away
+ *  from it — never a snap. */
+class IrisAdaptation {
+  private level = 1.0;                 // the exposure, 1 = wide open
+  private lastMs: number | null = null;
+
+  /** The exposure an alignment asks for: full open facing away,
+   *  ~45% down dead ahead at the sun. */
+  private static targetOf(align: number): number {
+    return 1.0 - 0.55 * align ** 3;
+  }
+
+  /** One frame: ease the level toward the alignment's target. */
+  update(align: number): void {
+    const clock = (globalThis as { performance?: { now(): number } })
+      .performance;
+    const now = clock !== undefined ? clock.now() : 0.0;
+    const dt = this.lastMs === null
+      ? 0.0
+      : Math.min(0.1, Math.max(0.0, (now - this.lastMs) / 1000.0));
+    this.lastMs = now;
+    const target = IrisAdaptation.targetOf(align);
+    // tighten in a flinch (~0.2 s), reopen like night vision (~1 s)
+    const tau = target < this.level ? 0.20 : 1.0;
+    const k = dt > 0.0 ? 1.0 - Math.exp(-dt / tau) : 0.0;
+    this.level += (target - this.level) * k;
+  }
+
+  get exposure(): number {
+    return this.level;
+  }
+}
+
+/** The one pilot's eye every cockpit view renders through — the main
+ *  windshield and the side viewports share its exposure. */
+const iris = new IrisAdaptation();
+
+/** THE HOUR'S GRADE — the controls strip's filter: the instruments
+ *  wear the mood's colour over their ink (noon's white grade tints
+ *  nothing), so the panel belongs to its hour. The veil draws
+ *  'source-atop' — it tints only the DRAWN ink; the strip's own CSS
+ *  background stays untouched beneath the transparent canvas. */
+const CONTROLS_GRADE = 0.5;
+function gradeControlsVeil(ctx: CanvasRenderingContext2D,
+                           W: number, H: number): void {
+  const grade = RENDER_STATE.mood.grade;
+  const mean = (grade[0] + grade[1] + grade[2]) / 3.0;
+  if (mean <= 0.0) {
+    return;
+  }
+  // mean-1: the grade tints without darkening; the alpha is its strength
+  const r = Math.round(grade[0] / mean);
+  const g = Math.round(grade[1] / mean);
+  const b = Math.round(grade[2] / mean);
+  ctx.globalCompositeOperation = "source-atop";
+  ctx.fillStyle = `rgba(${r},${g},${b},${CONTROLS_GRADE})`;
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = "source-over";
+}
+
 /** The sun's screen position when it stands in front of the camera,
  *  else null. */
 function sunScreen(cam: Camera): [number, number] | null {
-  return projectDir(cam, SUN_DIR[0], SUN_DIR[1], SUN_DIR[2]);
+  const sunDir = RENDER_STATE.mood.sunDir;
+  return projectDir(cam, sunDir[0], sunDir[1], sunDir[2]);
 }
 
 /** How directly the camera faces the sun, 0 (away) to 1 (dead ahead). */
 function sunAlign(cam: Camera): number {
-  return Math.max(0.0, cam.fx * SUN_DIR[0] + cam.fy * SUN_DIR[1]
-                           + cam.fz * SUN_DIR[2]);
+  const sunDir = RENDER_STATE.mood.sunDir;
+  return Math.max(0.0, cam.fx * sunDir[0] + cam.fy * sunDir[1]
+                           + cam.fz * sunDir[2]);
 }
 
-/** The sun: a hot disc with a soft additive glow, at its fixed world
- *  direction — behind the clouds and the landscape's objects. */
+/** The sun: a blendy disc with a soft additive glare, at the mood's
+ *  own direction, size and tint — behind the clouds and the objects.
+ *  THE SETTING LAW (the GPU skyFs's exact twin): the bigger the disc
+ *  the lower the sun, and the more the atmosphere chews its edge — a
+ *  wobbled silhouette, a refraction squash, a melted rim that never
+ *  turns hard — and a wider, stronger glare. */
 function drawSun(ctx: CanvasRenderingContext2D, cam: Camera): void {
-  const at = sunScreen(cam);
-  if (at === null) {
-    return;                                // the sun is behind us
+  const mood = RENDER_STATE.mood;
+  const sunDir = mood.sunDir;
+  const at = projectDir(cam, sunDir[0], sunDir[1], sunDir[2]);
+  if (at === null || mood.brightness <= 0.001) {
+    return;                                // no sun in this mood
   }
   const [sx, sy] = at;
-  const disc = cam.f * Math.tan(SUN_ANG);
-  const glow = disc * SUN_GLOW;
-  const grad = ctx.createRadialGradient(sx, sy, disc, sx, sy, glow);
-  grad.addColorStop(0.0, "rgba(255,250,225,0.55)");
-  grad.addColorStop(0.3, "rgba(255,244,205,0.24)");
-  grad.addColorStop(1.0, "rgba(255,240,200,0)");
+  const disc = cam.f * Math.tan(mood.discSize);
+  const tint = mood.disc;
+  const tintCss = (a: number): string =>
+    `rgba(${Math.round(tint[0])},${Math.round(tint[1])},${Math.round(tint[2])},${a.toFixed(3)})`;
+  // the setting factor: 0 at noon's clean circle, 1 at the swell
+  const s = Math.min(1.0, Math.max(0.0, (mood.discSize - 0.035) / 0.055));
+  const squash = 1.0 + 0.35 * s;            // refraction's vertical squash
+  // the pilot's iris this frame: the tightened eye dims the sun too —
+  // the glare recedes first of all (the GPU extras.y twin)
+  const ex = iris.exposure;
   ctx.globalCompositeOperation = "lighter";
-  ctx.fillStyle = grad;
-  ctx.fillRect(sx - glow, sy - glow, glow * 2.0, glow * 2.0);
-  ctx.fillStyle = "rgba(255,253,242,0.97)";  // the disc itself
+  // the wobbled, squashed silhouette: two harmonics of atmospheric chew
+  const N = 48;
   ctx.beginPath();
-  ctx.arc(sx, sy, disc, 0.0, 2.0 * Math.PI);
+  for (let i = 0; i <= N; i++) {
+    const ang = (i / N) * 2.0 * Math.PI;
+    const wob = s * (0.08 * Math.sin(4.0 * ang + 1.7)
+                     + 0.05 * Math.sin(9.0 * ang + 0.6));
+    const r = disc * (1.0 + wob);
+    const x = sx + r * Math.cos(ang);
+    const y = sy + (r * Math.sin(ang)) / squash;
+    if (i === 0) {
+      ctx.moveTo(x, y);
+    } else {
+      ctx.lineTo(x, y);
+    }
+  }
+  ctx.closePath();
+  // the disc's COLOUR (the GPU core's twin): the tint lifted toward
+  // white — the sun is never darker than the sky around it; the rim
+  // fades to nothing so the blendy edge melts INTO the sky's shade
+  const core = [
+    Math.round(tint[0] + (255 - tint[0]) * 0.65),
+    Math.round(tint[1] + (255 - tint[1]) * 0.65),
+    Math.round(tint[2] + (255 - tint[2]) * 0.65),
+  ];
+  const coreCss = (a: number): string =>
+    `rgba(${core[0]},${core[1]},${core[2]},${a.toFixed(3)})`;
+  // the blendy fill: solid at the core, fully melted at the rim
+  const fill = ctx.createRadialGradient(sx, sy, disc * 0.55,
+                                        sx, sy, disc * 1.06);
+  fill.addColorStop(0.0, coreCss(0.97 * ex));
+  fill.addColorStop(0.62, coreCss(0.90 * ex));
+  fill.addColorStop(1.0, coreCss(0));
+  ctx.fillStyle = fill;
   ctx.fill();
+  // the glare: wider and far stronger as the sun sinks (the GPU law)
+  const k = (0.28 + 1.1 * s) / 0.28;
+  const glowR = disc * SUN_GLOW * (1.0 + 0.8 * s);
+  const grad = ctx.createRadialGradient(sx, sy, disc * 0.9, sx, sy, glowR);
+  grad.addColorStop(0.0, tintCss(0.55 * k * ex));
+  grad.addColorStop(0.3, tintCss(0.24 * k * ex));
+  grad.addColorStop(1.0, tintCss(0));
+  ctx.fillStyle = grad;
+  ctx.fillRect(sx - glowR, sy - glowR, glowR * 2.0, glowR * 2.0);
   ctx.globalCompositeOperation = "source-over";
 }
 
 /** The sun's glare: a wide soft veil over the whole scene, blooming as
- *  the camera swings toward the sun — the lens flare of the eye. */
+ *  the camera swings toward the sun — the lens flare of the eye. It
+ *  TINTS with the mood and nearly DOUBLES at the low sun (the setting
+ *  law's veil half). */
 function drawSunGlare(ctx: CanvasRenderingContext2D, cam: Camera): void {
+  const mood = RENDER_STATE.mood;
   const at = sunScreen(cam);
   if (at === null) {
     return;
@@ -628,16 +813,170 @@ function drawSunGlare(ctx: CanvasRenderingContext2D, cam: Camera): void {
   if (align <= 0.05) {
     return;                                // facing away: no glare
   }
-  const a = GLARE_STRENGTH * align ** 3;
+  const s = Math.min(1.0, Math.max(0.0, (mood.discSize - 0.035) / 0.055));
+  const a = GLARE_STRENGTH * (1.0 + 1.2 * s) * align ** 3
+            * iris.exposure;   // the iris recedes the veil first of all
   const [sx, sy] = at;
   const R = Math.hypot(cam.W, cam.H);
+  // the veil's tint: the mood's disc colour, warmed toward white
+  const tint = mood.disc;
+  const vr = Math.round(tint[0] * 0.5 + 255 * 0.5);
+  const vg = Math.round(tint[1] * 0.5 + 246 * 0.5);
+  const vb = Math.round(tint[2] * 0.5 + 220 * 0.5);
   const grad = ctx.createRadialGradient(sx, sy, 0.0, sx, sy, R);
-  grad.addColorStop(0.0, `rgba(255,246,220,${a.toFixed(3)})`);
-  grad.addColorStop(0.35, `rgba(255,246,220,${(a * 0.45).toFixed(3)})`);
-  grad.addColorStop(1.0, "rgba(255,246,220,0)");
+  grad.addColorStop(0.0, `rgba(${vr},${vg},${vb},${a.toFixed(3)})`);
+  grad.addColorStop(0.35, `rgba(${vr},${vg},${vb},${(a * 0.45).toFixed(3)})`);
+  grad.addColorStop(1.0, `rgba(${vr},${vg},${vb},0)`);
   ctx.globalCompositeOperation = "lighter";
   ctx.fillStyle = grad;
   ctx.fillRect(0.0, 0.0, cam.W, cam.H);
+  ctx.globalCompositeOperation = "source-over";
+}
+
+/** THE LENS FLARES (the toolbar's dropdown, over the world, under the
+ *  instruments). Two families, both classical:
+ *  - panavision: the anamorphic cinematographer's flare — one long
+ *    horizontal blue streak through the sun, a soft warm halo, a
+ *    whisper of a vertical streak. The look of the wide screen.
+ *  - michaelbay: the blockbuster's flare — a hot white core, bright
+ *    horizontal + vertical streaks, a ring, and a CHAIN OF GHOSTS
+ *    marching across the frame through the centre, each a soft disc.
+ *  Both live on the HUD canvas (additive ink), gate on how directly
+ *  the camera faces the sun, and track the sun's mood (size + tint).
+ */
+function drawLensFlare(ctx: CanvasRenderingContext2D, cam: Camera): void {
+  const mood = RENDER_STATE.mood;
+  if (mood.brightness <= 0.001) {
+    return;                                 // no sun: nothing to flare
+  }
+  const at = sunScreen(cam);
+  if (at === null) {
+    return;
+  }
+  const align = sunAlign(cam);
+  if (align <= 0.05) {
+    return;                                 // facing away
+  }
+  const [sx, sy] = at;
+  const tint = mood.disc;
+  // THE FLARE'S INK IS THE SKY'S GLARE FAMILY: the same colour the sky's
+  // glow uses (the disc tint lifted toward white — skyFs's mix(tint,
+  // 1.0, 0.25)), so the streaks and ghosts belong to the light that
+  // made them: warm orange streaks at sunset, near-white at noon —
+  // never a foreign blue line over a burning sky
+  const glare = (lift: number): readonly [number, number, number] => [
+    Math.round(tint[0] + (255 - tint[0]) * lift),
+    Math.round(tint[1] + (255 - tint[1]) * lift),
+    Math.round(tint[2] + (255 - tint[2]) * lift),
+  ];
+  const css = (c: readonly number[], a: number): string =>
+    `rgba(${c[0]},${c[1]},${c[2]},${a.toFixed(3)})`;
+  const tintCss = (a: number): string => css(tint, a);
+  const W = cam.W;
+  const H = cam.H;
+  const cx = W / 2.0;
+  const cy = H / 2.0;
+  // the flare blooms with the hour: stronger at the low glaring sun
+  const s = Math.min(1.0, Math.max(0.0, (mood.discSize - 0.035) / 0.055));
+  const strength = align ** 2 * (0.75 + 0.6 * s)
+                    * iris.exposure;   // the tightened iris dims the flare
+  ctx.globalCompositeOperation = "lighter";
+  if (RENDER_STATE.flare === "panavision") {
+    // THE ANAMORPHIC STREAK: long, thin — the panavision stamp, worn
+    // in the sky's own glare colour
+    const len = W * 0.9 * strength;
+    const thick = Math.max(1.5, H * 0.006);
+    const edge = glare(0.25);
+    const mid = glare(0.40);
+    const grad = ctx.createLinearGradient(sx - len, sy, sx + len, sy);
+    grad.addColorStop(0.0, css(edge, 0));
+    grad.addColorStop(0.35, css(edge, 0.35 * strength));
+    grad.addColorStop(0.5, css(mid, 0.55 * strength));
+    grad.addColorStop(0.65, css(edge, 0.35 * strength));
+    grad.addColorStop(1.0, css(edge, 0));
+    ctx.fillStyle = grad;
+    ctx.fillRect(sx - len, sy - thick, len * 2.0, thick * 2.0);
+    // the soft halo around the source itself — the sky's glow family
+    const halo = Math.max(12.0, H * 0.10 * strength);
+    const g2 = ctx.createRadialGradient(sx, sy, 0.0, sx, sy, halo);
+    g2.addColorStop(0.0, css(glare(0.30), 0.22 * strength));
+    g2.addColorStop(1.0, css(glare(0.30), 0));
+    ctx.fillStyle = g2;
+    ctx.fillRect(sx - halo, sy - halo, halo * 2.0, halo * 2.0);
+    // the whisper of a vertical streak (the lens's true axis)
+    const vlen = H * 0.22 * strength;
+    const vthick = Math.max(1.0, H * 0.003);
+    const g3 = ctx.createLinearGradient(sx, sy - vlen, sx, sy + vlen);
+    g3.addColorStop(0.0, css(mid, 0));
+    g3.addColorStop(0.5, css(glare(0.50), 0.18 * strength));
+    g3.addColorStop(1.0, css(mid, 0));
+    ctx.fillStyle = g3;
+    ctx.fillRect(sx - vthick, sy - vlen, vthick * 2.0, vlen * 2.0);
+  } else if (RENDER_STATE.flare === "michaelbay") {
+    // THE BLOCKBUSTER: hot core + cross streaks + ring + ghost chain
+    const core = Math.max(6.0, H * 0.05 * strength);
+    const g1 = ctx.createRadialGradient(sx, sy, 0.0, sx, sy, core);
+    g1.addColorStop(0.0, `rgba(255,255,255,${(0.5 * strength).toFixed(3)})`);
+    g1.addColorStop(0.5, css(glare(0.45), 0.28 * strength));
+    g1.addColorStop(1.0, css(glare(0.45), 0));
+    ctx.fillStyle = g1;
+    ctx.fillRect(sx - core, sy - core, core * 2.0, core * 2.0);
+    // the cross: two bright streaks through the source, in the glare
+    // family (the same colour the sky's glow carries)
+    const hlen = W * 0.55 * strength;
+    const hthick = Math.max(2.0, H * 0.008);
+    const streak = glare(0.25);
+    const gh = ctx.createLinearGradient(sx - hlen, sy, sx + hlen, sy);
+    gh.addColorStop(0.0, css(streak, 0));
+    gh.addColorStop(0.5, css(streak, 0.5 * strength));
+    gh.addColorStop(1.0, css(streak, 0));
+    ctx.fillStyle = gh;
+    ctx.fillRect(sx - hlen, sy - hthick, hlen * 2.0, hthick * 2.0);
+    const vlen = H * 0.4 * strength;
+    const gv = ctx.createLinearGradient(sx, sy - vlen, sx, sy + vlen);
+    gv.addColorStop(0.0, css(streak, 0));
+    gv.addColorStop(0.5, css(streak, 0.3 * strength));
+    gv.addColorStop(1.0, css(streak, 0));
+    ctx.fillStyle = gv;
+    ctx.fillRect(sx - hthick, sy - vlen, hthick * 2.0, vlen * 2.0);
+    // the ring, wide around the source
+    const ring = Math.max(30.0, H * 0.28 * strength);
+    ctx.strokeStyle = css(glare(0.30), 0.10 * strength);
+    ctx.lineWidth = Math.max(2.0, H * 0.01);
+    ctx.beginPath();
+    ctx.arc(sx, sy, ring, 0.0, 2.0 * Math.PI);
+    ctx.stroke();
+    // THE GHOST CHAIN: discs marching through the frame centre, their
+    // hues DERIVED FROM THE SUN'S TINT (warm lifts and cool/violet
+    // mixes of it — bokeh of the same light, never fixed RGB)
+    const ax = cx - sx;                      // centre relative to sun
+    const ay = cy - sy;
+    const mix3 = (a: readonly number[], b: readonly number[], t: number):
+        readonly number[] => [
+      Math.round(a[0] * (1 - t) + b[0] * t),
+      Math.round(a[1] * (1 - t) + b[1] * t),
+      Math.round(a[2] * (1 - t) + b[2] * t),
+    ];
+    const ghostCols = [
+      glare(0.10),                                   // the warm echo
+      mix3(tint, [120, 190, 255], 0.45),             // tinted cool
+      mix3(tint, [200, 140, 255], 0.45),             // tinted violet
+    ];
+    for (let k = 1; k <= 5; k++) {
+      for (const side of [1, -1] as const) {
+        const t = side * (0.18 * k);
+        const gx = sx + ax + ax * t;
+        const gy = sy + ay + ay * t;
+        const gr = Math.max(4.0, H * 0.030 * (0.85 + 0.2 * ((k * 3) % 4)));
+        const gg = ctx.createRadialGradient(gx, gy, 0.0, gx, gy, gr);
+        const col = ghostCols[(k + (side === 1 ? 0 : 1)) % 3];
+        gg.addColorStop(0.0, css(col, 0.10 * strength));
+        gg.addColorStop(1.0, css(col, 0));
+        ctx.fillStyle = gg;
+        ctx.fillRect(gx - gr, gy - gr, gr * 2.0, gr * 2.0);
+      }
+    }
+  }
   ctx.globalCompositeOperation = "source-over";
 }
 
@@ -665,6 +1004,9 @@ function pushCloud(objects: WorldObject[], cam: Camera, c: CloudSpot): void {
   objects.push({
     depth: dist,
     draw: (ctx) => {
+      // the mood's tint: the cloud tops wear it (sunrise = pink)
+      const cloud = RENDER_STATE.mood.cloud;
+      const base = [Math.round(cloud[0] * 0.79), Math.round(cloud[1] * 0.83), Math.round(cloud[2] * 0.88)];
       // the puff layout: along the wind axis, deterministic per cloud
       const wind = hash01(c.seedX, c.seedY, 41) * Math.PI;
       const ax = Math.cos(wind);
@@ -678,30 +1020,38 @@ function pushCloud(objects: WorldObject[], cam: Camera, c: CloudSpot): void {
         const br = cr * jitterR;
         const grad = ctx.createRadialGradient(bx, by - br * 0.15, 0.0,
                                               bx, by, br);
-        grad.addColorStop(0.0, `rgba(250,252,255,${(0.15 * fade).toFixed(3)})`);
-        grad.addColorStop(1.0, "rgba(250,252,255,0)");
+        grad.addColorStop(0.0, `rgba(${cloud[0]},${cloud[1]},${cloud[2]},${(0.15 * fade).toFixed(3)})`);
+        grad.addColorStop(1.0, `rgba(${cloud[0]},${cloud[1]},${cloud[2]},0)`);
         ctx.fillStyle = grad;
         ctx.fillRect(bx - br, by - br, br * 2.0, br * 2.0);
       }
       // the flat grey base — the cloud's own shadow on itself
       const grad = ctx.createRadialGradient(p[0], p[1] + cr * 0.22, 0.0,
                                             p[0], p[1] + cr * 0.22, cr * 0.9);
-      grad.addColorStop(0.0, `rgba(198,210,224,${(0.06 * fade).toFixed(3)})`);
-      grad.addColorStop(1.0, "rgba(198,210,224,0)");
+      grad.addColorStop(0.0, `rgba(${base[0]},${base[1]},${base[2]},${(0.06 * fade).toFixed(3)})`);
+      grad.addColorStop(1.0, `rgba(${base[0]},${base[1]},${base[2]},0)`);
       ctx.fillStyle = grad;
       ctx.fillRect(p[0] - cr, p[1] - cr * 0.7, cr * 2.0, cr * 1.8);
     },
   });
 }
 
-function drawWorldObjects(ctx: CanvasRenderingContext2D, cam: Camera): void {
+/** One draw of the landscape's objects: the tower, the trees, the
+ * houses and the clouds — collected from the flora's deterministic
+ * world and depth-sorted (painter's algorithm, far to near), ground
+ * shadows painted first. `withTrees` false when the GPU pipeline
+ * already instanced the forest (its clump owns the trees then). */
+function drawWorldObjects(ctx: CanvasRenderingContext2D, cam: Camera,
+                          withTrees: boolean): void {
   const objects: WorldObject[] = [];
   pushTower(objects, cam);
-  const trees: TreeSpot[] = [];
-  flora.treesNear(cam.px - 700.0, cam.py - 700.0,
-                  cam.px + 700.0, cam.py + 700.0, trees);
-  for (const t of trees) {
-    pushTree(objects, cam, t);
+  if (withTrees) {
+    const trees: TreeSpot[] = [];
+    flora.treesNear(cam.px - 700.0, cam.py - 700.0,
+                    cam.px + 700.0, cam.py + 700.0, trees);
+    for (const t of trees) {
+      pushTree(objects, cam, t);
+    }
   }
   const houses: HouseSpot[] = [];
   flora.housesNear(cam.px - 2500.0, cam.py - 2500.0,
@@ -924,11 +1274,23 @@ function drawFlightPathMarker(ctx: CanvasRenderingContext2D, s: DroneView,
   ctx.lineCap = "butt";
 }
 
-/** The cockpit square: ADI horizon card, traffic, flight + engine gauges. */
+/**
+ * The cockpit square: ADI horizon card, traffic, flight + engine gauges.
+ *
+ * THE EXECUTOR SEAM: when a GPU WorldRenderer is handed in and ready,
+ * it renders the world (sky, terrain quads, the instanced forest) into
+ * the canvas stack's world layer and this canvas carries only the HUD
+ * ink — the pitch ladder, the tapes, the marker, the 2D overlays; the
+ * CPU path (the pixel-exact reference, and the only path the headless
+ * harness ever sees) renders the world right here, as it always has.
+ */
 export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
                                 view: DroneView, others: readonly DroneView[],
                                 foot: string, titleEl?: HTMLElement,
-                                footEl?: HTMLElement): void {
+                                footEl?: HTMLElement,
+                                world?: WorldRenderer | null,
+                                lightCanvas?: HTMLCanvasElement | null,
+                                focal?: number): void {
   const ctx = fitCanvas(canvas);
   const W = canvas.clientWidth;
   const H = canvas.clientHeight;
@@ -938,12 +1300,69 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
   // airframe; the viewport (the canvas) stays fixed, and everything below
   // is transformed INTO it by the one standard projection.
   const cam = cameraOf(s, W, H);
+  // THE WINDSHIELD'S SHARED FOCAL: the curved view's three panes share
+  // ONE projection scale — the whole view spans the 90° law, so each
+  // pane carries its own slice at the same px-per-degree (a pane alone
+  // would zoom; the shared focal keeps the seams continuous)
+  if (focal !== undefined && focal > 0) {
+    cam.f = focal;
+  }
 
-  // the windshield: the 3D world fills the WHOLE square — sky above the
-  // horizon, the ground's textured squares below, one ray per pixel
-  drawWorld(ctx, cam);
-  // the sun: a hot disc with its glow, at its fixed world direction
-  drawSun(ctx, cam);
+  // THE PILOT'S IRIS (HDR adaptation): one reflex per frame — the eye
+  // tightens toward the sun and the whole world dims by its exposure
+  // (the GPU uniform's extras.y; the CPU compose and the light ink
+  // read the same number)
+  iris.update(sunAlign(cam));
+
+  // THE LIGHT LAYER: sun, flare and glare ink — drawn on the light
+  // canvas (composited ADDITIVE/plus-lighter between the world and
+  // the HUD) when the world rendered on its own canvas below, or
+  // drawn right here with the lighter composite when the CPU path
+  // painted the world into THIS canvas (its sun/glare already add).
+  // The layer takes ALL light ink, both paths — one owner.
+  const lightCtx = lightCanvas !== null && lightCanvas !== undefined
+    ? fitCanvas(lightCanvas)
+    : null;
+  if (lightCtx !== null) {
+    lightCtx.clearRect(0, 0, lightCanvas!.clientWidth,
+                       lightCanvas!.clientHeight);
+  }
+
+  // the windshield: the GPU pipeline renders the world layer when it
+  // is handed in and ready; otherwise the CPU path — the per-pixel
+  // march, sky, sun and all — fills the WHOLE square right here
+  const gpuWorld = world !== null && world !== undefined
+                   && world.ready;
+  // THE HUD GLASS: additive only when the world lives on its own
+  // canvas below (GPU path) — then the HUD ink ADDS to the world.
+  // On the CPU path THIS canvas holds the opaque world itself, so it
+  // must composite normally (adding it would double-brighten).
+  canvas.style.mixBlendMode = gpuWorld ? "plus-lighter" : "normal";
+  if (gpuWorld) {
+    const eyeHeight = cam.pz - ground.heightAt(cam.px, cam.py);
+    world!.setExposure(iris.exposure);
+    world!.renderFrame(cam, eyeHeight);    // the sun, flare and glare veil: light ink on the additive layer
+    // — the sky's own glow family, ADDED to the world's own glare
+    const ink = lightCtx ?? ctx;
+    if (ink === ctx) {
+      ctx.globalCompositeOperation = "lighter";
+    }
+    drawSun(ink, cam);
+    drawLensFlare(ink, cam);
+    if (world!.featuresOf.glare) {
+      drawSunGlare(ink, cam);
+    }
+    if (ink === ctx) {
+      ctx.globalCompositeOperation = "source-over";
+    }
+  } else {
+    drawWorld(ctx, cam);
+    // the CPU reference path: the sun, flare and glare add onto the
+    // world painted in THIS canvas (their own lighter composite)
+    drawSun(ctx, cam);
+    drawLensFlare(ctx, cam);
+    drawSunGlare(ctx, cam);
+  }
 
   // world overlays, projected through the same camera
   ctx.save();
@@ -1003,9 +1422,8 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
     ctx.fillText(String(d), midX + ux * (half + 4), midY + uy * (half + 4) + 3);
   }
   // the landscape's objects: tower, trees, houses, clouds, depth-sorted
-  drawWorldObjects(ctx, cam);
-  // the sun's glare: a soft veil over the whole scene when facing it
-  drawSunGlare(ctx, cam);
+  // (the GPU pipeline instanced the forest itself — no painter trees)
+  drawWorldObjects(ctx, cam, !gpuWorld);
   // traffic: other drones in the forward view
   ctx.font = "10px Rajdhani, 'SF Mono', monospace";
   for (const other of others) {
@@ -1157,6 +1575,39 @@ export function drawCockpitView(canvas: HTMLCanvasElement, title: string,
  * idle at the RIGHT edge, INCREASING LEFTWARDS to full — green at
  * idle, red at the redline.
  */
+
+/** THE SIDE VIEWPORT: one third of the curved windshield — the same
+ *  aircraft, the same attitude, the pilot's head yawed `deg` left or
+ *  right, at the SAME shared focal (the windshield's own
+ *  px-per-degree, so the pane continues the centre view's projection
+ *  with no zoom jump at the seam). The GPU world renders through the
+ *  yawed camera (the panes are GPU-only: the CPU per-pixel path is
+ *  the reference view, the centre pane keeps it). One canvas, one
+ *  context: the pane canvas IS the renderer's webgpu context, so no
+ *  2D ink rides here — the sky shader's own sun disc and glow are
+ *  the pane's light. No HUD instruments either: the panes are
+ *  peripheral vision. */
+export function drawSideViewport(canvas: HTMLCanvasElement | null,
+                                 view: DroneView,
+                                 world: WorldRenderer | null,
+                                 deg: number,
+                                 focal: number): void {
+  if (canvas === null || world === null || !world.ready) {
+    return;
+  }
+  const W = canvas.clientWidth;
+  const H = canvas.clientHeight;
+  if (W < 8 || H < 8) {
+    return;                          // the pane is hidden: nothing to do
+  }
+  const cam = yawedCameraOf(view, W, H, deg);
+  cam.f = focal;                     // the shared windshield focal
+  // the world, the iris, the eye height — the windshield's own laws
+  world.setExposure(iris.exposure);
+  const eyeHeight = cam.pz - ground.heightAt(cam.px, cam.py);
+  world.renderFrame(cam, eyeHeight);
+}
+
 export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): void {
   const ctx = fitCanvas(canvas);
   const W = canvas.clientWidth;
@@ -1340,6 +1791,10 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   ctx.fillText("LEFT RUDDER", pl, textY);
   ctx.fillText("YOKE", yk, textY);
   ctx.fillText("RIGHT RUDDER", pr, textY);
+
+  // THE HOUR'S GRADE: the instruments wear the mood's colour — under
+  // the frozen alarm, which stays its own red whatever the hour
+  gradeControlsVeil(ctx, W, H);
 
   if (!s.alive) {
     ctx.fillStyle = "rgba(255,58,48,0.16)";

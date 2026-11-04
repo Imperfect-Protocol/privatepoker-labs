@@ -81,6 +81,123 @@ it, feed `pilot.step(sighting, commands)`, pass the result to
 
 ## Today's work
 
+### The second-generation attack mission: the continuous pair conveyor + THE WILL
+
+**The spec.** No waves: TWO drones lift off at once, the next pair
+rolls FIVE SECONDS behind them, pair after pair, forever. When they
+split, the left seats take the left flank (HSI-45), the right seats
+the right flank (HSI+45); level flight at 3000 ft — the moment in
+the flank; then the left flank's steep descending turn RIGHT
+(HSI+90, down to 500 ft) and the right flank's steep descending turn
+LEFT (HSI-90, down to 500 ft) — the columns converge on the tank in
+the area below; then the left flank's climbing turn LEFT to 1500 ft
+back onto HSI-45 (the right flank mirrors, HSI+45); pitch up, spin
+OWN side (left flank left, right flank right) and RECOVER; fly
+level — and THE WILL DECIDES: the drone's own brain takes the
+controls in free flight. No loop: the conveyor's pair-after-pair
+launches ARE the repetition.
+
+**The mode renames + the default.** The four controls modes are
+named for WHOSE HANDS FLY: `Solo: Instructor` (instructor), `Solo:
+AI` (ai), `Pair: Instructor` (both-suggest), `Pair: AI`
+(both-guarded). ONLY THE LABELS changed (controlModeLabel in
+guardian.ts + the index.html options). The default everywhere is
+`Pair: Instructor` — the classroom AND every new drone
+(WavesShow.defaultControlsMode), verified in the browser.
+
+**The 28-phase chain (src/learning/mission.ts).** [takeoff] roll ->
+rotate -> the ORBIT CLIMB (25-bank climbing turn held to 3000 ft,
+the whole climb inside a ~300 m circle above the field; a straight
+climb is 7 km and left the area) -> level off -> settle; [split]
+roll in -> turn-by +-45 -> the heading-hold roll-out (turnAmount
+enabler in school.ts) -> settle; [flank] the level hold, 8 s at
+3000 ft; [attack] roll in at the 60-bank, idle, top rudder, -6 m/s
+-> the 90-descending-turn -> **wings level, no heading capture** ->
+the held-sink glide to 500 ft; [climb] roll in -> the 135-climbing
+turn -> **the heading CAPTURE onto the flank heading** -> climb to
+1500 ft -> level off; [spin] the school's own chain: stall entry ->
+wait -> drop wing(own side) -> spin(own side) -> opposite rudder ->
+dive -> climb -> level off at 1500 ft; [will] the level hold, 8 s.
+MISSION_ENTRIES: takeoff 0 / split 5 / flank 9 / attack 10 / climb
+14 / spin 19 / will 27.
+
+**THE ATTACK LEG'S MUSH (the trap, and the fix).** The first plan
+finished the 90-descending-turn with a precise heading-hold
+roll-out — and both seats STUCK: the 60-bank idle turn bleeds the
+speed to ~63 mph (near stall at 2g), the roll-out overshoots 90 by
+~50 deg, and the heading-hold chases through an endless phugoid
+(bank +-14 deg, pitch 0->24 deg, altitude bleeding 2987->1133 ft
+over 200 s while drifting out of the area). The school's own steep
+descending demo yoyos the same way after its roll-out but recovers
+inside a 180; my tighter capture + deeper -8 m/s glide trapped it.
+THE FIX: the roll-out is `LevelWingsElement` — wings level, NO
+heading capture, the 90 lands with the natural arc overshoot
+(accepted: measured +95.7/-99.4, within 10 of the spec's HSI
++-90); the glide is `DescendToElement(500 ft, -6 m/s, cruise,
+descendThrottle)` — the school's own proven steep-descent regime.
+The -8 m/s variant is energy starvation; ATTACK_VS_MPS = -6.0.
+
+**THE RALLY'S HEADING CAPTURE.** The rally must end back on the
+flank's own HSI +-45 — but the attack's arc overshoot VARIES, so a
+fixed-amount turn lands wherever the arc left the column. The
+flank heading IS the target (the split put it there, the level hold
+kept it): `HeadingMark` (mission-local) is kept fresh every tick of
+the flank leg by MissionFlight itself (mode- and conform-proof),
+and the rally's roll-out is `RollOutToHeadingElement` — the school
+gained the `headingTo?: () => number` law (bank = clamp(1.4 *
+wrapPi(target - heading)), the runtime-heading twin of turnAmount)
+and `PhaseReadings.heading` (the HSI, already computed in
+readings(), now exposed). The 135 climbing turn flies the bulk, the
+capture lands exactly: rally -46.0/+42.2 against the flank's
+-46.5/+43.7.
+
+**THE WILL PHASE.** The chain does NOT loop: when the cursor
+finishes, `enterWill()` seats the AI at the levers in FREE FLIGHT
+(the swarm's LiveEpisode shape: null cursor, GOAL_FREE_FLIGHT, the
+free instructor's stabilizerTeaching as the error-wave source) and
+the drone's own tensor brain — trained on the whole sortie's error
+waves — decides every next step until it crashes or leaves the
+9000 m area (MISSION_AREA_M: the attack glide spans kilometres, the
+pattern points anywhere). A will-phase drone does NOT vote in the
+singularity's plurality and is BEYOND conform's pull (its will has
+it); it still blends memory (it remains a member of the heard
+swarm).
+
+**The conveyor (src/app/waves-show.ts).** `launchPair()` every
+5.0 s: two seats abreast (PAIR_GAP 40 m), the pairs in trail
+(PAIR_TRAIL 90 m), DRONE_CAP 40 (a pair launches only if
+aliveCount + 2 <= 40), labels "Pair N - left/right"; the singularity
+round every 50 ticks conforms everyone to the super-goal;
+pruneOldCrashSites keeps the last 6 pairs' sites. main.ts's
+narration: "drone attack - pair N lifted off - X flying - the will
+decides after the mission".
+
+### Verification (all green)
+- `tools/mission-probe.mjs`: MISSION PROBE OK — both seats the full
+  chain: rotate 65 mph (no early yoke), split -46.5/+43.7, the level
+  moment 2987/2986 ft, attack +95.7/-99.4 at 536 ft, rally
+  -46.0/+42.2 at 1490 ft, own-side spins (peak |rateR| 1.10 both
+  seats), will entered at 662 s, max radius 5787/6171 m inside the
+  9000 m area; the conveyor (first pair together, 4.9 s one pair,
+  5.1 s the second, 10 s the third, labels, all Pair: Instructor);
+  the singularity (plurality, rounds, the isolated drone untouched,
+  will-phase isolation); conform (forward at a boundary, never
+  backward, runway immunity).
+- All 9 test suites pass (1549 checks: vec 81, events 104, config
+  153, rng 174, physics 180, episode 202, units 209, school 210,
+  pipeline 236) — the school's own lessons untouched.
+- `tools/nan-hunt.mjs`: 0 NaN layers, 0 exam-flight NaN events,
+  waves stepping 40 alive at the cap.
+- Browser (Playwright, :8765 ?boot=skip): the scenario dropdown
+  offers the drone attack; the controls default SELECTS "Pair:
+  Instructor"; pairs roll continuously (pair 10 by ~90 s sim,
+  20-40 flying, cap held); the super-goal walks the legs live
+  (takeoff at t=373 -> attack at t=458 -> spin at t=654, 0 crashes
+  heard through the 500 ft attack and the spins); narration and
+  wiki name the will phase; no page errors.
+
+## Earlier work
+
 ### The controls dropdown (the big feature)
 Two dropdowns: **Aircraft** (which machine) and **Controls** (whose
 hands), the latter sticky per machine, effective in every scenario.
@@ -202,13 +319,23 @@ both spins
 
 ## Open items
 
+- The attack's natural arc lands HSI +-90 at +95.7/-99.4 (the
+  accepted overshoot of the wings-level roll-out through the
+  low-energy mush). The probe tolerates 10 deg; if an exact 90 is
+  ever wanted, the honest path is a headingTo capture flown AFTER
+  the glide (power on, speed recovered), not a tighter roll-out —
+  the roll-out capture is the trap, it cost a day.
+- The HeadingMark fallback: a drone conformed PAST the flank (split
+  boundary -> attack/climb) never marks a flank heading, so its
+  rally captures heading 0 (the runway heading). Rare, benign, and
+  forward-only — note it if conform pulls harder.
 - The takeoff EMA is still low after few reps (~0.28 at 3) — the servo
   has no rotate-pull memory yet; the power law unblocked the training
   path, and the endless browser classroom accumulates the reps. Watch
   it climb.
-- The stabilizer (swarm instructor mode) still crashes in long runs on
-  the new plateau — the clearance floor and firm hand were verified
-  individually but the combination needs one more tuning pass over
-  the Designer's final terrain. This is the next task.
-- vec.test's terrain golden needs a regeneration once the Designer's
-  ground work settles.
+- The waves' free-flight stabilizer crash on the Designer's plateau is
+  moot for the mission chain but the WILL PHASE flies the
+  stabilizer's teaching as its error-wave source — watch the will
+  drones' survivability over long runs on the current terrain.
+- vec.test's terrain golden has settled (passing); regenerate only if
+  the Designer's terrain changes again.

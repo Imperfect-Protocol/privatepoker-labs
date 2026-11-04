@@ -312,6 +312,17 @@ export class LandUse {
     return fx * fx + fy * fy < 1.0;
   }
 
+  /** The height channel, raw — the GPU pipeline's terrain texture
+   *  (uploaded once at renderer creation). */
+  heightsOf(): Float32Array {
+    return HEIGHT;
+  }
+
+  /** The biome map, raw — the GPU pipeline's biome texture. */
+  biomesOf(): Uint8Array {
+    return MAP;
+  }
+
   /** The tallest terrain within the 2^lvl-texel block containing
    *  (x, y), ring included — the marching ray's skip-ahead bound. */
   maxHeightAt(x: number, y: number, lvl: number): number {
