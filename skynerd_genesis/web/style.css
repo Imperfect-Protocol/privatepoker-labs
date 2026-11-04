@@ -190,6 +190,10 @@ label select { text-transform: none; }
   mix-blend-mode: plus-lighter;
   pointer-events: none;
 }
+#lightCanvasL, #lightCanvasR {
+  mix-blend-mode: plus-lighter;
+  pointer-events: none;
+}
 /* THE HUD GLASS: the cockpit ink (tapes, ladder, markers, objects)
  * composites ADDITIVELY too — the instruments read like luminous
  * glass over the world, adding their light instead of pasting over
@@ -205,11 +209,11 @@ label select { text-transform: none; }
   display: block;
   position: absolute;
   bottom: 0;
-  background: #03060b;
   border: none;
-  border-top: 1px solid var(--line);
   border-radius: 0;
   z-index: 5;
+  /* no CSS body: the canvas paints its own dashboard shape — the
+   * corners outside the path stay transparent, the world shows */
 }
 /* the render-feature checkboxes, right next to RESET */
 label.cb {

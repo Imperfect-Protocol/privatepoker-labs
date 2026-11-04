@@ -17,6 +17,7 @@ import { ServoPolicy } from "../build/src/learning/servo-tensor.js";
 import { NumpyPcg64 } from "../build/src/core/rng.js";
 import { TRIM_SPEED } from "../build/src/learning/flight.js";
 import { SYLLABUS } from "../build/src/learning/school.js";
+import { RUNWAY } from "../build/src/app/land.js";
 import { Vec3 } from "../build/src/core/vec.js";
 
 const DT = 1.0 / 50.0;
@@ -33,19 +34,22 @@ const check = (ok, label) => {
 
 const left = missionPlan(-1.0, new HeadingMark());
 check(left.phases.length === 28, `the plan has 28 phases (${left.phases.length})`);
-check(left.tokens[0] === "takeoff" && left.tokens[5] === "split"
-      && left.tokens[9] === "flank" && left.tokens[10] === "attack"
+check(left.tokens[0] === "takeoff" && left.tokens[3] === "split"
+      && left.tokens[6] === "flank" && left.tokens[10] === "attack"
       && left.tokens[14] === "climb" && left.tokens[19] === "spin"
       && left.tokens[27] === "will",
       "tokens sit on the legs (takeoff/split/flank/attack/climb/spin/will)");
 
 // --- one full sortie, both seats of the pair -------------------------------------
 
-const seat = (flankSign, x) =>
+const seat = (flankSign) =>
   new MissionFlight(new ServoPolicy(), instruments, 0,
     new NumpyPcg64(1007n, 87136372517582989555478159403783844777n), {
       flankSign,
-      startPosition: new Vec3(x, flankSign * 20.0, SYLLABUS.runwayM),
+      // the runway seat: the centre of the lane's own half, at the
+      // same threshold the conveyor launches from
+      startPosition: new Vec3(RUNWAY.near + 50.0,
+        flankSign * RUNWAY.half * 0.5, SYLLABUS.runwayM),
       mode: "both-suggest",        // the scenario's default: Pair: Instructor
     });
 
@@ -56,12 +60,16 @@ const headingOf = (flight) => {
 
 const sorties = [];
 for (const flankSign of [-1.0, 1.0]) {
-  const flight = seat(flankSign, 0.0);
+  const flight = seat(flankSign);
   const record = { flight, flankSign, rotated: null, earlyYoke: false,
     heading0: null, splitHeading: null, flankAlt: null,
     attackHeading: null, attackAlt: null, spinRateR: null,
     rallyHeading: null, rallyAlt: null, enteredWill: false,
-    maxR: 0.0, tokens: [], lastToken: "" };
+    maxR: 0.0, tokens: [], lastToken: "",
+    startX: flight.aircraft.body.position.x,
+    startY: flight.aircraft.body.position.y,
+    lastHeading: null, takeoffTurn: 0.0, splitTurn: 0.0,
+    flankDev: 0.0 };
   sorties.push(record);
   const SORTIE_S = 800.0;
   for (let t = 0; t < Math.round(SORTIE_S / DT); t += 1) {
@@ -69,6 +77,16 @@ for (const flankSign of [-1.0, 1.0]) {
     const body = flight.aircraft.body;
     const mph = body.velocity.length() * 2.23694;
     const token = flight.missionToken;
+    // the departure's own turns: the takeoff rolls straight (no
+    // circles), the split peels own side, the flank climb-out holds
+    const h = headingOf(flight);
+    if (record.lastHeading !== null) {
+      const dh = Math.atan2(Math.sin(h - record.lastHeading),
+                            Math.cos(h - record.lastHeading));
+      if (token === "takeoff") record.takeoffTurn += dh;
+      else if (token === "split") record.splitTurn += dh;
+    }
+    record.lastHeading = h;
     if (token !== record.lastToken) {
       record.tokens.push(`${token}@${(t * DT).toFixed(0)}s`);
       record.lastToken = token;
@@ -81,8 +99,13 @@ for (const flankSign of [-1.0, 1.0]) {
       record.heading0 = headingOf(flight);
     }
     if (token === "flank") {
-      record.splitHeading ??= headingOf(flight);
-      record.flankAlt ??= body.position.z;
+      record.splitHeading ??= h;
+      // the level moment: the altitude at the flank leg's END (the
+      // token exits to the attack at 3000 ft)
+      record.flankAlt = body.position.z;
+      record.flankDev = Math.max(record.flankDev,
+        Math.abs(Math.atan2(Math.sin(h - record.splitHeading),
+                            Math.cos(h - record.splitHeading))));
     }
     if (token === "climb") {
       record.attackHeading ??= headingOf(flight);
@@ -119,6 +142,19 @@ for (const [name, r] of [["left", sorties[0]], ["right", sorties[1]]]) {
         `${name}: rotates around 60 mph (${r.rotated?.toFixed(1)})`);
   check(!r.earlyYoke, `${name}: no yoke pull before rotation speed`);
   const s = r.flankSign;
+  check(r.startX >= RUNWAY.near && r.startX <= RUNWAY.far
+        && Math.abs(r.startY - s * RUNWAY.half * 0.5) <= 0.01,
+        `${name}: starts ON the runway at the centre of its half ` +
+        `(${r.startX.toFixed(0)}, ${r.startY.toFixed(1)})`);
+  check(Math.abs(r.takeoffTurn * DEG) <= 25.0,
+        `${name}: the takeoff rolls and climbs straight, no circles ` +
+        `(${(r.takeoffTurn * DEG).toFixed(1)} deg of turn)`);
+  check(r.splitTurn * s * DEG >= 25.0 && r.splitTurn * s * DEG <= 65.0,
+        `${name}: the split peels own side onto HSI ` +
+        `${s < 0 ? "-" : "+"}45 (${(r.splitTurn * DEG).toFixed(1)} deg)`);
+  check(r.flankDev * DEG <= 12.0,
+        `${name}: the flank climb-out holds the flank heading ` +
+        `(max ${(r.flankDev * DEG).toFixed(1)} deg off)`);
   check(Math.abs(splitDelta - s * 45.0) <= 8.0,
         `${name}: the split lands on HSI ${s < 0 ? "-" : "+"}45 (${splitDelta.toFixed(1)})`);
   check(Math.abs((r.flankAlt * FT) - 3000.0) <= 200.0,
@@ -155,6 +191,14 @@ const conveyor = new WavesShow({
   state: "35399562948360463058890781895381311971",
   inc: "87136372517582989555478159403783844777",
 });
+const firstSeats = conveyor.drones
+  .map((d) => d.flight.aircraft.body.position);
+check(firstSeats.length === 2
+      && firstSeats.every((p) => p.x >= RUNWAY.near && p.x <= RUNWAY.far
+        && (Math.abs(p.y - RUNWAY.half * 0.5) < 0.01
+            || Math.abs(p.y + RUNWAY.half * 0.5) < 0.01)),
+      "the conveyor's first pair lines up ON the runway, each seat at " +
+      "the centre of its half");
 const stepS = (s) => { for (let i = 0; i < Math.round(s / DT); i += 1) conveyor.step(); };
 check(conveyor.aliveCount === 2 && conveyor.pairCount === 1,
       `the first pair lifts off together (${conveyor.aliveCount} drones)`);
@@ -195,8 +239,8 @@ check(lone.superGoal === "takeoff",
 
 // --- conform: the super-goal pulls a fallen-behind drone forward -------------------
 
-const behind = seat(-1.0, 0.0);
-// fly to the split's leg entry (the settle after the takeoff level-off)
+const behind = seat(-1.0);
+// fly to the split's leg entry (the straight climb before the peel)
 let atSplit = false;
 for (let t = 0; t < Math.round(500.0 / DT) && !atSplit; t += 1) {
   if (!behind.step()) break;
@@ -207,7 +251,7 @@ behind.conform("attack");
 check(behind.missionToken === "attack", "a boundary-sitting drone conforms forward");
 behind.conform("split");
 check(behind.missionToken === "attack", "conform never moves backward");
-const runwayDrone = seat(-1.0, 0.0);
+const runwayDrone = seat(-1.0);
 runwayDrone.conform("attack");
 check(runwayDrone.missionToken === "takeoff",
       "a runway drone is never pulled off its takeoff");

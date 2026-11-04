@@ -81,7 +81,7 @@ if (!guard.tookOver) console.log("guarded: no danger arose in this run (no takeo
   console.log("selected:", label, "mode:", waves.selectedControlsMode);
   const drone0 = waves.drones.find((d) => d.entry.label === label);
   const before = drone0.entry.aircraft.body.position.z;
-  for (let i = 0; i < 10000; i++) waves.step();  // 200 s of the mission (the orbit climb)
+  for (let i = 0; i < 10000; i++) waves.step();  // 200 s of the mission (the flank climb-out)
   const drone = waves.drones.find((d) => d.entry.label === label);
   if (drone === undefined) {
     console.log("mission: drone LEFT the scene before the check");
