@@ -373,8 +373,8 @@ export class BootTrainer {
                     child: ServoPolicy): void {
     const snapA = parentA.snapshot();
     const snapB = parentB.snapshot();
-    const tensors = ["location", "energy", "flight", "controls", "skill",
-                     "goal", "servo"] as const;
+    const tensors = ["location", "energy", "flight", "controls", "leftSkill",
+                     "rightSkill", "goal", "servo"] as const;
     const merged: Record<string, { values: Map<number, Float32Array>;
                                    epochs: Map<number, Int32Array> }> = {};
     for (const tensor of tensors) {
@@ -399,7 +399,8 @@ export class BootTrainer {
     child.restore({
       location: merged.location, energy: merged.energy,
       flight: merged.flight, controls: merged.controls,
-      skill: merged.skill, goal: merged.goal, servo: merged.servo,
+      leftSkill: merged.leftSkill, rightSkill: merged.rightSkill,
+      goal: merged.goal, servo: merged.servo,
       errorSigns: snapA.errorSigns.map((sign, i) =>
         this.genes.uniform() < 0.5 ? sign : snapB.errorSigns[i]),
     });

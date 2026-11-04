@@ -5,7 +5,7 @@
  * signals travel synapses, and each cube brightens as its tensor fills
  * with what the classroom stamps into it.
  *
- * The SEVEN tensors, one cube each, in three tiers:
+ * The EIGHT tensors, one cube each, in three tiers:
  *   row 1 — the SENSOR tensors (they process the Aircraft's panel into
  *     situational signals; each is recurrent: its own previous code,
  *     the goal's element, and its skill patch bin are part of its key):
@@ -13,15 +13,17 @@
  *       EnergyTensor     alt × asi × vsi × pitch × rpm → SITUATION 32
  *       FlightTensor     vsi × asi × pitch × bank × turn → SITUATION 64
  *       ControlsTensor   aileron × elevator × rudder × throttle → SITUATION 64
- *   row 2 — the GOAL tensor (the fuzzy state machine) and the SKILL
- *     tensor (the patch panel: every tensor's signal wired to every
- *     other's)
- *   row 3 — the SERVO tensor (receives updates from ALL the tensors —
+ *   row 2 — THE TWO SKILLS TENSORS flanking the GOAL tensor (the
+ *     fuzzy state machine): LeftSkillsTensor on its left (the
+ *     perception panel: location × energy × element × servo),
+ *     RightSkillsTensor on its right (the execution panel:
+ *     flight × controls × element × servo), the bridge between them
+ *   row 3 — the SERVO tensor (receives the two panels' forwards —
  *     never from the Aircraft — and drives the levers)
  */
 import type { ServoPolicy } from "../learning/servo-tensor.js";
 import {
-  GOAL_AXIS, ELEMENT_AXIS, PATCH_WIRE_AXIS, SKILL_BIN_AXIS,
+  GOAL_AXIS, ELEMENT_AXIS, LEFT_WIRE_AXIS, RIGHT_WIRE_AXIS, SKILL_BIN_AXIS,
 } from "../learning/servo-tensor.js";
 import {
   LOCATION_SHAPE, ENERGY_SHAPE, FLIGHT_SHAPE, CONTROLS_SHAPE,
@@ -36,19 +38,21 @@ export interface TensorCounts {
   energy: number;
   flight: number;
   controls: number;
-  skill: number;
+  leftSkill: number;
+  rightSkill: number;
   goal: number;
   servo: number;
 }
 
-/** The seven tensors' live key counts (one cube per tensor). */
+/** The eight tensors' live key counts (one cube per tensor). */
 export function tensorCounts(policy: ServoPolicy): TensorCounts {
   return {
     location: policy.locationTensor.storedCombinations,
     energy: policy.energyTensor.storedCombinations,
     flight: policy.flightTensor.storedCombinations,
     controls: policy.controlsTensor.storedCombinations,
-    skill: policy.skillTensor.storedCombinations,
+    leftSkill: policy.leftSkillTensor.storedCombinations,
+    rightSkill: policy.rightSkillTensor.storedCombinations,
     goal: policy.goalTensor.storedCombinations,
     servo: policy.servoTensor.storedCombinations,
   };
@@ -75,10 +79,11 @@ const tensorDims = (input: readonly number[], output: readonly number[]): string
 /**
  * THE LAYOUT — three tiers, the way the signals flow:
  *   row 1: the four SENSOR tensors (they process the Aircraft's panel)
- *   row 2: the GOAL tensor (the fuzzy state machine) and the SKILL
- *          tensor (the patch panel)
- *   row 3: the SERVO tensor (receives every tensor's signal — never
- *          the Aircraft — and drives the levers)
+ *   row 2: THE LEFT SKILLS TENSOR (the perception panel), the GOAL
+ *          tensor (the fuzzy state machine), THE RIGHT SKILLS TENSOR
+ *          (the execution panel) — the two panels flanking the goal
+ *   row 3: the SERVO tensor (receives the two panels' forwards —
+ *          never the Aircraft — and drives the levers)
  */
 const CUBE_SPOTS: readonly CubeSpot[] = [
   { key: "location",  name: "LocationTensor",
@@ -97,42 +102,49 @@ const CUBE_SPOTS: readonly CubeSpot[] = [
     dims: tensorDims([...CONTROLS_SHAPE, CONTROLS_CLASS_AXIS, ELEMENT_AXIS,
                        SKILL_BIN_AXIS], [CONTROLS_CLASS_AXIS]),
     rgb: [140, 226, 255], fx: 0.875, fy: 0.15 },
+  { key: "leftSkill", name: "LeftSkillsTensor",
+    dims: tensorDims([LEFT_WIRE_AXIS, PATCH_SLOT_AXIS, PATCH_SLOT_AXIS], []),
+    rgb: [94, 240, 158],  fx: 0.25, fy: 0.50 },
   { key: "goal",      name: "GoalTensor",
     dims: tensorDims([GOAL_AXIS, ELEMENT_AXIS, SITUATION_AXIS],
                      [GOAL_AXIS, ELEMENT_AXIS]),
-    rgb: [180, 140, 255], fx: 0.375, fy: 0.50 },
-  { key: "skill",     name: "SkillTensor",
-    dims: tensorDims([PATCH_WIRE_AXIS, PATCH_SLOT_AXIS, PATCH_SLOT_AXIS], []),
-    rgb: [94, 240, 158],  fx: 0.625, fy: 0.50 },
+    rgb: [180, 140, 255], fx: 0.50, fy: 0.50 },
+  { key: "rightSkill", name: "RightSkillsTensor",
+    dims: tensorDims([RIGHT_WIRE_AXIS, PATCH_SLOT_AXIS, PATCH_SLOT_AXIS], []),
+    rgb: [45, 212, 191],  fx: 0.75, fy: 0.50 },
   { key: "servo",     name: "ServoTensor",
     dims: tensorDims([GOAL_AXIS, ELEMENT_AXIS, ENERGY_CLASS_AXIS,
-                       FLIGHT_CLASS_AXIS, SKILL_BIN_AXIS],
+                       FLIGHT_CLASS_AXIS, SKILL_BIN_AXIS, SKILL_BIN_AXIS],
       [stopCount(0), stopCount(1), stopCount(2), stopCount(3)]),
     rgb: [255, 106, 122], fx: 0.50, fy: 0.85 },
 ];
 
 /**
  * THE SYNAPSES (by index into CUBE_SPOTS). The sensors connect
- * DIRECTLY to the goal tensor and the skill patch panel; the goal
- * tensor feeds its element back to the sensors (the recurrence) and
- * to the skill; the patch panel wires every tensor to every other —
- * and the SERVO's only inbound synapse is the patch panel's forward:
- * ALL its input arrives from the skill tensor.
+ * DIRECTLY to the goal tensor and their side's skills panel; the
+ * goal tensor feeds its element back to the sensors (the recurrence)
+ * and to both panels; each panel wires its own side's signals and
+ * BRIDGES the other panel — and the SERVO's only inbound synapses
+ * are the two panels' forwards: ALL its input arrives from the two
+ * skills panels.
  */
 const SYNAPSES: ReadonlyArray<readonly [number, number]> = [
-  // the sensors -> goal, skill (direct)
-  [0, 4], [1, 4], [2, 4], [3, 4],
+  // the sensors -> the goal and their side's panel (direct)
   [0, 5], [1, 5], [2, 5], [3, 5],
+  [0, 4], [1, 4],            // location, energy -> the LEFT panel
+  [2, 6], [3, 6],            // flight, controls -> the RIGHT panel
   // the goal tensor: its element -> the sensors (the recurrence)
-  // and the skill
-  [4, 0], [4, 1], [4, 2], [4, 3],
-  [4, 5],
-  // the patch panel: its wires -> the sensors, the goal; its FORWARD
-  // -> the servo (the servo's whole input); the servo's last command
-  // -> back to the panel
+  // and both panels
   [5, 0], [5, 1], [5, 2], [5, 3],
   [5, 4], [5, 6],
-  [6, 5],
+  // the panels: their wires' verdict -> their sensors and the goal;
+  // THE BRIDGE -> each other; their FORWARDS -> the servo (the
+  // servo's whole input); the servo's last command -> back to both
+  [4, 0], [4, 1], [4, 5],
+  [6, 2], [6, 3], [6, 5],
+  [4, 6], [6, 4],            // the bridge between the two panels
+  [4, 7], [6, 7],
+  [7, 4], [7, 6],
 ];
 
 /** The unit cube: corners and the six faces (corner indices, in order). */
@@ -229,7 +241,7 @@ function fillOf(count: number): number {
 
 /**
  * Paint the brain view once: the synapses (with their traveling pulses),
- * the five cubes, and the labels below them. `time` is seconds — the
+ * the eight cubes, and the labels below them. `time` is seconds — the
  * cubes rotate and the pulses travel with it.
  */
 export function drawBrainView(canvas: HTMLCanvasElement, time: number,

@@ -1589,7 +1589,7 @@ export class ExamFlight extends ClassroomFlight {
    */
   chosenIndex: number;
   /**
-   * THE TENSOR NETWORK: the seven tensors as dispatcher nodes —
+   * THE TENSOR NETWORK: the eight tensors as dispatcher nodes —
    * input message -> reward -> stun (logsig timer) -> queue; on the
    * timer's fire: noise -> Haar -> Gaussian -> threshold -> message
    * -> send. One network per flight, sharing the student's brain.

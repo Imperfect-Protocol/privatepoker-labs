@@ -261,7 +261,8 @@ export interface AiBrainCounts {
   readonly energy: number;
   readonly flight: number;
   readonly controls: number;
-  readonly skill: number;
+  readonly leftSkill: number;
+  readonly rightSkill: number;
   readonly goal: number;
   readonly servo: number;
 }
@@ -489,8 +490,8 @@ export class AiPilot implements Pilot {
   weaveWith(other: AiPilot, rng: NumpyPcg64): AiBrainState {
     const snapA = this.policy.snapshot();
     const snapB = other.policy.snapshot();
-    const tensors = ["location", "energy", "flight", "controls", "skill",
-                     "goal", "servo"] as const;
+    const tensors = ["location", "energy", "flight", "controls", "leftSkill",
+                     "rightSkill", "goal", "servo"] as const;
     const merged: Record<string, { values: Map<number, Float32Array>;
                                    epochs: Map<number, Int32Array> }> = {};
     for (const tensor of tensors) {
@@ -515,7 +516,8 @@ export class AiPilot implements Pilot {
     return {
       location: merged.location, energy: merged.energy,
       flight: merged.flight, controls: merged.controls,
-      skill: merged.skill, goal: merged.goal, servo: merged.servo,
+      leftSkill: merged.leftSkill, rightSkill: merged.rightSkill,
+      goal: merged.goal, servo: merged.servo,
       errorSigns: snapA.errorSigns.map((sign, i) =>
         rng.uniform() < 0.5 ? sign : snapB.errorSigns[i]),
     };
@@ -534,7 +536,8 @@ export class AiPilot implements Pilot {
       [this.policy.energyTensor, donor.policy.energyTensor],
       [this.policy.flightTensor, donor.policy.flightTensor],
       [this.policy.controlsTensor, donor.policy.controlsTensor],
-      [this.policy.skillTensor, donor.policy.skillTensor],
+      [this.policy.leftSkillTensor, donor.policy.leftSkillTensor],
+      [this.policy.rightSkillTensor, donor.policy.rightSkillTensor],
       [this.policy.goalTensor, donor.policy.goalTensor],
       [this.policy.servoTensor, donor.policy.servoTensor],
     ];
@@ -624,7 +627,8 @@ export class AiPilot implements Pilot {
       energy: this.policy.energyTensor.storedCombinations,
       flight: this.policy.flightTensor.storedCombinations,
       controls: this.policy.controlsTensor.storedCombinations,
-      skill: this.policy.skillTensor.storedCombinations,
+      leftSkill: this.policy.leftSkillTensor.storedCombinations,
+      rightSkill: this.policy.rightSkillTensor.storedCombinations,
       goal: this.policy.goalTensor.storedCombinations,
       servo: this.policy.servoTensor.storedCombinations,
     };
