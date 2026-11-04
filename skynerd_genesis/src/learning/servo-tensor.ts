@@ -511,6 +511,20 @@ export class ServoPolicy {
 
   /** THE STALL-RECOVERY REFLEX's power half: the stall family always
    *  adds full throttle, whatever the pitch correction did. */
+  private static readonly STALL_FAMILY = new Set([8, 9]);
+  private static readonly FULL_THROTTLE_LEVEL = 6;   // stopCount(3) - 1
+
+  /** THE STALL FAMILY'S POWER LAW: a stall-family state always adds
+   *  full throttle, whatever else the servo chose — a push without
+   *  power recovers nothing, and a plane parked on the runway (the
+   *  teacher's "stall" reading at zero airspeed) never rolls. The
+   *  chosen correction rides on top; the power is unconditional. */
+  private static applyStallPower(key: readonly number[],
+                                 actions: Int32Array): void {
+    if (ServoPolicy.STALL_FAMILY.has(key[2])) {
+      actions[3] = ServoPolicy.FULL_THROTTLE_LEVEL;
+    }
+  }
 
   /**
    * IMPOSE THE PRIOR WIRES — the sensible companies cohering on the
@@ -823,6 +837,7 @@ export class ServoPolicy {
       const reflex = ServoPolicy.servoReflex(key);
       if (reflex !== null) {
         actions[reflex[0]] = reflex[1];
+        ServoPolicy.applyStallPower(key, actions);
         return actions;
       }
     }
@@ -830,6 +845,7 @@ export class ServoPolicy {
       const [channel, level] = ServoPolicy.channelLevelOf(choice);
       actions[channel] = level;
     }
+    ServoPolicy.applyStallPower(key, actions);
     return actions;
   }
 

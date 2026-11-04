@@ -74,7 +74,7 @@ const cases = [
   ["15 deg climb at 70 mph", { x: 0, y: 0, z: 300, fwdX: 1, fwdY: 0, velX: 36.5, velY: 0, pitch: 15 * DEG, speed: 37.1, vs: 6.5 }],
   ["25 deg bank LEFT turning", { x: 0, y: 0, z: 300, fwdX: 1, fwdY: 0, velX: 37.0, velY: 3.0, pitch: 3 * DEG, speed: 38.1, vs: 0.0 }],
   ["spin look-down (pitch -80)", { x: 0, y: 0, z: 600, fwdX: 0.17, fwdY: 0, velX: 4, velY: 0, pitch: -80 * DEG, speed: 30, vs: -28 }],
-  ["on the runway, stopped", { x: 0, y: 0, z: 3, fwdX: 1, fwdY: 0, velX: 0, velY: 0, pitch: 0, speed: 0, vs: 0 }],
+  ["on the runway, stopped", { x: 0, y: 0, z: 30.48, fwdX: 1, fwdY: 0, velX: 0, velY: 0, pitch: 0, speed: 0, vs: 0 }],
 ];
 
 const add = (v, extra) => ({ ...v, ...extra, throttle: 0.8, ail: 0, elev: 0, rud: 0, alive: true });
@@ -108,6 +108,7 @@ console.log(`\nfocal ${F.toFixed(1)} px; buffer ${Math.ceil(W / 1)}x${Math.ceil(
 // --- the filter probe: the Ground's sampling law, directly ----------------
 const FTm = 0.3048;
 const { Ground: GroundCls } = await import("../build/src/app/ground.js");
+const { FIELD_ELEV } = await import("../build/src/app/land.js");
 const g = new GroundCls();
 {
   const norm = (c) => (c[0] - 66.0) / (74.0 - 66.0);   // 1.0 = level-0 bright (Grass)
@@ -156,5 +157,78 @@ const g = new GroundCls();
   console.log(`  anisotropic at ground: stretch norm ${norm(stretch).toFixed(3)}` +
               ` (structure along the stretch), square norm ${norm(square).toFixed(3)}` +
               `${Math.abs(norm(square)) > 0.1 ? "  ✓ full-contrast, never a flat mean" : "  ✗"}`);
-}
+
+  // THE TERRAIN: the height channel — the field a plateau at 5 ft
+  // (FIELD_ELEV, the gear's ground), the hills marching up to ~1000 ft,
+  // the relief shading leaning off flat.
+  const land = g.land;
+  const flat = Math.abs(land.heightAt(0.0, 0.0) - FIELD_ELEV) < 1e-6
+    && Math.abs(land.normalAt(0.0, 0.0)[2] - 1.0) < 1e-9;  let peak = 0.0;
+  let peakAt = [0.0, 0.0];
+  for (let y = -4096; y < 4096; y += 32) {
+    for (let x = -4096; x < 4096; x += 32) {
+      const h = land.heightAt(x, y);
+      if (h > peak) { peak = h; peakAt = [x, y]; }
+    }
+  }
+  const peakOk = peak > 250.0 && peak <= 306.0;
+  console.log(`\n  terrain: the field a plateau at ${(FIELD_ELEV / 0.3048).toFixed(0)} ft (${FIELD_ELEV} m) ${flat ? "✓" : "✗"}` +
+              `; the tallest hill ${peak.toFixed(0)} m (${(peak / 0.3048).toFixed(0)} ft)` +
+              `${peakOk ? "  ✓ rivers 0, hills ~1000 ft" : "  ✗"}`);
+  // a ray at the peak hits the SLOPE before the flat plane would
+  const [hx, hy] = peakAt;
+  const ox = hx - 3000.0, oy = hy;
+  const oz = 600.0;
+  const dxx = 3000.0 / Math.hypot(3000.0, oz);
+  const dzz = -oz / Math.hypot(3000.0, oz);
+  const tHit = g.intersectRay(ox, oy, oz, dxx, 0.0, dzz);
+  const tPlane = -oz / dzz;
+  const slopeOk = tHit !== null && tHit < tPlane * 0.95;
+  console.log(`  a ray into the hill: march t=${tHit === null ? "null" : tHit.toFixed(0)}` +
+              ` vs flat-plane t=${tPlane.toFixed(0)}${slopeOk ? "  ✓ the slope catches it first" : "  ✗"}`);
+  // the relief: the hilltop is flat by definition — the FLANK is where
+  // the normal leans (walk downhill until half the peak's height)
+  let fx = hx, fy = hy;
+  const stepLen = Math.hypot(hx, hy) / 200.0;
+  const stepX = -hx / Math.hypot(hx, hy) * stepLen;
+  const stepY = -hy / Math.hypot(hx, hy) * stepLen;
+  for (let i = 0; i < 200 && land.heightAt(fx, fy) > peak / 2.0; i++) {
+    fx += stepX;
+    fy += stepY;
+  }
+  const nf = land.normalAt(fx, fy);
+  const leans = nf[2] < 0.995;
+  console.log(`  relief on the flank (${Math.round(fx)}, ${Math.round(fy)}):` +
+              ` normal (${nf.map((v) => v.toFixed(3)).join(",")})` +
+              `${leans ? "  ✓ the hills lean into the sun" : "  ✗"}`);
+  // THE WATER/LAND LAW: every water texel exactly level 0 (the flat
+  // water plane — no slope, no shimmer), every land texel above 10 ft
+  // (the bank at every waterline). Sampled on OPEN ground — texels
+  // whose whole 8-neighbourhood is one kind; the boundary ring is the
+  // bank itself, where the surface blends water level into land.
+  let waterMax = -1.0, landMin = 1e9;
+  for (let ty = 1; ty < 511; ty++) {
+    for (let tx = 1; tx < 511; tx++) {
+      const x = (tx + 0.5) * 16, y = (ty + 0.5) * 16;
+      const biome = land.biomeAt(x, y);
+      let mixed = false;
+      for (let oy = -1; oy <= 1 && !mixed; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          if (land.biomeAt(x + ox * 16, y + oy * 16) !== biome) { mixed = true; break; }
+        }
+      }
+      if (mixed) continue;               // the bank ring: the blend
+      const hgt = land.heightAt(x, y);
+      if (biome === 4) {                 // Biome.Water
+        if (hgt > waterMax) waterMax = hgt;
+      } else if (hgt < landMin) {
+        landMin = hgt;
+      }
+    }
+  }
+  const lawOk = waterMax <= 1e-6 && landMin > 10.0 / 3.28084;
+  console.log(`  the law: open water flat at 0 (max ${waterMax.toFixed(3)} m)` +
+              `, open land above 10 ft (min ${(landMin / 0.3048).toFixed(1)} ft)` +
+              `${lawOk ? "  ✓" : "  ✗"}`);}
+
 

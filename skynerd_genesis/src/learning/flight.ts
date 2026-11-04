@@ -18,6 +18,12 @@ import { Quaternion } from "../core/quaternion.js";
 import {
   DenseReward, EpisodeOutcome, FlightInstruments, classifyOutcome,
 } from "./instruments.js";
+import { levelOf } from "./instruments.js";
+import { ControlMode } from "./guardian.js";
+import {
+  AIPilot, AIGuidedInstructorPilot, AIPilotWithInstructor,
+  InstructorPilot, type Pilot, type PilotSighting,
+} from "./pilot.js";
 import { ServoPolicy, TensorNetwork, GOAL_FREE_FLIGHT,
          ELEMENT_FREE_FLIGHT, type TensorStateView } from "./servo-tensor.js";
 
@@ -108,7 +114,15 @@ export class LiveEpisode {
   private readonly steps: number;
   tick = 0;
   private outcome: string | null = null;
-  private lastChoices: Int32Array | null = null;
+  /** THE PILOTS — whose hands are on this drone's levers (sticky per
+   *  drone). The pilot is the mode: all mode logic lives in the Pilot
+   *  classes; the episode never branches on it. The default ("ai")
+   *  leaves the episode's behavior byte-identical with the golden
+   *  path. */
+  private readonly ai: AIPilot;
+  private readonly instructor: InstructorPilot;
+  private pilot: Pilot;
+  private mode: ControlMode = "ai";
 
   constructor(policy: ServoPolicy, instruments: FlightInstruments,
               epoch: number, rng: NumpyPcg64,
@@ -135,6 +149,10 @@ export class LiveEpisode {
     }
     this.aircraft = options.aircraft ?? new Aircraft(body);
     this.network = new TensorNetwork(policy, ELEMENT_FREE_FLIGHT, rng);
+    this.ai = new AIPilot(this.network, this.policy, rng,
+                          this.decisionEvery, springTowardNeutral);
+    this.instructor = new InstructorPilot(TRIM_COMMAND, true);
+    this.pilot = this.ai;
     this.dense = new DenseReward(instruments, 5.0);
     this.dense.reset(this.aircraft.body);
     this.steps = Math.floor((options.horizon ?? HORIZON) / DT);
@@ -165,16 +183,51 @@ export class LiveEpisode {
   /** The drone's decisions for the panel — the same contract as the
    *  classroom's ClassroomFlight.handInputs. */
   get handInputs(): HandDecisions {
-    return {
-      choices: this.lastChoices,
-      fresh: this.tick % this.decisionEvery < this.decisionEvery / 2,
-    };
+    return this.pilot.heldByInstructor
+      ? { choices: null, fresh: false }
+      : {
+        choices: this.ai.lastChoices,
+        fresh: this.tick % this.decisionEvery < this.decisionEvery / 2,
+      };
   }
 
   /** THE UI's STATE VIEW — the AI state log's snapshot of this
    *  drone's tensor network. */
   stateView(): TensorStateView {
     return this.network.stateView();
+  }
+
+  /** THE CONTROLS DROPDOWN — this drone's sticky mode. */
+  get controlsMode(): ControlMode {
+    return this.mode;
+  }
+
+  /** Swap the whole pilot — the mode IS the pilot object. A mid-air
+   *  swap re-seats the instructor's hand from the drone's CURRENT
+   *  lever targets, and the stabilizer captures the altitude where
+   *  the drone is now. */
+  setControlsMode(mode: ControlMode): void {
+    if (mode === this.mode) {
+      return;
+    }
+    this.mode = mode;
+    this.instructor.reseat(this.commands, this.aircraft.body);
+    switch (mode) {
+      case "ai": this.pilot = this.ai; break;
+      case "instructor": this.pilot = this.instructor; break;
+      case "both-suggest":
+        this.pilot = new AIGuidedInstructorPilot(this.ai, this.instructor);
+        break;
+      case "both-guarded":
+        this.pilot = new AIPilotWithInstructor(this.ai, this.instructor);
+        break;
+    }
+  }
+
+  /** Whether the instructor currently holds the levers (the status
+   *  line and the panel care). */
+  get instructorAtControls(): boolean {
+    return this.pilot.heldByInstructor;
   }
 
   /**
@@ -189,31 +242,47 @@ export class LiveEpisode {
         this.policy.reinforce(this.recent, this.pendingReward, this.epoch);
       }
       this.pendingReward = 0.0;
-      // The drone reads the MACHINE, not its own hand: the panel comes
-      // from the aircraft's current instruments (the body's physical
-      // truth and the surface positions the actuators actually hold) —
-      // the same reading the classroom's students get.
-      const sense = this.instruments.senseReading(this.aircraft.body,
-                                                  this.aircraft.surfacePositions);
-      const decision = this.network.decide(GOAL_FREE_FLIGHT, sense,
-                                            null, this.rng);
-      this.commands = this.policy.commandFrom(this.commands, decision.actions);
-      this.lastChoices = decision.actions;
-      // The reinforcement key is the servo tensor's observation prefix:
-      // the skill's forward. Only FIRED decisions earn credit — a hold
-      // (no news from the skill) has no key to credit.
-      if (decision.acted) {
-        this.recent.push([decision.key, decision.actions]);
-        if (this.recent.length > 10) {
-          this.recent.shift();
-        }
+    }
+    // THE PILOT AT THE CONTROLS: the mode IS the pilot object — the
+    // episode never branches on it. The pilot reads the sighting (the
+    // drone's own state, its free-flight null cursor, the stabilizer's
+    // teaching beside it) and produces this tick's control inputs.
+    const sighting: PilotSighting = {
+      dt: DT,
+      tick: this.tick,
+      body: this.aircraft.body,
+      groundM: this.world.terrainHeight(this.aircraft.body.position.x,
+                                        this.aircraft.body.position.y),
+      cursor: null,
+      sense: this.instruments.senseReading(this.aircraft.body,
+                                           this.aircraft.surfacePositions),
+      teaching: this.instructor.stabilizerTeaching(this.aircraft.body,
+        this.world.terrainHeight(this.aircraft.body.position.x,
+                                  this.aircraft.body.position.y)),
+      epoch: this.epoch,
+      goalId: GOAL_FREE_FLIGHT,
+      candidates: null,
+    };
+    this.commands = this.pilot.step(sighting, this.commands);
+    // The reinforcement key is the servo tensor's observation prefix:
+    // the skill's forward. Only the AI's own FIRED decisions earn
+    // credit — while the instructor holds the levers there is nothing
+    // of the drone's own to credit.
+    const decision = this.ai.lastDecision;
+    if (decision !== null && this.tick % this.decisionEvery === 0
+        && decision.acted && !this.pilot.heldByInstructor) {
+      this.recent.push([decision.key, decision.actions]);
+      if (this.recent.length > 10) {
+        this.recent.shift();
       }
     }
     this.aircraft.command(this.commands, DT);
     this.aircraft.step(DT, this.aircraft.body.position.z
       - this.world.terrainHeight(this.aircraft.body.position.x,
                                  this.aircraft.body.position.y));
-    this.commands = springTowardNeutral(this.commands, DT);
+    // The hands-off reflex: the AI's stick springs; the instructor's
+    // hand holds its own positions.
+    this.commands = this.pilot.relax(this.commands, DT);
     this.pendingReward += this.dense.tick(this.aircraft.body) + 0.0005;
     const outcome = classifyOutcome(this.aircraft.body, this.world,
                                     (this.tick + 1) * DT);

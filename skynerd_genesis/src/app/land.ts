@@ -3,14 +3,18 @@
  * texture over the world.
  *
  * The LOW-level texture is the checkerboard (src/app/ground.ts); this
- * module is the HIGH-level texture that decides what each square IS:
- * grass, dry, rocky, forest — and WATER: lakes in the lowlands, rivers
- * wandering through them. It is a 512x512 map of 16 m texels, repeating
- * every 8192 m, GENERATED at load from PERIODIC value noise
- * (quintic-interpolated lattice hashes): the regions are organic blobs
- * and bands, not square tiles, and the whole map is deterministic — the
- * same lake sits in the same place in every flight, every frame, on
- * every machine.
+ * module is the HIGH-level texture — a multidimensional ground
+ * MATERIAL: every texel carries not just its colour class but its
+ * HEIGHT. The 512x512 map of 16 m texels (repeating every 8192 m,
+ * generated at load from PERIODIC value noise — quintic-interpolated
+ * lattice hashes; deterministic: the same lake sits in the same place
+ * in every flight, every frame, on every machine) decides what each
+ * square IS — grass, dry, rocky, forest, WATER — and how HIGH it
+ * stands: rivers and lakes at LEVEL 0, every land surface ABOVE
+ * 10 ft (a bank at every waterline), rocky highlands rising to
+ * ~1000 ft. The AIRFIELD is carved to a flat plateau at 95 ft (the
+ * runway — the physics world's AIRFIELD, one shared shape), rimmed
+ * by a smooth blend into the natural terrain.
  *
  * The classifier reads three noise fields:
  *   h — land height (3 octaves): the lowlands hold the LAKES, the
@@ -31,6 +35,8 @@
  * on rock or water.
  */
 
+import { AIRFIELD } from "../core/world.js";
+
 /** The landscape's biomes: the base palettes the checker paints in. */
 export enum Biome {
   Grass = 0,
@@ -40,6 +46,25 @@ export enum Biome {
   Water = 4,
 }
 
+/** The world's light direction — the one sun the whole landscape obeys
+ *  (the terrain's relief shading, the objects' face shades, the
+ *  shadows, the glare): azimuth ~200\u00b0, elevation ~20\u00b0, unit length. */
+export const SUN_DIR: readonly [number, number, number] = (() => {
+  const v = [-0.88, -0.32, 0.35];
+  const l = Math.hypot(v[0], v[1], v[2]);
+  return [v[0] / l, v[1] / l, v[2] / l];
+})();
+
+/** The terrain's tallest hill, metres (~1000 ft). */
+export const TERRAIN_MAX = 305.0;
+/** The airfield's flat carve: the ellipse of plateau ground the runway
+ *  lives on (the shape shared with the physics world's AIRFIELD),
+ *  rimmed by a smooth roll into the natural terrain. */
+export const FIELD = { cx: AIRFIELD.cx, rx: AIRFIELD.rx, ry: AIRFIELD.ry, rim: 1.45 };
+/** The plateau's height: 95 ft — the runway's flat ground. The
+ *  aircraft's 100 ft takeoff datum is this plus 5 ft of landing gear,
+ *  so standing on the runway the instruments read 100 ft. */
+export const FIELD_ELEV = AIRFIELD.elev;
 /** The runway, in world metres: the FINITE 1.7 km lane along +X the
  *  school flies. Lived here so the flora can keep the airfield clear
  *  and the ground texture can paint it. */
@@ -91,6 +116,7 @@ export function hash01(ix: number, iy: number, salt: number): number {
 
 /** The high-level texture: 512x512 texels of 16 m, tiling every 8 km. */
 const TEX = 512;
+const TEX_MASK = TEX - 1;                    // 512 is a power of two: wrapping is a mask
 const TEXEL = 16.0;
 const PERIOD = TEX * TEXEL;               // 8192 m — the map's period
 
@@ -124,17 +150,17 @@ const DRY_M = 0.40;            // dry uplands turn yellow
 const DRY_H = 0.52;
 const RIVER_W = 0.030;         // the river band, in the r field
 const RIVER_MAX_H = 0.60;      // rivers only through the lowlands
-
-/** The airfield's clearing: an ellipse of plain grass under and around
- *  the runway, so the field never sits in a lake or on a scree. */
-function carvedGrass(x: number, y: number): boolean {
-  const dx = (x - 600.0) / 1050.0;
-  const dy = y / 420.0;
-  return dx * dx + dy * dy < 1.0;
-}
+const RIVER_VALLEY_W = 0.090;  // the river's valley, 3x the band: wide
+                               // gentle banks (the water's own width +
+                               // the land's roll down to it)
+/** The LAND's floor: every land surface stands above 10 ft — the bank
+ *  at every waterline (water at 0, the land never lower than this). */
+const LAND_MIN = 3.2;
 
 /** The world's tileable ground plan, one Biome per texel. */
 const MAP: Uint8Array = new Uint8Array(TEX * TEX);
+/** The same map's HEIGHT channel, metres above level 0. */
+const HEIGHT: Float32Array = new Float32Array(TEX * TEX);
 {
   for (let ty = 0; ty < TEX; ty++) {
     const v = (ty + 0.5) / TEX;
@@ -146,9 +172,11 @@ const MAP: Uint8Array = new Uint8Array(TEX * TEX);
       const h = 0.55 * vnoise(u, v, 6, 21)
               + 0.28 * vnoise(u, v, 13, 22)
               + 0.17 * vnoise(u, v, 27, 23);
-      // the river field: its midline crossings are the river's course
-      const river = Math.abs(vnoise(u, v, 5, 26) - 0.5) < RIVER_W;
-      let biome: Biome;
+      // the river field: its midline crossings are the river's course;
+      // the margin (0 at the midline, 1 at the band's edge) shapes the
+      // valley — the water's width and its banks' gentle roll
+      const riverMargin = Math.abs(vnoise(u, v, 5, 26) - 0.5) / RIVER_W;
+      const river = riverMargin < 1.0;      let biome: Biome;
       if (h < WATER_LEVEL || (river && h < RIVER_MAX_H)) {
         biome = Biome.Water;
       } else if (h < SHORE_LEVEL) {
@@ -164,11 +192,91 @@ const MAP: Uint8Array = new Uint8Array(TEX * TEX);
       }
       const wxRaw = (tx + 0.5) * TEXEL;
       const wx = wxRaw > PERIOD / 2 ? wxRaw - PERIOD : wxRaw;
-      if (carvedGrass(wx, wy)) {
-        biome = Biome.Grass;             // the airfield's clearing
+      // THE HEIGHT CHANNEL: WATER FLAT AT LEVEL 0 — lakes and rivers
+      // alike, the whole water plane; the LAND ramping from its floor
+      // (LAND_MIN, just above 10 ft: the bank at every waterline)
+      // through the low ground (t^1.6) to the rocky highlands at the
+      // cap
+      const t = Math.min(1.0, Math.max(0.0, (h - WATER_LEVEL) / 0.55));
+      const ramp = LAND_MIN + (TERRAIN_MAX - LAND_MIN) * t ** 1.6;
+      let elev = 0.0;
+      if (biome !== Biome.Water) {
+        elev = ramp;
+        // THE RIVER'S VALLEY: the land rolls gently down around the
+        // river's water — from the plain to the floor across a valley
+        // 3x the band's width (wide banks, no shimmer), shallowing to
+        // nothing before the RIVER_MAX_H cutoff so a river's source
+        // never cliffs
+        const valleyMargin = riverMargin * RIVER_W / RIVER_VALLEY_W;
+        if (valleyMargin < 1.0 && h < RIVER_MAX_H) {
+          const inner = RIVER_W / RIVER_VALLEY_W;
+          const wall = Math.max(0.0, (valleyMargin - inner)
+            / (1.0 - inner)) ** 1.5;
+          const headFade = Math.min(1.0,
+            Math.max(0.0, (RIVER_MAX_H - h) / 0.08));
+          const dip = 1.0 - (1.0 - wall) * headFade;
+          elev = LAND_MIN + (ramp - LAND_MIN) * dip;
+        }
+      }
+      // the field's carve: the plateau at FIELD_ELEV (95 ft — the
+      // runway's flat ground, the physics world's AIRFIELD), rimmed by
+      // a smooth roll into the natural terrain
+      const dx = (wx - FIELD.cx) / FIELD.rx;
+      const dy = wy / FIELD.ry;
+      const w = dx * dx + dy * dy;
+      if (w < FIELD.rim) {
+        if (w < 1.0) {
+          elev = FIELD_ELEV;
+        } else {
+          const r = (w - 1.0) / (FIELD.rim - 1.0);
+          const s = r * r * (3.0 - 2.0 * r);
+          // the rim rolls toward the natural terrain but never below
+          // the land's floor — where the rim reaches water, the apron
+          // banks at LAND_MIN like every other waterline
+          const target = Math.max(elev, LAND_MIN);
+          elev = FIELD_ELEV + (target - FIELD_ELEV) * s;
+        }
+        biome = Biome.Grass;             // the airfield's clearing + apron
       }
       MAP[ty * TEX + tx] = biome;
+      HEIGHT[ty * TEX + tx] = elev;
     }
+  }
+}
+
+// The coarse-max pyramid over HEIGHT: each level's block carries the
+// tallest height of its texels plus a one-texel ring (hermite
+// heightAt's bilinear window reaches one texel over), so a ray
+// provably above a block's max is above the terrain through it.
+// Level l blocks are 2^l texels wide: 32 m to 2048 m at l = 1..7.
+export const MAXMIP_LEVELS = 7;
+const MAXMIP: Float32Array[] = [];
+{
+  let prev: Float32Array = HEIGHT;
+  let prevSize = TEX;
+  for (let lvl = 1; lvl <= MAXMIP_LEVELS; lvl++) {
+    const size = TEX >> lvl;
+    const cur = new Float32Array(size * size);
+    for (let by = 0; by < size; by++) {
+      for (let bx = 0; bx < size; bx++) {
+        let m = 0.0;
+        // the 2x2 children plus the ring of children around them
+        for (let cy = 2 * by - 1; cy <= 2 * by + 2; cy++) {
+          const wy = ((cy % prevSize) + prevSize) % prevSize;
+          for (let cx = 2 * bx - 1; cx <= 2 * bx + 2; cx++) {
+            const wx = ((cx % prevSize) + prevSize) % prevSize;
+            const v = prev[wy * prevSize + wx];
+            if (v > m) {
+              m = v;
+            }
+          }
+        }
+        cur[by * size + bx] = m;
+      }
+    }
+    MAXMIP.push(cur);
+    prev = cur;
+    prevSize = size;
   }
 }
 
@@ -192,9 +300,63 @@ export class LandUse {
 
   /** The biome that owns the ground point. */
   biomeAt(x: number, y: number): Biome {
-    const ix = (((Math.floor(x / TEXEL) % TEX) + TEX) % TEX) | 0;
-    const iy = (((Math.floor(y / TEXEL) % TEX) + TEX) % TEX) | 0;
+    const ix = Math.floor(x / TEXEL) & TEX_MASK;
+    const iy = Math.floor(y / TEXEL) & TEX_MASK;
     return MAP[iy * TEX + ix] as Biome;
+  }
+  /** Whether (x, y) lies inside the airfield's flat carve — through
+   *  the whole ellipse the terrain is exactly level 0. */
+  inField(x: number, y: number): boolean {
+    const fx = (x - FIELD.cx) / FIELD.rx;
+    const fy = y / FIELD.ry;
+    return fx * fx + fy * fy < 1.0;
+  }
+
+  /** The tallest terrain within the 2^lvl-texel block containing
+   *  (x, y), ring included — the marching ray's skip-ahead bound. */
+  maxHeightAt(x: number, y: number, lvl: number): number {
+    const ix = Math.floor(x / TEXEL) & TEX_MASK;
+    const iy = Math.floor(y / TEXEL) & TEX_MASK;
+    const size = TEX >> lvl;
+    return MAXMIP[lvl - 1][(iy >> lvl) * size + (ix >> lvl)];
+  }
+
+  /** The terrain's height at a world point, metres above level 0 —
+   *  hermite-interpolated off the height channel (smooth normals, no
+   *  grid faceting), seamlessly tileable with the map. */
+  heightAt(x: number, y: number): number {
+    const gx = x / TEXEL - 0.5;
+    const gy = y / TEXEL - 0.5;
+    const ix = Math.floor(gx);
+    const iy = Math.floor(gy);
+    const sx = gx - ix;
+    const sy = gy - iy;
+    const fx = sx * sx * (3.0 - 2.0 * sx);
+    const fy = sy * sy * (3.0 - 2.0 * sy);
+    const x0 = ix & TEX_MASK;
+    const y0 = iy & TEX_MASK;
+    const x1 = (x0 + 1) & TEX_MASK;
+    const y1 = (y0 + 1) & TEX_MASK;
+    const h00 = HEIGHT[y0 * TEX + x0];
+    const h10 = HEIGHT[y0 * TEX + x1];
+    const h01 = HEIGHT[y1 * TEX + x0];
+    const h11 = HEIGHT[y1 * TEX + x1];
+    const a = h00 + (h10 - h00) * fx;
+    const b = h01 + (h11 - h01) * fx;
+    return a + (b - a) * fy;
+  }
+
+  /** The terrain's surface normal at a world point (unit length) —
+   *  central differences at one texel's spacing. Flat ground reads
+   *  (0, 0, 1); the hills lean with their slopes. */
+  normalAt(x: number, y: number): [number, number, number] {
+    const hx = this.heightAt(x + TEXEL, y) - this.heightAt(x - TEXEL, y);
+    const hy = this.heightAt(x, y + TEXEL) - this.heightAt(x, y - TEXEL);
+    const d = 2.0 * TEXEL;
+    const nx = -hx / d;
+    const ny = -hy / d;
+    const l = Math.hypot(nx, ny, 1.0);
+    return [nx / l, ny / l, 1.0 / l];
   }
 
   /** Signed distances to the nearest road centreline of each family
