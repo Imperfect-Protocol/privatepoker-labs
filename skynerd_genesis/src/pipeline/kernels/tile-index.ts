@@ -30,7 +30,8 @@ export const TILE_CAP = 64;
 const TILES_MAX = 8192;
 
 // One index-map module per instance-record KIND (the record struct and
-// the entry point differ; the projection law — indexOne — is shared).
+// the entry point differ; the tile-append law — indexOne — is shared,
+// and the quads carry their own corner law on top of it).
 function indexWgsl(record: string, entry: "quads" | "trees"): string {
   const bindings = /* wgsl */ `
 @group(1) @binding(0) var<storage, read> instances : Instances;
@@ -41,9 +42,10 @@ function indexWgsl(record: string, entry: "quads" | "trees"): string {
 const TILE_CAP : u32 = ${TILE_CAP};
 `;
   const indexOne = /* wgsl */ `
-// One instance's world centre + radius -> screen box -> tile range ->
-// flags + list appends. Every branch reads the buffers/uniform: the
-// conditional-ops law of this pipeline.
+// One SMALL instance's world centre + radius -> screen box -> tile
+// range -> flags + list appends (the trees' law: their footprint is
+// honestly inside the radius). Every branch reads the buffers/uniform:
+// the conditional-ops law of this pipeline.
 fn indexOne(gi : u32, centre : vec3f, radius : f32) {
   atomicStore(&flags[gi], 0u);
   let clip = frame.viewProj * vec4f(centre, 1.0);
@@ -84,6 +86,81 @@ fn indexOne(gi : u32, centre : vec3f, radius : f32) {
   }
 }
 `;
+
+// THE QUAD'S OWN LAW: terrain is the camera's ground — the quad it
+// stands on (or any quad crossing the near plane) is visible from a
+// fragment of its footprint even when its CENTRE is behind the eye.
+// A quad dies only when ALL FOUR corners (at their terrain heights)
+// sit behind the near plane; the screen box comes from the corners
+// in front, so a straddling quad still lands its tiles.
+const indexQuad = /* wgsl */ `
+fn indexQuad(gi : u32, q : Quad) {
+  atomicStore(&flags[gi], 0u);
+  var corners = array<vec3f, 4>(
+    vec3f(q.x, q.y, heightAt(vec2f(q.x, q.y))),
+    vec3f(q.x + q.size, q.y, heightAt(vec2f(q.x + q.size, q.y))),
+    vec3f(q.x, q.y + q.size, heightAt(vec2f(q.x, q.y + q.size))),
+    vec3f(q.x + q.size, q.y + q.size,
+          heightAt(vec2f(q.x + q.size, q.y + q.size))));
+  var anyFront = false;
+  var minW = 1e9;
+  var farX0 = 1e9; var farX1 = -1e9;
+  var farY0 = 1e9; var farY1 = -1e9;
+  for (var i = 0; i < 4; i = i + 1) {
+    let clip = frame.viewProj * vec4f(corners[i], 1.0);
+    if (clip.w <= 0.25) {
+      continue;                        // this corner is behind the eye
+    }
+    anyFront = true;
+    minW = min(minW, clip.w);
+    if (clip.w > 1.0) {                // a stable screen position
+      let ndc = clip.xyz / clip.w;
+      let sx = (ndc.x * 0.5 + 0.5) * frame.up.w;
+      let sy = (1.0 - (ndc.y * 0.5 + 0.5)) * frame.fwd.w;
+      farX0 = min(farX0, sx); farX1 = max(farX1, sx);
+      farY0 = min(farY0, sy); farY1 = max(farY1, sy);
+    }
+  }
+  if (!anyFront) {
+    return;                            // the whole footprint is behind
+  }
+  let W = frame.up.w;
+  let H = frame.fwd.w;
+  // no corner far enough for a clean projection: the camera is IN the
+  // quad's footprint at the near plane — it sweeps the whole view
+  if (farX1 < farX0) {
+    farX0 = 0.0; farX1 = W; farY0 = 0.0; farY1 = H;
+  } else {
+    // the clipped polygon also carries the near-plane crossings of
+    // the quad's edges — pad the box by the footprint's projected
+    // radius at the nearest front corner, the honest bound on that
+    // sweep, so a straddling quad is never culled off-screen
+    let pad = frame.right.w * q.size * 0.75 / max(minW, 0.25);
+    farX0 -= pad; farX1 += pad; farY0 -= pad; farY1 += pad;
+  }
+  let tilePx = frame.params.w;
+  let cols = i32(frame.params.y);
+  let rows = i32(frame.params.z);
+  let tx0 = clamp(i32(floor(farX0 / tilePx)), 0, cols - 1);
+  let tx1 = clamp(i32(floor(farX1 / tilePx)), 0, cols - 1);
+  let ty0 = clamp(i32(floor(farY0 / tilePx)), 0, rows - 1);
+  let ty1 = clamp(i32(floor(farY1 / tilePx)), 0, rows - 1);
+  if (tx0 > tx1 || ty0 > ty1 || farX1 < 0.0 || farX0 > W
+      || farY1 < 0.0 || farY0 > H) {
+    return;                            // the whole box is off-screen
+  }
+  atomicStore(&flags[gi], 1u);
+  for (var ty = ty0; ty <= ty1; ty++) {
+    for (var tx = tx0; tx <= tx1; tx++) {
+      let tile = u32(ty) * u32(cols) + u32(tx);
+      let slot = atomicAdd(&tileCounters[tile], 1u);
+      if (slot < TILE_CAP) {
+        tileItems[tile * TILE_CAP + slot] = gi;
+      }
+    }
+  }
+}
+`;
   const quadEntry = /* wgsl */ `
 @compute @workgroup_size(64)
 fn indexQuads(@builtin(global_invocation_id) gid : vec3u) {
@@ -91,9 +168,7 @@ fn indexQuads(@builtin(global_invocation_id) gid : vec3u) {
   if (gi >= countBuf) {
     return;
   }
-  let q = instances.quads[gi];
-  let c = vec2f(q.x + q.size * 0.5, q.y + q.size * 0.5);
-  indexOne(gi, vec3f(c.x, c.y, heightAt(c)), q.size * 0.75);
+  indexQuad(gi, instances.quads[gi]);
 }
 `;
   const treeEntry = /* wgsl */ `
@@ -112,7 +187,7 @@ fn indexTrees(@builtin(global_invocation_id) gid : vec3u) {
   indexOne(gi, centre, max(tr.r * 1.5, tr.h) * 0.6);
 }
 `;
-  const entries = entry === "quads" ? quadEntry : treeEntry;
+  const entries = entry === "quads" ? indexQuad + quadEntry : treeEntry;
   return WGSL_COMMON + record + bindings + indexOne + entries;
 }
 

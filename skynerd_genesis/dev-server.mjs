@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8000);
 const roots = {
-  "/": path.join(here, "web"),
+  "/": here,
   "/build-web/": path.join(here, "build-web"),
   "/reference/": path.join(here, "reference"),
 };

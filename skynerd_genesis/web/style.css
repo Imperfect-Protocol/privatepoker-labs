@@ -142,7 +142,10 @@ label select { text-transform: none; }
   flex-direction: column;
   gap: 8px;
   padding: 10px;
-  background: var(--panel);
+  /* THE PANEL'S BLACK PLINTH: the bottom band under the view reads
+     as the dashboard's own base — solid black from the foot to the
+     panel's bottom edge, so no margin can ever read as view leaking */
+  background: linear-gradient(to top, #000 48px, var(--panel) 48px);
   overflow: hidden;         /* the panels size themselves; nothing spills */
 }
 /* dragged shut by the grip: a zero-width column with no padding sliver */
@@ -231,7 +234,17 @@ label.cb {
 label.cb input {
   accent-color: var(--accent);
 }
-#cockpit-foot { color: var(--dim); font-size: 10px; letter-spacing: 0.05em; min-height: 13px; }
+/* THE PANEL'S BLACK BASE: the strip under the view reads as the
+   dashboard's own plinth — solid black, edge to edge, so no margin
+   under the controls can ever read as view sneaking through. The
+   negative top margin seats it on the view's bottom border; the side
+   and bottom margins carry it past the panel's padding to its edges. */
+#cockpit-foot {
+  color: var(--dim); font-size: 10px; letter-spacing: 0.05em; min-height: 13px;
+  background: #000;
+  margin: -9px -10px -10px;
+  padding: 5px 10px 9px;
+}
 
 /* --- results panel (bottom edge, ending at the sidebar's left edge) -------- */
 #results {
@@ -332,6 +345,34 @@ td .ok { color: var(--good); }
 td .bad { color: var(--bad); }
 td .na { color: var(--dim); }
 #school td:nth-child(2) { color: var(--dim); }
+
+/* --- the splash screen -------------------------------------------------------
+ * The poster's own moment (the vite app's splash law): the page loads
+ * behind the full-bleed poster, it holds a beat, then fades out. The
+ * two URLs layer the same asset for both servers — /splash.png for
+ * the deployed build (public/ lands at the root), /public/splash.png
+ * for the dev server (the repo root IS the web root); the one that
+ * 404s is simply never painted. */
+#splash {
+  position: fixed;
+  inset: 0;
+  z-index: 150;              /* over the boot dialog (100), under nothing */
+  cursor: pointer;           /* the whole poster is the skip button */
+  opacity: 1.0;
+  transition: opacity 0.7s ease;
+  background: #05070c;
+  background-image:
+    url("/splash.png"),
+    url("/public/splash.png");
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: cover;
+}
+#splash.fading { opacity: 0.0; pointer-events: none; }
+#splash.gone { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  #splash { transition-duration: 0.15s; }
+}
 
 /* --- boot pre-learning dialog ----------------------------------------------
  * Black screen, the terminal dialog in the middle: the training log

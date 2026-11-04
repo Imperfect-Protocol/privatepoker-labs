@@ -21,11 +21,14 @@ import {
 import { levelOf } from "./instruments.js";
 import { ControlMode } from "./guardian.js";
 import {
-  AIPilot, AIGuidedInstructorPilot, AIPilotWithInstructor,
-  InstructorPilot, type Pilot, type PilotSighting,
+  AiPilot, InstructorPilot, type AiBrainState, type PilotSighting,
 } from "./pilot.js";
-import { ServoPolicy, TensorNetwork, GOAL_FREE_FLIGHT,
-         ELEMENT_FREE_FLIGHT, type TensorStateView } from "./servo-tensor.js";
+import {
+  AircraftController, controllerFor,
+} from "./aircraft-controller.js";
+import {
+  ELEMENT_FREE_FLIGHT, GOAL_FREE_FLIGHT, type TensorStateView,
+} from "./servo-tensor.js";
 
 export const TRIM_SPEED = 38.0;       // m/s — 85 mph, the C172 economy cruise
 export const HORIZON = 20.0;
@@ -83,6 +86,11 @@ export interface EpisodeOptions {
   /** An existing machine to fly (its body must already be positioned);
    *  by default the episode builds its own. */
   aircraft?: Aircraft;
+  /** THE DRONE'S OWN PILOT to fly this life with (the carpet's drones:
+   *  the flock's living shard IS the flying brain, its learning stays
+   *  in the shard and its death scream carries it); by default the
+   *  episode grows its own from the brain token. */
+  pilot?: AiPilot;
   /** The episode's horizon, seconds — how long the DRONE SIDE of the
    *  library flies before calling the episode survived. Infinity means
    *  NO expiry: the flight lives until it crashes, stalls, or leaves
@@ -97,40 +105,32 @@ export class LiveEpisode {
   private readonly world = new World({ halfExtent: 800.0 });
   private readonly dense: DenseReward;
   /** The controller's command state — the hand at the controls. */
-  private commands = Float64Array.from(TRIM_COMMAND);
-  private readonly policy: ServoPolicy;
+  private commands: Float64Array = Float64Array.from(TRIM_COMMAND);
   private readonly instruments: FlightInstruments;
   private readonly epoch: number;
-  private readonly rng: NumpyPcg64;
-  /** The drone's tensor network: the seven tensors as dispatcher
-   *  nodes on the shared queue — stun on input, fire on relaxation,
-   *  message the law's thresholded projection. Free flight has no
-   *  maneuver chain; the sensors' codes and the skill's coherence
-   *  are the servo's whole input. */
-  private readonly network: TensorNetwork;
-  private readonly recent: Array<[readonly number[], Int32Array]> = [];
   private pendingReward = 0.0;
   private readonly decisionEvery = 10;
   private readonly steps: number;
   tick = 0;
   private outcome: string | null = null;
-  /** THE PILOTS — whose hands are on this drone's levers (sticky per
-   *  drone). The pilot is the mode: all mode logic lives in the Pilot
-   *  classes; the episode never branches on it. The default ("ai")
-   *  leaves the episode's behavior byte-identical with the golden
-   *  path. */
-  private readonly ai: AIPilot;
+  /** THE AI — THE DRONE'S ENCAPSULATED TENSOR BRAIN: every tensor
+   *  lives inside it (the memory, the pulsating network, the error
+   *  neurons); the episode never sees one. Free flight has no
+   *  maneuver chain; the sensors' codes and the skill's coherence
+   *  are the servo's whole input. */
+  readonly ai: AiPilot;
   private readonly instructor: InstructorPilot;
-  private pilot: Pilot;
+  /** THE CONTROLLER at the machine's controls (the mode IS the
+   *  controller: all mode logic lives in the AircraftController
+   *  classes; the episode never branches on it). */
+  private controller: AircraftController;
   private mode: ControlMode = "ai";
 
-  constructor(policy: ServoPolicy, instruments: FlightInstruments,
+  constructor(brain: AiBrainState | null, instruments: FlightInstruments,
               epoch: number, rng: NumpyPcg64,
               options: EpisodeOptions = {}) {
-    this.policy = policy;
     this.instruments = instruments;
     this.epoch = epoch;
-    this.rng = rng;
     const body = options.aircraft !== undefined
       ? options.aircraft.body
       : new RigidBody(
@@ -148,18 +148,28 @@ export class LiveEpisode {
       body.velocity = new Vec3(14.0, 0.0, -4.0);
     }
     this.aircraft = options.aircraft ?? new Aircraft(body);
-    this.network = new TensorNetwork(policy, ELEMENT_FREE_FLIGHT, rng);
-    this.ai = new AIPilot(this.network, this.policy, rng,
-                          this.decisionEvery, springTowardNeutral);
+    // THE BRAIN — constructed exactly where the network used to draw
+    // (the frozen stream: the spiral dice, then the network's seeds).
+    // A drone that brings its own pilot flies it (a fresh life over
+    // the same memory); otherwise the episode grows its own from the
+    // brain token.
+    this.ai = options.pilot ?? new AiPilot({ seedRng: rng,
+      decisionEvery: this.decisionEvery, spring: springTowardNeutral,
+      startElementId: ELEMENT_FREE_FLIGHT });
+    if (options.pilot === undefined && brain !== null) {
+      this.ai.inherit(brain);
+    }
+    this.ai.beginFlight(ELEMENT_FREE_FLIGHT);
+    if (options.epsilonOverride !== undefined
+        && options.epsilonOverride !== null) {
+      this.ai.setExploration(options.epsilonOverride);
+    }
     this.instructor = new InstructorPilot(TRIM_COMMAND, true);
-    this.pilot = this.ai;
+    this.controller = controllerFor(this.aircraft, this.mode, this.ai,
+                                    this.instructor);
     this.dense = new DenseReward(instruments, 5.0);
     this.dense.reset(this.aircraft.body);
     this.steps = Math.floor((options.horizon ?? HORIZON) / DT);
-    if (options.epsilonOverride !== undefined
-        && options.epsilonOverride !== null) {
-      policy.epsilon = options.epsilonOverride;
-    }
   }
 
   /** Survival so far, seconds (the episode's length once it has ended). */
@@ -183,10 +193,10 @@ export class LiveEpisode {
   /** The drone's decisions for the panel — the same contract as the
    *  classroom's ClassroomFlight.handInputs. */
   get handInputs(): HandDecisions {
-    return this.pilot.heldByInstructor
+    return this.controller.heldByInstructor
       ? { choices: null, fresh: false }
       : {
-        choices: this.ai.lastChoices,
+        choices: this.ai.choices,
         fresh: this.tick % this.decisionEvery < this.decisionEvery / 2,
       };
   }
@@ -194,7 +204,7 @@ export class LiveEpisode {
   /** THE UI's STATE VIEW — the AI state log's snapshot of this
    *  drone's tensor network. */
   stateView(): TensorStateView {
-    return this.network.stateView();
+    return this.ai.stateView;
   }
 
   /** THE CONTROLS DROPDOWN — this drone's sticky mode. */
@@ -211,23 +221,15 @@ export class LiveEpisode {
       return;
     }
     this.mode = mode;
-    this.instructor.reseat(this.commands, this.aircraft.body);
-    switch (mode) {
-      case "ai": this.pilot = this.ai; break;
-      case "instructor": this.pilot = this.instructor; break;
-      case "both-suggest":
-        this.pilot = new AIGuidedInstructorPilot(this.ai, this.instructor);
-        break;
-      case "both-guarded":
-        this.pilot = new AIPilotWithInstructor(this.ai, this.instructor);
-        break;
-    }
+    this.controller = controllerFor(this.aircraft, mode, this.ai,
+      this.instructor,
+      { commands: this.commands, body: this.aircraft.body });
   }
 
   /** Whether the instructor currently holds the levers (the status
    *  line and the panel care). */
   get instructorAtControls(): boolean {
-    return this.pilot.heldByInstructor;
+    return this.controller.heldByInstructor;
   }
 
   /**
@@ -238,9 +240,7 @@ export class LiveEpisode {
    */
   step(): boolean {
     if (this.tick % this.decisionEvery === 0) {
-      if (this.recent.length > 0) {
-        this.policy.reinforce(this.recent, this.pendingReward, this.epoch);
-      }
+      this.ai.credit(this.pendingReward, this.epoch);
       this.pendingReward = 0.0;
     }
     // THE PILOT AT THE CONTROLS: the mode IS the pilot object — the
@@ -263,26 +263,17 @@ export class LiveEpisode {
       goalId: GOAL_FREE_FLIGHT,
       candidates: null,
     };
-    this.commands = this.pilot.step(sighting, this.commands);
-    // The reinforcement key is the servo tensor's observation prefix:
-    // the skill's forward. Only the AI's own FIRED decisions earn
-    // credit — while the instructor holds the levers there is nothing
-    // of the drone's own to credit.
-    const decision = this.ai.lastDecision;
-    if (decision !== null && this.tick % this.decisionEvery === 0
-        && decision.acted && !this.pilot.heldByInstructor) {
-      this.recent.push([decision.key, decision.actions]);
-      if (this.recent.length > 10) {
-        this.recent.shift();
-      }
-    }
+    this.commands = this.controller.step(sighting, this.commands);
+    // The AI's own fired decisions earn credit — the eligibility's
+    // bookkeeping lives inside the brain now (the controllers tell it
+    // whose hands fly).
     this.aircraft.command(this.commands, DT);
     this.aircraft.step(DT, this.aircraft.body.position.z
       - this.world.terrainHeight(this.aircraft.body.position.x,
                                  this.aircraft.body.position.y));
     // The hands-off reflex: the AI's stick springs; the instructor's
     // hand holds its own positions.
-    this.commands = this.pilot.relax(this.commands, DT);
+    this.commands = this.controller.relax(this.commands, DT);
     this.pendingReward += this.dense.tick(this.aircraft.body) + 0.0005;
     const outcome = classifyOutcome(this.aircraft.body, this.world,
                                     (this.tick + 1) * DT);
@@ -296,21 +287,17 @@ export class LiveEpisode {
 
   /** The episode's epilogue: the final reinforcement, exactly once. */
   private finish(outcome: string | null): void {
-    this.outcome = outcome;
-    if (outcome === EpisodeOutcome.CRASHED || outcome === EpisodeOutcome.STALLED) {
-      this.policy.reinforce(this.recent, -2.0, this.epoch);
-    } else if (outcome === null) {
-      this.outcome = EpisodeOutcome.ALIVE;
-      this.policy.reinforce(this.recent, 0.5, this.epoch);
-    }
+    this.outcome = outcome === null ? EpisodeOutcome.ALIVE : outcome;
+    this.ai.settle(outcome, this.epoch);
   }
 }
 
 /** Run one episode headless (the library fast path). */
-export function flyEpisode(policy: ServoPolicy, instruments: FlightInstruments,
+export function flyEpisode(brain: AiBrainState | null,
+                           instruments: FlightInstruments,
                            epoch: number, rng: NumpyPcg64,
                            options: EpisodeOptions = {}): EpisodeResult {
-  const episode = new LiveEpisode(policy, instruments, epoch, rng, options);
+  const episode = new LiveEpisode(brain, instruments, epoch, rng, options);
   while (episode.step()) { /* fly to completion */ }
   // The record is the MACHINE's, read through its sealed getters.
   return {

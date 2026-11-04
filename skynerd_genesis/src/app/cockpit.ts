@@ -1662,9 +1662,14 @@ function hideInk(canvas: HTMLCanvasElement): void {
  *  vertical sides, and a straight bottom flush with the canvas's
  *  bottom edge — the console sits on the cockpit floor. The canvas is
  *  the bounding box; this path is the panel. */
+/** The dashboard's shoulder round — one law for the shape and its edge. */
+function shoulderOf(W: number, H: number): number {
+  return Math.min(H * 0.45, W * 0.055);
+}
+
 function dashboardPath(ctx: CanvasRenderingContext2D,
                        W: number, H: number): void {
-  const r = Math.min(H * 0.45, W * 0.055);   // the shoulders' round
+  const r = shoulderOf(W, H);               // the shoulders' round
   ctx.beginPath();
   ctx.moveTo(r, 0.0);
   ctx.lineTo(W - r, 0.0);
@@ -1689,7 +1694,7 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
   const body = ctx.createLinearGradient(0.0, 0.0, 0.0, H);
   body.addColorStop(0.0, "#0d1622");
   body.addColorStop(0.10, "#060c14");
-  body.addColorStop(1.0, "#03060b");
+  body.addColorStop(1.0, "#000000");   // the bottom edge: just black
   ctx.fillStyle = body;
   ctx.fillRect(0.0, 0.0, W, H);
   const s = view;
@@ -1883,9 +1888,17 @@ export function drawControlsView(canvas: HTMLCanvasElement, view: DroneView): vo
     ctx.fillText("CONTROLS FROZEN", W / 2, midY + H * 0.32);
   }
   ctx.restore();                 // the dashboard's shape ends here
-  // the console's lit edge: a thin highlight along the whole sill,
-  // so the panel reads as a physical slab against the world
-  dashboardPath(ctx, W, H);
+  // the console's lit edge: the highlight rides the sill's TOP and
+  // SIDES only — the BOTTOM EDGE IS JUST BLACK, so the slab ends
+  // solid against its base with no line along the world
+  const r = shoulderOf(W, H);
+  ctx.beginPath();
+  ctx.moveTo(0.5, H);
+  ctx.lineTo(0.5, r);
+  ctx.quadraticCurveTo(0.5, 0.5, r, 0.5);
+  ctx.lineTo(W - r, 0.5);
+  ctx.quadraticCurveTo(W - 0.5, 0.5, W - 0.5, r);
+  ctx.lineTo(W - 0.5, H);
   ctx.strokeStyle = "rgba(130,170,200,0.30)";
   ctx.lineWidth = 1;
   ctx.stroke();
