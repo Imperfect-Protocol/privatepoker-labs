@@ -550,3 +550,67 @@ map hides at the floor and reopens tracking; sidebar hides under 10%
 and reopens at its last width; the seam scan shows the 1px border column
 (fixed). Takeoff probe to 4.9 k ft: the band rows read fog, not black.
 npm test: 9 suites green (pipeline 236). Both tsconfigs clean.
+
+## §16 the side panes' shade parity — one sky, three panes
+
+**The diagnosis** (the user's screenshots): the side panes rendered only
+the bare GPU world — the sun's disc+glow (drawSun), the glare veil, the
+lens flare, the tower, the houses and the CLOUDS are all 2D ink on the
+centre pane's light/HUD canvases, so the sides wore a different sky.
+
+**The law**: every pane of the windshield gets its OWN additive ink
+canvas. #lightCanvasL and #lightCanvasR sit over their world panes
+(plus-lighter, like the centre's #lightCanvas), placed by the same
+layoutSidebar thirds. drawSideViewport now takes the pane's ink canvas
+and draws the centre's exact light laws through the yawed camera:
+drawSun + drawLensFlare + drawSunGlare (the glare gate from the toolbar,
+the iris exposure inside each) in "lighter" ink, then drawWorldObjects
+(the tower, the hamlet houses, the CLOUDS — withTrees=false: the GPU
+instances the forest itself, so the CPU painter trees must not
+double-draw). No HUD instruments on the sides — peripheral vision.
+hideInk clears a pane's ink when it rests.
+
+**The floating controls grew**: the console slab is now 1.5× the centre
+pane's width (min(viewW, centreW*1.5)), centred on the windshield, so it
+reaches half-way across each side pane — its own height law unchanged.
+
+**Verified** (CDP probes + pixel scans): the side ink layers render
+(LUM-INK L 22.5, R 25.6 — sun glow, veil, clouds), zero console errors;
+the seam continuity holds with glare ON and OFF — sky rows differ ~12
+(texture noise), terrain rows ≤36 (field edges at the seam), 0 at the
+slab; the one 45-diff spot at the C|R seam is the sun glow's own radial
+gradient (its steepest region), not a projection jump — a discontinuity
+would shift EVERY sky row by the yaw. The sun's glow is visible in the
+left pane (the noon sun stands forward-left); the clouds ride all three
+panes now. npm test 9 suites green; both tsconfigs clean.
+
+## §17 one environment, three windows + the plane dashboard
+
+**THE SHARED LIGHT** (the user's parity demand): the glare veil and the
+lens flare used to compute their strength from EACH PANE'S own
+sun-align — a yawed camera faces the sun differently, so the sides wore
+a different veil strength than the centre (the user's screenshots).
+Now drawCockpitView computes the light ONCE per frame from the CENTRE
+pane's camera — sharedLight {align, exposure} — and drawSunGlare /
+drawLensFlare read it for every pane; only the sun's SCREEN POSITION is
+each pane's own projection (the iris was already shared: one reflex,
+one exposure for the whole windshield). One environment, three
+windows; the projection differs, nothing else.
+
+**THE PLANE DASHBOARD** (the user's drawn shape): the controls console
+is no longer a rectangle. dashboardPath() paints a real instrument
+panel's silhouette — rounded top corners (the glareshield's shoulders),
+straight vertical sides, a shallow-U bottom whose ends RISE so the
+world shows through the canvas's bottom corners. The canvas's own CSS
+body/border are gone: the path IS the panel (a vertical body gradient
+from the lit lip #0d1622 down to the console's #03060b, a thin
+highlight stroke along the whole sill). Verified by alpha probe:
+top corners 0, body 255, bottom corners 0, the U's ends 39 — the
+corners are transparent, the world glows through.
+
+**Sunset parity, pixel-walked**: the sun's disc straddled the C|R seam
+in the probe shot; the walk shows the sky rows matching across both
+seams (12 diff = texture noise; the veil's gradient steps 3–7 units
+continuously across the boundary), the disc's rim legitimately jumping
+(the sun's own edge at x≈781), the terrain greens matching within 4.
+npm test 9 suites green; both tsconfigs clean.

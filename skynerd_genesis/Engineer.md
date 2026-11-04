@@ -172,6 +172,48 @@ pruneOldCrashSites keeps the last 6 pairs' sites. main.ts's
 narration: "drone attack - pair N lifted off - X flying - the will
 decides after the mission".
 
+### The third generation: the instructor's own departure (no more circles)
+
+**The reports.** The person watched the browser: "they all turn
+left all the time" (the first-generation orbit climb circled the
+whole sky left), then after the mirror fix "they go in circle"
+(the mirrored orbit circled both ways but STILL circled — tight
+~300 m rings above the field for the whole 340 s climb), and
+finally: "in the comprehensive lesson the instructor follows the
+steps correctly, so the drones can too — follow the scenario."
+
+**The fix: the orbit climb is GONE.** The mission now flies the
+instructor's own departure, exactly like the comprehensive lesson:
+roll -> rotate -> THE STRAIGHT CLIMB out of ground effect to 800 ft
+(SPLIT_CLIMB_ALT_M) -> THE SPLIT ON THE CLIMB: the turning
+departure onto the flank heading (roll in -> climbing turn-by
++-45 -> the heading-hold roll-out, the climb never stopping) ->
+THE CLIMB-OUT IN THE FLANK: straight down the flank heading to
+3000 ft -> level off -> settle -> the level moment. The legs:
+MISSION_ENTRIES split 3 / flank 6 (was 5 / 9); the plan is still 28
+phases (the split's roll-in/turn/roll-out absorbed the takeoff's
+level-off slot). A turning departure off the runway is flown from
+800 ft up, wings loaded and speed built — never in ground effect.
+
+**Why the pattern is now honest geometry:** each pair's track is
+the wide circuit the drawn spec shows — a straight lane out of the
+field, a 45 peel onto the flank, a long straight climb-out, the
+90 converging attack arc at the far end, the 135 rally home. The
+probe's new checks pin it: the takeoff leg turns 0.0 deg (straight,
+no circles), the split peels -45.8/+45.6, and the flank climb-out
+holds the flank heading within 1.5 deg. Max radius 6712 m — inside
+the 9000 m area. The sortie runs takeoff 63 s -> flank 75-80 s ->
+attack 222 s -> climb 401 s -> spin 469 s -> will 521 s (half the
+old time: no more 340 s of circling).
+
+**The runway seating (the same session's earlier fix, kept):** both
+drones of a pair start ON the runway — land.ts's RUNWAY is the one
+source of truth, the lane's width split into two halves, each seat
+at the CENTRE of its half (±7.5 m on the 30 m lane), every pair
+from the same threshold (LAUNCH_X = RUNWAY.near + 50; the 5 s launch
+interval is the trail, real runway ops). PAIR_GAP/PAIR_TRAIL are
+gone.
+
 ### Verification (all green)
 - `tools/mission-probe.mjs`: MISSION PROBE OK — both seats the full
   chain: rotate 65 mph (no early yoke), split -46.5/+43.7, the level
