@@ -7,7 +7,46 @@ A fully Hebbian drone-swarm simulator, spun off from `privatepoker-labs/p2p_neru
 One learning mechanism everywhere — no autopilot, no teacher. The swarm learns
 to fly by dying, to fight by watching kills, and to remember through itself:
 every living drone is a shard of the brain, death erases a shard, births are
-mosaics of the living. Designed by the Sonia Code & Gemini AI & Open AI (2026).
+mosaics of the living. Designed by the Sonia Code & Fetch.ai (2026).
+
+This is terminal app only, which runs in-memory simulation.
+There is also live simulation with UX and 3D graphics under [SKYNERD - GENESIS](/skynerd_genesis/README.md)
+
+
+## Seting up
+
+Install dependencies using frozen versions:
+
+```sh
+pip install -r requirements.txt
+```
+
+Alternatively install SciPy and Torch:
+
+```sh
+pip install scipy torch
+```
+
+## Running
+
+Simulation can be ran with:
+
+```sh
+python ./skynerd/sim_runner.py 
+```
+
+Sim has also few options:
+```sh
+python ./skynerd/sim_runner.py --help
+```
+
+The `--seed` option sets RNG seed, giving different simulation results. Runs with same seed are deterministic.
+
+The `--waves` option sets number of drone waves to run. More waves gives longer simulation.
+
+The `--wave-size` options sets number of drones in a single wave. We were interested to see if that affects survival ratio.
+
+
 
 ## The tensors
 
