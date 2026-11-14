@@ -155,6 +155,16 @@ TypeScript entry. The gate below
 names the compiler explicitly and notes the global 5.8.3 that this machine
 resolves.
 
+**F13 — The ticket's worked stall example names a class the V2 teacher cannot
+produce at the ticket's own bins.** The example says `pitch ≥ 16` and
+`asi ≤ 2` should fire `11: nose high` (`tensor_task.md:93`). With wings level
+and coordinated, `classifyFlightAttitude(16, 12, 3, 5, 2)` returns
+**21 "wings level, nose high, slow"**; class 11 needs `asi ≥ 4`
+(`instruments.ts:540-542`). The energy half is right: `asi ≤ 2`, `vsi ≤ 5`
+returns **9 "developed stall"** (`instruments.ts:598-604`). ASI bin 2 is
+50–60 mph, not the ticket's 55 (`instruments.ts:70`). U1's Proof pins the
+teacher's real outputs, so the plan does not inherit the ticket's label.
+
 ## Decisions
 
 **D1 — DW1–DW5 are the acceptance statements, with the plan's proofs attached.**
@@ -220,11 +230,17 @@ may not rewrite the sortie.
 
 **D10 — Isolated perception training uses a neutral recurrence
 (prev = teacher class, element = free flight, skill bin = 0) and never replaces
-runtime lesson stamping.** *Assumed*: the sensor keys are recurrent
-(`servo-tensor.ts:430-476`), so a sample stamped under one context may not
-recall under another. What settles it: a held-out-panel recall rate with and
-without the pre-training pass. If the rate does not improve, D10 is wrong and
-the pre-training pass is dropped rather than expanded.
+runtime lesson stamping.** *Assumed*: the sensor keys are recurrent — each is
+`[panel, own previous class, goal element, skill bin] -> class`
+(`servo-tensor.ts:434-478,680-686`) — so a sample stamped under one context may
+not recall under another. What settles it: a held-out-panel recall rate with
+and without the pre-training pass. If the rate does not improve, D10 is wrong
+and the pre-training pass is dropped rather than expanded. **The alternative —
+dropping `prev`, `element` and `skill bin` from the three sensor keys — is a
+key migration** through the goal bus, both panels, the snapshots and the
+school's stamping; it is out of scope unless the neutral pass fails *and* the
+owner chooses the migration. The plan does not claim DW4's "train in
+isolation" while the keys stay recurrent.
 
 **D11 — The eligibility window becomes 2 decisions (0.4 s).** *Directed* by the
 report's 0.2–0.4 s range (`tensor_task.md:195`); the exact 2 is
@@ -269,11 +285,12 @@ classes defined once, so every later tensor keys on the same vocabulary.
 **Proof.** An automated check asserts: the three shape products are
 24·24·7·16·8, 8·8·7·8·16 and 11·9·9; the class axes are 32, 16, 64; the
 ticket's stall example classifies as `developed stall` (energy 9) and
-`nose high` (attitude 11) on the stated bins; every class index has a non-empty
-label; `senseReadingV2` returns the same bin as `senseReading` for every shared
-gauge on a fixed `RigidBody`; every teacher output is inside its axis. The old
-4-sensor runtime is untouched, so the existing replay-determinism section still
-determines the same two runs.
+`wings level, nose high, slow` (attitude 21) — **not** the ticket's
+`11: nose high`, which needs `asi ≥ 4` (F13); every class index has a
+non-empty label; `senseReadingV2` returns the same bin as `senseReading` for
+every shared gauge on a fixed `RigidBody`; every teacher output is inside its
+axis. The old 4-sensor runtime is untouched, so the existing
+replay-determinism section still determines the same two runs.
 
 **Invariant.** `SenseReading`, the old shapes, every existing tensor key and
 every in-memory snapshot keep their current meaning; `test/episode.test.ts`
@@ -357,6 +374,10 @@ inside one transition map.
 - Rename `goalTensor` to `goalPlanTensor`: key
   `[goal, desiredPhase, actualPhase, progress]` → desired phase; keep the
   existing transition stamping; `progress` is D7's 0–7 held-decision count.
+  The report's `phase_req` (`tensor_task.md:84`) is this `desiredPhase` slot
+  and is D4's `ELEMENT_AXIS`; no separate 32-name requested-phase vocabulary
+  is defined, and actual state is in the key so completion (e.g. altitude
+  reached) can trigger the next transition (D6).
 - Make the two phases patch signals on U3's panel (actual and desired alongside
   the three classes and the servo option), and put the phase pair into the
   servo observation key. Keep the servo's exclusion of the controls class
