@@ -165,6 +165,15 @@ returns **9 "developed stall"** (`instruments.ts:598-604`). ASI bin 2 is
 50–60 mph, not the ticket's 55 (`instruments.ts:70`). U1's Proof pins the
 teacher's real outputs, so the plan does not inherit the ticket's label.
 
+**F14 — The three V2 panels drop heading-to-target (HSI).** The old
+LocationTensor was the only carrier of heading error: `senseReading` puts
+`circleBin(heading)` in `location` (`instruments.ts:835-838`), and the location
+class feeds the situation bus (`servo-tensor.ts:734-740`). `SenseReadingV2`
+has no heading field (`instruments.ts:746-759,867-898`), and FlightAttitude
+carries bank and turn *rate*, not heading error. If U2 lands as written, two
+airframes differing only by 90° of heading error are identical to perception,
+and a rollout has no heading signal. D15 supplies one.
+
 ## Decisions
 
 **D1 — DW1–DW5 are the acceptance statements, with the plan's proofs attached.**
@@ -193,13 +202,13 @@ so the phase tensor can be supervised by the instructor's element. If the owner
 wants a distinct phase vocabulary, U4 must add names and an element→phase
 mapping, and every key in U4/U5 changes.
 
-**D5 — $\Delta P$ is the existing servo option (hold-all + 37 lever stops), not
-a new 64-vector vocabulary.** *Settled* by the existing option layout
-(`servo-tensor.ts:850-877`): there is no 64-name transition vocabulary in the
-repo to key on, and the panel+servo already associate the phase/class company
-with a lever option. The report's 64 is read as capacity. If the owner requires
-literal transition vectors, the 64 names and their lever mapping are a new
-authoring task; U3–U5 cannot proceed unchanged.
+**D5 — $\Delta P$ is the existing servo option (hold-all plus the four levers'
+36 stops = 37 options), not a new 64-vector vocabulary.** *Settled* by the
+existing option layout (`servo-tensor.ts:850-877`): there is no 64-name
+transition vocabulary in the repo to key on, and the panel+servo already
+associate the phase/class company with a lever option. The report's 64 is read
+as capacity. If the owner requires literal transition vectors, the 64 names and
+their lever mapping are a new authoring task; U3–U5 cannot proceed unchanged.
 
 **D6 — `GoalPlanTensor` keys on the actual phase as well as goal, desired phase
 and progress.** *Recommended*: the report's input list
@@ -263,6 +272,17 @@ point.** *Assumed*: they are in the working tree on `tensors_revised`, dated
 2026-11-14 00:04, and they type-check. If they are someone's scratch, U1 starts
 by re-creating them; no other unit changes.
 
+**D15 — Heading error is preserved as an input to the phase tensors, not as a
+fourth sensor and not as an extra attitude axis.** *Recommended*: DW1 caps
+perception at three panels, and heading error is what "where am I relative to
+the leg" needs, so `SenseReadingV2` gains a 24-bin `headingError` computed from
+the same `targetBearing` argument as `senseReading` (`instruments.ts:835-838`),
+and U4's `currentPhaseTensor` key includes it. This keeps the three shapes
+exactly as the V2 constants define them. *Alternative*: add heading error as a
+sixth FlightAttitude axis — that changes `FLIGHT_ATTITUDE_SHAPE`, U1's shape
+proof, every stored key and the teachers' context. If the owner wants heading
+inside perception rather than in the phase, that is the swap, and U1/U2 change.
+
 ## Units
 
 Each unit is a development story: it can be built and verified in the order
@@ -294,7 +314,8 @@ replay-determinism section still determines the same two runs.
 
 **Invariant.** `SenseReading`, the old shapes, every existing tensor key and
 every in-memory snapshot keep their current meaning; `test/episode.test.ts`
-needs no edit.
+needs no edit. U2 may add D15's `headingError` field to `SenseReadingV2`; the
+three panel fields keep their meaning.
 
 **Touches.** `src/learning/instruments.ts`, `src/index.ts`, `test/run.ts`, new
 `test/instruments.test.ts`.
@@ -309,6 +330,10 @@ panels, so the same gauge is never read through two unrelated vocabularies.
   EnergyPropulsion (16), Proprioception (64). Use `SenseReadingV2` at every
   call site: `servo-tensor.ts`, `school.ts`, `pilot.ts`, `mission.ts`,
   `flight.ts`, tests.
+- Do not drop heading: `SenseReadingV2` gains a `headingError` bin computed
+  from the same `targetBearing` argument `senseReading` already takes
+  (`instruments.ts:835-838`), as D15 requires. This is the only addition to the
+  V2 interface; the three panel shapes are unchanged.
 - Re-partition the two panels without changing their machinery: left =
   flight-attitude + energy-propulsion, right = proprioception, plus the element
   and servo signals and the existing bridge. A one-sensor panel still has wires
@@ -322,8 +347,10 @@ panels, so the same gauge is never read through two unrelated vocabularies.
 **Proof.** A fixed body + fixed seed produces a deterministic decision; a
 demonstration stamp lands on all three sensors; a free-flight episode still
 flies; the snapshot round-trips bit-exactly; the state log names exactly three
-sensors; no path constructs a four-panel `SenseReading`. `npm run build:web`
-type-checks the UI row, which the Node tsconfig excludes.
+sensors; no path constructs a four-panel `SenseReading`; two bodies differing
+only by 90° of heading error get different `headingError` bins; a rollout leg
+still completes. `npm run build:web` type-checks the UI row, which the Node
+tsconfig excludes.
 
 **Invariant.** The servo's option vocabulary, command semantics and teacher
 fallback are unchanged; the two panels still evaluate every pair of their
@@ -336,8 +363,8 @@ signals; the 0.2 s decision clock and `PULSE_EVERY` are unchanged.
 ### U3 — Merge the two skill panels into one transition panel
 
 **Story.** As the brain, I want one company of perception, intent and command,
-so a spin recovery does not have to cross a single-wire bridge between two
-disagreeing sides.
+so a spin recovery does not need two half-banks whose only extra coupling is a
+coherence wire (the servo already mixes both classes; the bridge is extra).
 
 **Changes.**
 - Remove `LEFT_SIDE`/`RIGHT_SIDE`, the two panel nodes and the bridge
@@ -368,9 +395,12 @@ where the plan wants me next, so a mismatch can be acted on instead of hidden
 inside one transition map.
 
 **Changes.**
-- Add `currentPhaseTensor`: key `[attitudeClass, energyClass, proprioClass]` →
+- Add `currentPhaseTensor`: key
+  `[attitudeClass, energyClass, proprioClass, headingError]` →
   actual phase (`ELEMENT_AXIS`), supervised at demonstration time by the
-  instructor's element; fallback is D8's unknown/free-flight marker.
+  instructor's element (the vocabulary already names `stall entry`, `break`,
+  `spin`, `opposite rudder`, `dive`: `school.ts:396-418`); fallback is D8's
+  unknown/free-flight marker. `headingError` is D15's bin.
 - Rename `goalTensor` to `goalPlanTensor`: key
   `[goal, desiredPhase, actualPhase, progress]` → desired phase; keep the
   existing transition stamping; `progress` is D7's 0–7 held-decision count.
@@ -386,11 +416,14 @@ inside one transition map.
   goal assertion (`episode.test.ts:189-192`).
 
 **Proof.** On a stamped takeoff demonstration the current-phase tensor recalls
-roll/rotate/climb/level-off at the matching panels; the goal plan advances
-through the element chain; during a maneuver the desired phase differs from the
-actual phase and the servo key carries both; free flight reports its own phase
-and no plan; a stamp under the same element history and the same progress
-produces the same key at recall; the snapshot round-trips.
+roll/rotate/climb/level-off at the matching panels; a stamped stall
+demonstration recalls `stall entry` and the recovery recalls `break`/`push`;
+two states differing only by 90° of heading error recall different actual
+phases; the goal plan advances through the element chain; during a maneuver the
+desired phase differs from the actual phase and the servo key carries both;
+free flight reports its own phase and no plan; a stamp under the same element
+history and the same progress produces the same key at recall; the snapshot
+round-trips.
 
 **Invariant.** Normal transitions remain forward-only; the mission goal is
 unchanged; the servo's option count and command semantics are unchanged; the
