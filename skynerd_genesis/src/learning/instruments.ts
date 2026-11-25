@@ -78,6 +78,63 @@ export const LOCATION_SHAPE = [8, 24] as const;          // alt, hsi
 export const ENERGY_SHAPE = [8, 8, 16, 24, 8] as const;  // alt, asi, vsi, pitch, rpm
 export const FLIGHT_SHAPE = [16, 8, 24, 24, 7] as const; // vsi, asi, pitch, bank, turn
 
+// ===========================================================================
+// V2 SENSORY VOCABULARY — the three orthogonal perception tensors.
+//
+// The redesign eliminates duplicated gauges across the old four sensor
+// tensors and replaces them with three non-overlapping panels:
+//
+//   FlightAttitude    — aerodynamic attitude & airframe dynamics
+//   EnergyPropulsion  — mechanical & kinetic potential (engine + energy)
+//   Proprioception    — tactile control surface positions (the "hands")
+//
+// Each gauge appears in exactly ONE panel.  The old shapes above remain
+// for backward compatibility until servo-tensor.ts migrates.
+// ===========================================================================
+
+/**
+ * FLIGHT ATTITUDE: what the airframe is doing right now.
+ *
+ * Pitch (24) × Bank (24) × Turn coordinator (7) × VSI (16) × ASI (8).
+ *
+ * The attitude instruments: pitch and bank from the attitude indicator,
+ * the turn coordinator ball, the vertical speed, and airspeed — the
+ * six-pack's dynamic group.  Every gauge that sweeps during a maneuver
+ * lives here; nothing engine-related enters.
+ */
+export const FLIGHT_ATTITUDE_SHAPE = [24, 24, 7, 16, 8] as const;
+
+/**
+ * ENERGY / PROPULSION: the energy state including the engine.
+ *
+ * Alt (8) × RPM (8) × Throttle (7) × ASI (8) × VSI (16).
+ *
+ * The energy / power group: altitude (potential energy), RPM (engine
+ * state), throttle position (power command), airspeed (kinetic energy),
+ * and vertical speed (energy rate of change).  The overlap of ASI and
+ * VSI with FlightAttitude is intentional in the SHAPE — the teacher
+ * classifier uses them to judge energy, not attitude, so the class
+ * vocabulary (and therefore what gets stamped) is completely different.
+ *
+ * NOTE: throttle is a 7-stop lever (THROTTLE_STOPS), not a gauge — but
+ * the energy tensor reads it as an engine-state indicator alongside RPM,
+ * exactly the way a pilot cross-checks the power lever against the
+ * tachometer.
+ */
+export const ENERGY_PROPULSION_SHAPE = [8, 8, 7, 8, 16] as const;
+
+/**
+ * PROPRIOCEPTION: what the pilot's hands and feet feel.
+ *
+ * Elevator vernier (11) × Aileron (9) × Rudder (9).
+ *
+ * Pure "tactile" feedback — the stop positions of the three primary
+ * flight control surfaces (the yoke columns and rudder pedals).
+ * Throttle is excluded: it is an engine command, not a flight-control
+ * deflection, and lives in the EnergyPropulsion panel.
+ */
+export const PROPRIOCEPTION_SHAPE = [11, 9, 9] as const;
+
 /**
  * THE COMMAND VOCABULARY — each lever's stops, the positions a hand
  * can command it to AND the coarseness the ControlsTensor reads the
@@ -354,6 +411,292 @@ export function labelControlsClass(cls: number): string {
     ` \u00b7 ${THR_COARSE_NAMES[thrCoarse]}`;
 }
 
+// ===========================================================================
+// V2 SITUATION CLASSES — the three orthogonal perception classifiers.
+//
+// Each teacher is deterministic: a pure function from binned gauges to a
+// named class.  The classifiers own no state and never touch the
+// Aircraft; they receive the panel's quantized bins and return the
+// class index.  The perception tensors stamp the teacher's label during
+// demonstration and fall back to it at runtime.
+// ===========================================================================
+
+/** FLIGHT ATTITUDE — 32 named states: the airframe's dynamic posture.
+ *
+ * The vocabulary splits into: level/coordinated, bank left/right (×
+ * climbing/descending/level), overbank, nose high/low, yaw
+ * left/right, spin left/right, and unusual-attitude envelope
+ * (spiral dive, tumble).  Every class is a pilot's English phrase
+ * — the downstream tensors read the vocabulary as named situations. */
+export const FLIGHT_ATTITUDE_CLASS_AXIS = 32;
+export const FLIGHT_ATTITUDE_CLASSES: readonly string[] = [
+  "wings level, coordinated",                    //  0
+  "banking left",                                //  1
+  "banking right",                               //  2
+  "yawing right, need left rudder",              //  3
+  "yawing left, need right rudder",              //  4
+  "banking left, losing altitude",               //  5
+  "banking right, losing altitude",              //  6
+  "banking left, climbing",                      //  7
+  "banking right, climbing",                     //  8
+  "overbanked left",                             //  9
+  "overbanked right",                            // 10
+  "nose high",                                   // 11
+  "nose low",                                    // 12
+  "steep turn left, coordinated",                // 13
+  "steep turn right, coordinated",               // 14
+  "spin entry left",                             // 15
+  "spin entry right",                            // 16
+  "spin developed left",                         // 17
+  "spin developed right",                        // 18
+  "spiral dive left",                            // 19
+  "spiral dive right",                           // 20
+  "wings level, nose high, slow",                // 21
+  "wings level, nose low, fast",                 // 22
+  "banking left, nose high",                     // 23
+  "banking right, nose high",                    // 24
+  "banking left, nose low",                      // 25
+  "banking right, nose low",                     // 26
+  "unusual attitude: inverted tendency",         // 27
+  "slip left (cross-controlled)",                // 28
+  "slip right (cross-controlled)",               // 29
+  "reserved",                                    // 30
+  "reserved",                                    // 31
+];
+
+/**
+ * The flight-attitude teacher: [pitch, bank, turn, vsi, asi] bins →
+ * the class.
+ *
+ * Pitch is the 24-bin circle (12 = level, ≥13 nose up, ≤11 nose down).
+ * Bank is the 24-bin circle (12 = wings level).
+ * Turn coordinator: 7 bins (3 = centered, ≤1 left marks, ≥5 right).
+ * VSI: 16-bin signed scale (7 = gentle climb, ≤5 = descent ≥ 1000 fpm).
+ * ASI: 8 bins (≤2 = below ~60 mph stall region, 5 = cruise).
+ */
+export function classifyFlightAttitude(
+    pitch: number, bank: number, turn: number,
+    vsi: number, asi: number): number {
+  // --- SPIN detection (highest priority: pitch nose-down + extreme yaw
+  //     + one wing fully stalled) ---
+  // Developed spin: extreme bank + nose well down + slow + high yaw rate
+  if (asi <= 2 && (bank <= 8 || bank >= 16)) {
+    if (pitch <= 9 && (turn <= 0 || turn >= 6)) {
+      return bank <= 8 ? 17 : 18;   // developed spin left / right
+    }
+    // Spin entry: overbanked + slow + yaw disagrees with bank
+    if (bank <= 9 && turn >= 5) { return 15; }   // spin entry left
+    if (bank >= 15 && turn <= 1) { return 16; }  // spin entry right
+  }
+
+  // --- UNUSUAL ATTITUDES ---
+  // Spiral dive: steep bank + nose low + descending fast + speed building
+  if ((bank <= 9 || bank >= 15) && pitch <= 9 && vsi <= 4 && asi >= 5) {
+    return bank <= 9 ? 19 : 20;   // spiral dive left / right
+  }
+  // Inverted tendency: bank well past 60 deg (bin 7 or 17+)
+  if (bank <= 7 || bank >= 17) {
+    return 27;   // unusual attitude: inverted tendency
+  }
+
+  // --- OVERBANK (45-60 deg) ---
+  if (bank <= 9) { return 9; }       // overbanked left
+  if (bank >= 15) { return 10; }     // overbanked right
+
+  // --- STEEP TURNS (30-45 deg, coordinated) ---
+  if (bank === 10 && turn >= 1 && turn <= 2 && vsi >= 6 && vsi <= 8) {
+    return 13;   // steep turn left, coordinated
+  }
+  if (bank === 14 && turn >= 4 && turn <= 5 && vsi >= 6 && vsi <= 8) {
+    return 14;   // steep turn right, coordinated
+  }
+
+  // --- MODERATE BANK (15-45 deg) ---
+  if (bank <= 11) {                    // left bank
+    if (pitch >= 14) { return 23; }    // banking left, nose high
+    if (pitch <= 10) { return 25; }    // banking left, nose low
+    if (vsi >= 8) { return 7; }        // banking left, climbing
+    if (vsi <= 5) { return 5; }        // banking left, losing altitude
+    return 1;                          // banking left (level)
+  }
+  if (bank >= 13) {                    // right bank
+    if (pitch >= 14) { return 24; }    // banking right, nose high
+    if (pitch <= 10) { return 26; }    // banking right, nose low
+    if (vsi >= 8) { return 8; }        // banking right, climbing
+    if (vsi <= 5) { return 6; }        // banking right, losing altitude
+    return 2;                          // banking right (level)
+  }
+
+  // --- WINGS NEAR LEVEL (bank 12 ± 1) ---
+  // Cross-controlled slip: wings level but ball off
+  if (turn <= 1 && bank === 12) { return 28; }   // slip left
+  if (turn >= 5 && bank === 12) { return 29; }   // slip right
+
+  // Yaw detection: ball off with no meaningful bank
+  if (turn <= 1) { return 4; }        // yawing left, need right rudder
+  if (turn >= 5) { return 3; }        // yawing right, need left rudder
+
+  // Pitch attitude with speed context
+  if (pitch >= 15 && asi <= 3) { return 21; }   // wings level, nose high, slow
+  if (pitch <= 9 && asi >= 5) { return 22; }    // wings level, nose low, fast
+  if (pitch >= 15) { return 11; }               // nose high
+  if (pitch <= 9) { return 12; }                // nose low
+
+  // Pitch mid-range (10-14) but still with a VSI signal
+  if (pitch >= 14 && vsi >= 9) { return 11; }   // nose high (climbing hard)
+  if (pitch <= 10 && vsi <= 4) { return 12; }   // nose low (diving)
+
+  return 0;   // wings level, coordinated
+}
+
+/** A flight-attitude class label, by name. */
+export function labelFlightAttitudeClass(cls: number): string {
+  return FLIGHT_ATTITUDE_CLASSES[Math.min(Math.max(cls, 0), 31)];
+}
+
+
+/** ENERGY / PROPULSION — 16 named states: the plane's energy budget.
+ *
+ * The vocabulary covers: cruise, climbing (with speed/power variants),
+ * descending (ditto), the stall family, overspeed, and the
+ * all-important engine-power cross-check (throttle against what the
+ * RPM tachometer reads). */
+export const ENERGY_PROPULSION_CLASS_AXIS = 16;
+export const ENERGY_PROPULSION_CLASSES: readonly string[] = [
+  "level cruise",                                          //  0
+  "climbing",                                              //  1
+  "climbing, losing speed",                                //  2
+  "climbing fast",                                         //  3
+  "descending",                                            //  4
+  "descending slow",                                       //  5
+  "accelerating descent (gaining speed, losing altitude)",  //  6
+  "slow, high angle of attack (not enough speed)",          //  7
+  "incipient stall",                                       //  8
+  "developed stall (falling)",                             //  9
+  "fast and level",                                        // 10
+  "high-power climb",                                      // 11
+  "low-power descent",                                     // 12
+  "engine underperforming (low RPM, high throttle)",       // 13
+  "overspeed",                                             // 14
+  "reserved",                                              // 15
+];
+
+/**
+ * The energy-propulsion teacher: [alt, rpm, throttle, asi, vsi] bins →
+ * the class.
+ *
+ * Alt: 8-bin altitude gauge.
+ * RPM: 8-bin tachometer.
+ * Throttle: 7 stops (0 = idle, 6 = full).
+ * ASI: 8 bins (≤2 = below ~60 mph stall region, 5 = cruise band).
+ * VSI: 16-bin signed scale (7 = 0-1000 fpm up, ≤5 = ≥ 1000 fpm down).
+ */
+export function classifyEnergyPropulsion(
+    _alt: number, rpm: number, thr: number,
+    asi: number, vsi: number): number {
+  // --- THE STALL FAMILY (highest priority: always classified) ---
+  if (asi <= 2) {
+    // Developed stall: airspeed collapsed, descending or nose already low
+    if (vsi <= 5) { return 9; }
+    return 8;   // incipient stall: slow but not yet sinking hard
+  }
+
+  // High angle of attack: slow + high throttle but RPM doesn't match
+  if (asi <= 4 && thr >= 4) {
+    return 7;   // slow, high angle of attack
+  }
+
+  // --- ENGINE ANOMALY ---
+  // Low RPM with high throttle: engine is underperforming
+  if (rpm <= 2 && thr >= 5) {
+    return 13;   // engine underperforming
+  }
+
+  // --- OVERSPEED ---
+  if (asi >= 7) {
+    if (vsi >= 6 && vsi <= 8) { return 10; }   // fast and level
+    return 14;   // overspeed (outside the level band)
+  }
+
+  // --- CLIMBING ---
+  if (vsi >= 8) {                      // > 1000 fpm climb
+    if (asi <= 5) { return 2; }        // climbing, losing speed
+    return 3;                          // climbing fast
+  }
+  if (vsi === 7) {                     // gentle climb (0-1000 fpm up)
+    if (rpm >= 6) { return 11; }       // high-power climb
+    return 1;                          // climbing
+  }
+
+  // --- DESCENDING ---
+  if (vsi <= 5) {                      // > 1000 fpm descent
+    if (asi >= 6) { return 6; }        // accelerating descent
+    if (thr <= 1) { return 12; }       // low-power descent (idle throttle)
+    return 4;                          // descending
+  }
+  if (vsi === 6) {                     // gentle descent
+    return 5;                          // descending slow
+  }
+
+  // --- LEVEL ---
+  if (asi >= 6) { return 10; }         // fast and level
+  return 0;                            // level cruise
+}
+
+/** An energy-propulsion class label, by name. */
+export function labelEnergyPropulsionClass(cls: number): string {
+  return ENERGY_PROPULSION_CLASSES[Math.min(Math.max(cls, 0), 15)];
+}
+
+
+/** PROPRIOCEPTION — 64 named states: what the pilot's hands feel.
+ *
+ * The vocabulary is the coarsened control surface configuration:
+ *   Elevator: 4 coarse bands (push / trim / pull / pull high)
+ *   Aileron:  4 coarse bands (hard left / left / neutral / right)
+ *   Rudder:   4 coarse bands (hard left / left / neutral / right)
+ *
+ * 4 × 4 × 4 = 64 classes.  Throttle is excluded — it is an engine
+ * command (EnergyPropulsion reads it); the flight-control hands and
+ * feet are a separate sensory channel. */
+export const PROPRIOCEPTION_CLASS_AXIS = 64;
+
+/**
+ * The proprioception teacher: [elev, ail, rud] stop levels → the class.
+ *
+ * Elevator (11 vernier stops): 0-2 = push, 3-7 = near trim,
+ *   8-9 = pull, 10 = pull high.
+ * Aileron (9 stops): 0-1 = hard left, 2-3 = left, 4 = neutral,
+ *   5-6 = right, 7-8 = hard right.
+ * Rudder (9 stops): same 4-band layout as aileron.
+ */
+export function classifyProprioception(
+    elev: number, ail: number, rud: number): number {
+  const elevCoarse = elev <= 2 ? 0 : elev <= 7 ? 1 : elev <= 9 ? 2 : 3;
+  const ailCoarse = ail <= 1 ? 0 : ail <= 3 ? 1 : ail <= 4 ? 2 : ail <= 6 ? 3 : 3;
+  const rudCoarse = rud <= 1 ? 0 : rud <= 3 ? 1 : rud <= 4 ? 2 : rud <= 6 ? 3 : 3;
+  return elevCoarse * 16 + ailCoarse * 4 + rudCoarse;
+}
+
+const ELEV_PROPRIO_NAMES: readonly string[] =
+  ["pushing down", "near trim", "pulling up", "pulling up high"];
+const AIL_PROPRIO_NAMES: readonly string[] =
+  ["ailerons hard left", "ailerons left", "ailerons neutral", "ailerons right"];
+const RUD_PROPRIO_NAMES: readonly string[] =
+  ["rudder hard left", "rudder left", "rudder neutral", "rudder right"];
+
+/** A proprioception class, decoded:
+ *  "near trim · ailerons neutral · rudder neutral". */
+export function labelProprioceptionClass(cls: number): string {
+  const elevCoarse = Math.floor(cls / 16);
+  const ailCoarse = Math.floor(cls / 4) % 4;
+  const rudCoarse = cls % 4;
+  return `${ELEV_PROPRIO_NAMES[Math.min(elevCoarse, 3)]}` +
+    ` \u00b7 ${AIL_PROPRIO_NAMES[Math.min(ailCoarse, 3)]}` +
+    ` \u00b7 ${RUD_PROPRIO_NAMES[Math.min(rudCoarse, 3)]}`;
+}
+
+
 /**
  * A signed angle on the 24-bin 15-degree circle: -180 deg is bin 0,
  * level is bin 12, +180 is bin 23. The SAME 0-345+ quantization the
@@ -398,6 +741,21 @@ export interface SenseReading {
   readonly flight: number[];
   /** [ail, elev, rud, thr] — the controls panel, at the stops. */
   readonly controls: number[];
+}
+
+// ===========================================================================
+// V2 SENSE READING — the three orthogonal perception panels.
+// ===========================================================================
+
+/** The V2 panel reading: three non-overlapping sub-panels, each gauge
+ *  appearing in exactly one panel. */
+export interface SenseReadingV2 {
+  /** [pitch, bank, turn, vsi, asi] — the flight-attitude panel. */
+  readonly flightAttitude: number[];
+  /** [alt, rpm, throttle, asi, vsi] — the energy-propulsion panel. */
+  readonly energyPropulsion: number[];
+  /** [elev, ail, rud] — the proprioception panel (control surfaces). */
+  readonly proprioception: number[];
 }
 
 /** Turns a RigidBody into binned panel keys and error norms. */
@@ -493,6 +851,49 @@ export class FlightInstruments {
         TURN_GAUGE.bin(turnCoordinatorReading(body)),
       ],
       controls: [ailLevel, elevLevel, rudLevel, thrLevel],
+    };
+  }
+
+  /**
+   * V2 panel reading — the three orthogonal perception panels.
+   *
+   * Each gauge appears in exactly one panel:
+   *   flightAttitude:    pitch, bank, turn, vsi, asi
+   *   energyPropulsion:  alt, rpm, throttle (stop level), asi, vsi
+   *   proprioception:    elevator (stop level), aileron, rudder
+   *
+   * `controls` is the actual surface/throttle state of the airframe.
+   */
+  senseReadingV2(body: RigidBody, controls: ArrayLike<number>): SenseReadingV2 {
+    const elevLevel = levelOf(ELEVATOR, controls[ELEVATOR]);
+    const ailLevel = levelOf(AILERON, controls[AILERON]);
+    const rudLevel = levelOf(RUDDER, controls[RUDDER]);
+    const thrLevel = levelOf(THROTTLE, controls[THROTTLE]);
+    const altFt = body.position.z * FT_PER_M;
+    const asiMph = body.velocity.length() * MPH_PER_MPS;
+    const vsiFpm = body.velocity.z * FPM_PER_MPS;
+    // The engine gauge: RPM idles at 700 and redlines at 2700.
+    const rpm = 700.0 + 2000.0 * controls[THROTTLE];
+    return {
+      flightAttitude: [
+        circleBin(body.deckPitch),       // pitch: 24 bins
+        circleBin(body.bank),            // bank: 24 bins
+        TURN_GAUGE.bin(turnCoordinatorReading(body)),  // turn: 7 bins
+        VSI_GAUGE.bin(vsiFpm),           // vsi: 16 bins
+        ASI_GAUGE.bin(asiMph),           // asi: 8 bins
+      ],
+      energyPropulsion: [
+        ALT_GAUGE.bin(altFt),            // alt: 8 bins
+        RPM_GAUGE.bin(rpm),              // rpm: 8 bins
+        thrLevel,                        // throttle: 7 stops
+        ASI_GAUGE.bin(asiMph),           // asi: 8 bins
+        VSI_GAUGE.bin(vsiFpm),           // vsi: 16 bins
+      ],
+      proprioception: [
+        elevLevel,                       // elevator: 11 vernier stops
+        ailLevel,                        // aileron: 9 stops
+        rudLevel,                        // rudder: 9 stops
+      ],
     };
   }
 
