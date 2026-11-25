@@ -59,6 +59,12 @@ the **Proof** of the unit that delivers it (D1).
   ticket; `WEBGPU-PLAN.md` §8 reserves that work.
 - **O6 — Persistent snapshot format / migration.** Snapshots are in-memory
   (`pilot.ts:475-480`); no file format exists to migrate.
+- **O7 — Retiring the `%64` situation bus.** The phase path avoids it (D17);
+  making the panels' situation key injective is a separate change.
+- **O8 — Efference-copy prediction error.** DW5's roadmap bullet is the
+  coincidence window and the signed depression, both delivered and tested
+  (U6); the predicted-outcome copy in the ticket's §2 is background, and the
+  existing `ErrorNeuron` sign law is what the bullet names.
 
 ## Findings
 
@@ -192,15 +198,17 @@ change; that is a different story.
 
 **D3 — Proprioception uses the code's 11 × 9 × 9 stop counts, not the report's
 15 × 11 × 11.** *Settled* by `instruments.ts:152-159`. The class axis remains
-64. The report's `trim` axis (`tensor_task.md:42`) is not a panel gauge and is
-dropped.
+64. The axis order is (elevator, aileron, rudder), `PROPRIOCEPTION_SHAPE`'s
+order — which differs from `CONTROLS_SHAPE`'s (aileron, elevator, rudder,
+throttle) — and U1's test pins it. The report's `trim` axis (`tensor_task.md:42`)
+is not a panel gauge and is dropped.
 
 **D4 — $P_{actual}$ and $P_{desired}$ use the existing `ELEMENT_AXIS` (32 slots,
 21 named elements) rather than a new 32-name phase vocabulary.** *Recommended*:
 the axis, the names (`school.ts:396-418`) and the demo stamping already exist,
 so the phase tensor can be supervised by the instructor's element. If the owner
-wants a distinct phase vocabulary, U4 must add names and an element→phase
-mapping, and every key in U4/U5 changes.
+wants a distinct phase vocabulary, U3 must add names and an element→phase
+mapping, and every key in U3/U4 changes.
 
 **D5 — $\Delta P$ is the existing servo option (hold-all plus the four levers'
 36 stops = 37 options), not a new 64-vector vocabulary.** *Settled* by the
@@ -208,7 +216,7 @@ existing option layout (`servo-tensor.ts:850-877`): there is no 64-name
 transition vocabulary in the repo to key on, and the panel+servo already
 associate the phase/class company with a lever option. The report's 64 is read
 as capacity. If the owner requires literal transition vectors, the 64 names and
-their lever mapping are a new authoring task; U3–U5 cannot proceed unchanged.
+their lever mapping are a new authoring task; U3–U4 cannot proceed unchanged.
 
 **D6 — `GoalPlanTensor` keys on the actual phase as well as goal, desired phase
 and progress.** *Recommended*: the report's input list
@@ -283,11 +291,65 @@ sixth FlightAttitude axis — that changes `FLIGHT_ATTITUDE_SHAPE`, U1's shape
 proof, every stored key and the teachers' context. If the owner wants heading
 inside perception rather than in the phase, that is the swap, and U1/U2 change.
 
+**D16 — The two skill panels stay two; DW3's "unify" is the transition engine,
+not the node count.** *Directed* by the code owner's recommendation and by DW3's
+own two bullets: one transition computation (D5's ΔP plus U4's interrupt), not a
+deleted node. The panels carry the error wave's two sides and the bridge wire
+(`servo-tensor.ts:213-261`); merging them would re-wire that topology, which the
+ticket does not ask for. If the owner wants literal node unification, it is a
+separate story: it removes the bridge, collapses the two coherence bins into one
+servo key axis, and re-wires the error wave.
+
+**D17 — The phase tensors key on the classes directly, not on the `%64`
+situation bus.** *Settled*: the bus is a modular sum (`instruments.ts:203`,
+`servo-tensor.ts:736-739`) and cannot represent "where am I" without
+collisions. U3 keys `currentPhaseTensor` on the three classes plus heading
+error. Retiring the bus for the panels as well is out of scope (O7).
+
+**D18 — The mission's `PhaseCursor` remains the only phase advancer.**
+*Directed* by `Engineer.md:274-279`: the cursor is physics-driven and the AI's
+claim only grades. `currentPhaseTensor` and `goalPlanTensor` are perception and
+claim; U4's override changes the brain's desired phase only and never moves the
+cursor (D9). A test proves completion and grading are unchanged.
+
+**D19 — Precedence is guardian > override > servo memory > servo reflex.**
+*Recommended*: the guardian takes the levers from outside the brain
+(`guardian.ts:1-18,61-75`), so nothing inside outranks it; the override sits
+above the learned command because it is the emergency; the reflex is the
+servo's fallback only when memory recalls nothing above the fire bar
+(`servo-tensor.ts:544-568`), so it is last. The override is stateless per
+decision, so enter/hold/clear reduces to recompute; U4 proves no oscillation.
+
 ## Units
 
 Each unit is a development story: it can be built and verified in the order
-given. U2 is the only wide change; it is wide because the compiler forces every
-consumer at once, not because it does more than DW1.
+given. U0 is the behaviour gate, and U2 is the only wide change; U2 is wide
+because the compiler forces every consumer at once, not because it does more
+than DW1.
+
+### U0 — Characterization gate before any behaviour change
+
+**Story.** As the maintainer, I want a behaviour gate that fails when learning
+changes, so every later unit's Proof means something.
+
+**Changes.**
+- `test/school.test.ts` is a placeholder and `test/episode.test.ts` gates only
+  replay determinism (F9). Add fixed-seed behaviour checks: a takeoff that
+  reaches level-off, a turn leg that rolls out, the stall-recovery chain, a
+  snapshot round-trip, zero NaN over the episodes, and the existing
+  determinism.
+- Do not gate exact weights or the retired Python goldens (O3). Do not change
+  `src/`.
+- Import the file from `test/run.ts` (`test/run.ts:1-10`).
+
+**Proof.** Every check passes on `e3046b1` before any behaviour change. A local
+mutation to a learning law (e.g. making `imprint` a no-op) makes at least one
+check fail; the mutation is not committed. `npm test` runs the file.
+
+**Invariant.** No production behaviour changes; no golden is regenerated;
+`test/episode.test.ts` keeps its determinism section.
+
+**Touches.** `test/school.test.ts`, `test/run.ts`.
 
 ### U1 — Adopt and pin the V2 perception vocabulary
 
@@ -309,8 +371,9 @@ ticket's stall example classifies as `developed stall` (energy 9) and
 `11: nose high`, which needs `asi ≥ 4` (F13); every class index has a
 non-empty label; `senseReadingV2` returns the same bin as `senseReading` for
 every shared gauge on a fixed `RigidBody`; every teacher output is inside its
-axis. The old 4-sensor runtime is untouched, so the existing
-replay-determinism section still determines the same two runs.
+axis; the proprioception axis order is (elevator, aileron, rudder) (D3). The
+old 4-sensor runtime is untouched, so the existing replay-determinism section
+still determines the same two runs.
 
 **Invariant.** `SenseReading`, the old shapes, every existing tensor key and
 every in-memory snapshot keep their current meaning; `test/episode.test.ts`
@@ -337,7 +400,7 @@ panels, so the same gauge is never read through two unrelated vocabularies.
 - Re-partition the two panels without changing their machinery: left =
   flight-attitude + energy-propulsion, right = proprioception, plus the element
   and servo signals and the existing bridge. A one-sensor panel still has wires
-  through the element/servo pairs.
+  through the element/servo pairs. The panels stay two (D16).
 - Update `TENSOR_NODE`, `CLASS_AXES`, `BrainSnapshot`, `sensorTensorOf`,
   `teacherClass`, `stateView`, `prune`, the error-wave widths, the
   spread/consolidation branches, the boot crossover list, and the UI row
@@ -354,45 +417,18 @@ tsconfig excludes.
 
 **Invariant.** The servo's option vocabulary, command semantics and teacher
 fallback are unchanged; the two panels still evaluate every pair of their
-signals; the 0.2 s decision clock and `PULSE_EVERY` are unchanged.
+signals, keep the bridge, and keep the error wave's two sides; the 0.2 s
+decision clock and `PULSE_EVERY` are unchanged.
 
 **Touches.** `src/learning/servo-tensor.ts`, `instruments.ts`, `school.ts`,
 `pilot.ts`, `mission.ts`, `flight.ts`, `app/boot-train.ts`, `app/main.ts`,
 `src/index.ts`, `test/episode.test.ts`, `test/run.ts`.
 
-### U3 — Merge the two skill panels into one transition panel
-
-**Story.** As the brain, I want one company of perception, intent and command,
-so a spin recovery does not need two half-banks whose only extra coupling is a
-coherence wire (the servo already mixes both classes; the bridge is extra).
-
-**Changes.**
-- Remove `LEFT_SIDE`/`RIGHT_SIDE`, the two panel nodes and the bridge
-  (`servo-tensor.ts:246-261,1290-1307,1760-1832`).
-- One panel over the signals `[flightAttitude, energyPropulsion,
-  proprioception, element, servo]`: every unordered pair is a wire (10 wires).
-  Its verdict is the mean of its wires; it forwards the three classes plus one
-  coherence bin to the servo, and the servo's key has one bin axis instead of
-  two.
-- Keep $\Delta P$ as the servo option (D5); the panel associates the company
-  with that option.
-
-**Proof.** A check enumerates the single wire bank and asserts that every pair
-the old two banks could learn is present exactly once; a demonstration stamps
-all ten; a decision receives exactly one forward; no bridge message exists; the
-state log shows one coherence; the snapshot round-trips.
-
-**Invariant.** No signal pair loses its association; the servo still gets one
-payload per decision and its command semantics are unchanged; the teaching error
-wave still reaches the goal and the sensors.
-
-**Touches.** `servo-tensor.ts`, `app/boot-train.ts`, `test/episode.test.ts`.
-
-### U4 — CurrentPhaseTensor and GoalPlanTensor
+### U3 — CurrentPhaseTensor, GoalPlanTensor and the delta-P signal
 
 **Story.** As the student, I want to know where I actually am separately from
-where the plan wants me next, so a mismatch can be acted on instead of hidden
-inside one transition map.
+where the plan wants me next, so the gap between them can be learned as a
+command instead of hidden inside one transition map.
 
 **Changes.**
 - Add `currentPhaseTensor`: key
@@ -408,10 +444,12 @@ inside one transition map.
   and is D4's `ELEMENT_AXIS`; no separate 32-name requested-phase vocabulary
   is defined, and actual state is in the key so completion (e.g. altitude
   reached) can trigger the next transition (D6).
-- Make the two phases patch signals on U3's panel (actual and desired alongside
-  the three classes and the servo option), and put the phase pair into the
-  servo observation key. Keep the servo's exclusion of the controls class
-  (D12).
+- Make the phase pair a patch signal on the two existing panels (actual on the
+  perception side, desired on the execution side) and put the pair into the
+  servo observation key, so the panel associates "where I am / where I want to
+  be" with a lever option. The panels stay two (D16); their wire banks, the
+  bridge and the error wave's two sides keep their meaning. Keep the servo's
+  exclusion of the controls class (D12).
 - Update the snapshot, crossover, prune, state view and the episode test's
   goal assertion (`episode.test.ts:189-192`).
 
@@ -425,14 +463,16 @@ free flight reports its own phase and no plan; a stamp under the same element
 history and the same progress produces the same key at recall; the snapshot
 round-trips.
 
-**Invariant.** Normal transitions remain forward-only; the mission goal is
-unchanged; the servo's option count and command semantics are unchanged; the
-teaching error wave still stamps the same transitions.
+**Invariant.** Normal transitions remain forward-only; the mission goal and the
+mission's `PhaseCursor` are unchanged, and the cursor stays the only phase
+advancer (D18); the servo's option count and command semantics are unchanged;
+the teaching error wave still stamps the same transitions; the phase path does
+not read the `%64` situation bus (D17).
 
 **Touches.** `servo-tensor.ts`, `school.ts`, `pilot.ts`, `mission.ts`,
 `app/boot-train.ts`, `app/main.ts`, `test/episode.test.ts`, `src/index.ts`.
 
-### U5 — Backward emergency interrupt
+### U4 — Backward emergency interrupt
 
 **Story.** As the student, when the aircraft is in a stall or spin but the plan
 still says cruise, I want the plan to be overridden to a recovery phase in that
@@ -447,23 +487,28 @@ same decision, so the recovery does not wait for the instructor.
   override. Whether this is a dispatcher message or a reflex inside the goal
   plan is the implementer's choice, provided the stun timing keeps the decision
   coherent.
+- Pin the precedence D19: guardian takeover > override > servo memory > servo
+  reflex. The override is recomputed from the actual phase each decision, so it
+  has no hold state to clear.
 - The state log distinguishes a normal transition from an override.
 
 **Proof.** A brain demonstrated to answer a stall panel with cruise, then flown
 on that panel, returns the recovery desired phase and a positive override count
 in the decision where the emergency first appears; a normal flight never
 overrides; two networks in one process do not share override state; a repeated
-decision at the same tick does not double-count; the servo still commands in
-that decision.
+decision at the same tick does not double-count and two consecutive decisions
+on the same emergency give the same override; a guardian takeover in the same
+decision outranks the override; the servo still commands in that decision.
 
 **Invariant.** Normal forward transitions and the teaching error wave are
 unchanged; the mission goal, formation token and guardian modes are unchanged
-(D9); no override fires on a non-emergency class.
+(D9); no override fires on a non-emergency class; the override never advances
+the mission's cursor (D18).
 
 **Touches.** `servo-tensor.ts`, `test` (new learning test), `app/main.ts` state
 row.
 
-### U6 — Isolated perception training with Monte Carlo fuzzing
+### U5 — Isolated perception training with Monte Carlo fuzzing
 
 **Story.** As the instructor, I want the perception panels trained over the
 continuous instrument space, so a reading one bin off a stamp still classifies.
@@ -491,7 +536,7 @@ invented at runtime; the brain's snapshot shape is unchanged by the pass.
 test-owned harness), `test` (new learning test), `servo-tensor.ts` only if a
 pre-training entry point is needed.
 
-### U7 — Coincidence window and the LTD gate
+### U6 — Coincidence window and the LTD gate
 
 **Story.** As the student, I want credit to attach only to the decisions that
 caused the outcome, so a good landing does not reinforce a lever move from two
