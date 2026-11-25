@@ -7,7 +7,80 @@ A fully Hebbian drone-swarm simulator, spun off from `privatepoker-labs/p2p_neru
 One learning mechanism everywhere — no autopilot, no teacher. The swarm learns
 to fly by dying, to fight by watching kills, and to remember through itself:
 every living drone is a shard of the brain, death erases a shard, births are
-mosaics of the living. Designed by the Sonia Code & Gemini AI & Open AI (2026).
+mosaics of the living. Designed by the Sonia Code & Fetch.ai (2026).
+
+This is terminal app only, which runs in-memory simulation.
+There is also live simulation with UX and 3D graphics under [SKYNERD - GENESIS](/skynerd_genesis/README.md)
+
+
+## Seting up
+
+Install dependencies using frozen versions:
+
+```sh
+pip install -r requirements.txt
+```
+
+Alternatively install SciPy and Torch:
+
+```sh
+pip install scipy torch
+```
+
+## Running
+
+Simulation can be ran with:
+
+```sh
+python ./skynerd/sim_runner.py 
+```
+
+Sim has also few options:
+```sh
+python ./skynerd/sim_runner.py --help
+```
+
+The `--seed` option sets RNG seed, giving different simulation results. Runs with same seed are deterministic.
+
+The `--waves` option sets number of drone waves to run. More waves gives longer simulation.
+
+The `--wave-size` options sets number of drones in a single wave. We were interested to see if that affects survival ratio.
+
+Example run with output:
+```sh
+% python ./skynerd/sim_runner.py 
+wave   0: mean 15.46s  best 20.00s  deaths 10/16
+wave   1: mean 12.47s  best 20.00s  deaths 15/16
+wave   2: mean 13.51s  best 20.00s  deaths 12/16
+wave   3: mean 13.67s  best 20.00s  deaths 14/16
+wave   4: mean 13.39s  best 20.00s  deaths 15/16
+wave   5: mean 13.50s  best 20.00s  deaths 14/16
+wave   6: mean 13.73s  best 20.00s  deaths 13/16
+wave   7: mean 15.19s  best 20.00s  deaths 12/16
+wave   8: mean 12.34s  best 18.82s  deaths 16/16
+wave   9: mean 13.77s  best 20.00s  deaths 14/16
+==============================================================================
+SKYNERD WAVE REPORT
+==============================================================================
+wave | drones | deaths | median | mean   | best  | full-horizon survivors
+-----+--------+--------+--------+--------+-------+-----------------------
+   0 |     16 |     10 |  16.15 |  15.46 | 20.00 | 6
+   1 |     16 |     15 |  11.77 |  12.47 | 20.00 | 1
+   2 |     16 |     12 |  13.84 |  13.51 | 20.00 | 4
+   3 |     16 |     14 |  12.48 |  13.67 | 20.00 | 2
+   4 |     16 |     15 |  13.00 |  13.39 | 20.00 | 1
+   5 |     16 |     14 |  12.11 |  13.50 | 20.00 | 2
+   6 |     16 |     13 |  13.13 |  13.73 | 20.00 | 3
+   7 |     16 |     12 |  15.70 |  15.19 | 20.00 | 4
+   8 |     16 |     16 |  11.85 |  12.34 | 18.82 | 0
+   9 |     16 |     14 |  13.31 |  13.77 | 20.00 | 2
+------------------------------------------------------------------------------
+inheritance trend (first-two -> last-two wave medians): 13.96s -> 12.58s
+living memory shards: 25 drones carry the brain (160 births, 2732 obituaries heard)
+best single life: 20.00s
+==============================================================================
+```
+
 
 ## The tensors
 

@@ -1,9 +1,100 @@
-# Genesis — TypeScript/WebGPU port of Skynerd
+# SKYNERD - GENESIS
+
+<p align="center"><img width="640" src="/skynerd/splash/Skynerd.png" alt="Splash" /></p>
 
 The browser-native, GPU-accelerated next stage of the Skynerd drone swarm.
-The design brief lives beside this folder: `SKYNERD_Genesis_Design_Brief.docx`.
+The design brief lives beside this folder: [Design Brief](SKYNERD_Genesis_Design_Brief.docx)
 
-## Folder contract
+
+## Building
+
+Install dependencies
+
+```sh
+npm install
+```
+
+## Running
+
+Run dev
+
+```sh
+npm run dev
+```
+
+## How to use
+
+Initial screen illustrates the tensors that make AI Drone's brain.
+Clicking *Show Details* reveals the list of flight lessons that each student goes through.
+There is number of students, and each repetition we choose best half and replace the other half with new generation crossed-over from best half.
+
+Clicking *Done* button will progress to main view without waiting until AI Drones fully master the curriculum, which
+we don't actually know if they possibly can.
+
+The main view has three panels:
+
+- Top view with grid
+- Beautiful 3D rendered cockpit view
+- Tab panel with two tabs:
+  - Scenario listing lesson/mission goals and steps
+  - AI State shows live values and classifications computed by drone's tensors
+
+Toolbar at the top has two rows.
+
+First row:
+
+- SKYNERD logo
+- Scenario selection dropdown - select a flight lesson or drone attack mission
+- Aircraft selection dropdown - select a drone flying in current mission
+- Controls selection dropdown - select who controls aircraft:
+  - Solo: Instructor - only instructor on board
+  - Solo: AI - drone fully controlled by AI
+  - Pair: Instructor - instructor has controls, drone AI learns
+  - Pair: AI - drone controlled by AI, instructor intercepts in critical situations
+- Next Maneuver - progress to next lesson or mission
+- Restart - start over current lesson or mission
+
+Second row:
+
+- Pause / Play button - pauses / resumes whole simulation
+- Speed - select simulation speed from 0.2x up to 10x
+- `+` / `-` buttons - zoom in/out top view
+- Reset button - resets zoom
+- Checkboxes enabling 3D graphics elements
+  - Relief mapping for more 3D look of the height map
+  - Glare for more glaring sun
+  - Haze for nicer sky blending at horizon
+  - Shadows - n/a
+  - Refl - n/a
+  - Checker - Dynamic checkerboard texture
+- Time dropdown - select time of the day from: Dawn, Sunrise, Noon, Sunset, Dusk, Night
+- Flare - select type of lens flare effect from: None, NerdVision, MichaelNerd
+
+## Technology
+
+***SKYNERD - GENESIS*** is fully made by ***Fetch.ai*** under strict guidance of [Sonia Code](https://github.com/sadhbh-c0d3) - an engineer experienced in computer graphics, and student pilot.
+
+Make sure you don't miss this [article on LinkedIn](https://www.linkedin.com/pulse/skynerd-hebbian-learning-part-2-highly-pytyf/)
+
+Following notes were prepared by AI agents:
+
+  - [Engineer](./Engineer.md) - How drone's tensors work?
+  - [Graphic Designer](./GraphicDesigner.md) - Which 3D graphics methods were used?
+
+
+## Known issues
+
+*SKYNERD - GENESIS* was developped in three days and our focus was on getting to presentable working demo rather than accuracy of learning or flight synamics.
+
+We're aware that flights dynamics is off, especially seen in spin recovry maneuver. We also know that our Hebbian learning approach might not guarantee any success in drones actually learning to fly. However we have built the platform for next experiments.
+
+Neural network design needs more thought put into it. Perhaps the classifications and propagation need to be tuned. Also was considering use of traditional backpropagation to train initial weights, and then use Hebbian learning on the go to give drones some personality. It is an open research project, but definitely fun.
+
+## Agent notes
+
+These may no longer be actual, as we focused work on "SKYNERD - GENESIS" moving away from original simulation running in terminal.
+
+### Folder contract
 
 - **`../skynerd/`** — the Python reference simulator. It stays the source of
   truth; behavioural changes happen there first. Its `golden/` harness
@@ -14,7 +105,7 @@ The design brief lives beside this folder: `SKYNERD_Genesis_Design_Brief.docx`.
   re-capture with Python when the reference changes.
 - **TypeScript application code** — developed here.
 
-## Golden baseline (Milestone 0)
+### Golden baseline (Milestone 0)
 
 Captured with Python 3.14.6 / NumPy 2.5.4. Contains four scenarios with
 fixed seeds — `learn_to_fly` (30 blank-policy episodes), `waves` (5 carpet
@@ -33,7 +124,7 @@ Determinism proof: two captures of the same commit match exactly
 (`skynerd/golden/compare.py`, zero tolerance). Port comparisons run with
 `--tol` and agreed tolerances per milestone.
 
-## Port milestones (from the brief)
+### Port milestones (from the brief)
 
 1. **TypeScript core — IN PROGRESS → Milestone 1 done.** `src/core/` (Vec3,
    Heading, Quaternion, binning, RangeBins, Config, World coordinates),
@@ -118,7 +209,7 @@ Determinism proof: two captures of the same commit match exactly
 7. Swarm Commander — Nebius LLM intents, validator, command panel
 8. Genesis Town — digital twins: humans, cinema, shops, buses, buildings
 
-## Notes
+### Notes
 
 - Zero npm dependencies: the compiler is the system `tsc`, tests run on
   Node's module loader. `types-node.d.ts` holds minimal ambient declarations
